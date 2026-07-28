@@ -1,0 +1,168 @@
+{
+  "description": "美股板块 → A股概念映射。通过 concept_stock_map.json 解析到具体个股",
+  "updated": "2026-07-03",
+  "threshold": 2.0,
+  "etf_tickers": [
+    {"ticker": "usSMH",  "name": "半导体ETF",     "sector": "半导体",      "westock": "usSMH"},
+    {"ticker": "usXLK",  "name": "科技ETF",        "sector": "科技",        "westock": "usXLK"},
+    {"ticker": "usXLF",  "name": "金融ETF",        "sector": "金融",        "westock": "usXLF"},
+    {"ticker": "usXLE",  "name": "能源ETF",        "sector": "能源",        "westock": "usXLE"},
+    {"ticker": "usXLI",  "name": "工业ETF",        "sector": "工业",        "westock": "usXLI"},
+    {"ticker": "usXLV",  "name": "医疗ETF",        "sector": "医疗",        "westock": "usXLV"},
+    {"ticker": "usXLP",  "name": "消费必需品ETF",  "sector": "消费",        "westock": "usXLP"},
+    {"ticker": "usXLY",  "name": "可选消费ETF",    "sector": "可选消费",    "westock": "usXLY"},
+    {"ticker": "usXLRE", "name": "房地产ETF",      "sector": "房地产",      "westock": "usXLRE"},
+    {"ticker": "usTLT",  "name": "长债ETF",        "sector": "利率/债",     "westock": "usTLT"},
+    {"ticker": "usGLD",  "name": "黄金ETF",        "sector": "黄金",        "westock": "usGLD"},
+    {"ticker": "usSLV",  "name": "白银ETF",        "sector": "白银",        "westock": "usSLV"},
+    {"ticker": "usUSO",  "name": "原油ETF",        "sector": "原油",        "westock": "usUSO"},
+    {"ticker": "usKWEB", "name": "中概互联ETF",    "sector": "中概",        "westock": "usKWEB"},
+    {"ticker": "usIWM",  "name": "小盘ETF",        "sector": "小盘",        "westock": "usIWM"}
+  ],
+  "sector_mappings": [
+    {"etf_name": "半导体ETF", "a_concepts": ["芯片概念", "半导体", "第三代半导体", "存储芯片"], "weight": "P1"},
+    {"etf_name": "科技ETF",   "a_concepts": ["AI应用", "芯片概念", "数据中心(AIDC)"], "weight": "P2"},
+    {"etf_name": "金融ETF",   "a_concepts": [], "weight": "P2"},
+    {"etf_name": "能源ETF",   "a_concepts": [], "weight": "P2"},
+    {"etf_name": "中概互联ETF", "a_concepts": [], "weight": "P2"},
+    {"etf_name": "黄金ETF",   "a_concepts": [], "weight": "P2"}
+  ],
+  "mappings": [
+    {
+      "us_name": "英伟达产业链",
+      "us_code": "NVDA.US",
+      "us_sector": "AI芯片/算力",
+      "a_concepts": ["芯片概念", "算力租赁", "AI智能体", "AI应用", "光模块"],
+      "direct_codes": ["300308.SZ","300394.SZ","300502.SZ","002281.SZ"],
+      "direct_names": ["中际旭创","天孚通信","新易盛","光迅科技"],
+      "weights": {"chip_concept": 0.6, "optical_module": 0.4},
+      "weight": "P0",
+      "note": "NVDA业绩/新品发布会直接驱动AI算力链"
+    },
+    {
+      "us_name": "费城半导体指数",
+      "us_code": "SOX.US",
+      "us_sector": "半导体整体",
+      "a_concepts": ["芯片概念", "半导体", "存储芯片", "第三代半导体", "汽车芯片", "MCU芯片"],
+      "weights": {"chip_concept": 0.5, "storage": 0.3, "semi_equip": 0.2},
+      "weight": "P1",
+      "note": "SOX为A股半导体板块最重要情绪指标"
+    },
+    {
+      "us_name": "特斯拉",
+      "us_code": "TSLA.US",
+      "us_sector": "新能源车/智能驾驶",
+      "a_concepts": ["特斯拉概念", "新能源汽车", "汽车芯片"],
+      "direct_codes": ["002920.SZ","601689.SH","002126.SZ"],
+      "direct_names": ["德赛西威","拓普集团","银轮股份"],
+      "weight": "P1",
+      "note": "特斯拉销量/FSD/机器人直接驱动供应链"
+    },
+    {
+      "us_name": "苹果",
+      "us_code": "AAPL.US",
+      "us_sector": "消费电子",
+      "a_concepts": ["AI手机", "AI PC", "消费电子概念"],
+      "direct_codes": ["002475.SZ","002241.SZ","600745.SH","601138.SH"],
+      "direct_names": ["立讯精密","歌尔股份","闻泰科技","工业富联"],
+      "weight": "P1",
+      "note": "苹果新品周期驱动果链"
+    },
+    {
+      "us_name": "台积电",
+      "us_code": "TSM.US",
+      "us_sector": "半导体代工/先进封装",
+      "a_concepts": ["芯片概念", "汽车芯片"],
+      "direct_codes": ["688981.SH","002371.SZ","688012.SH"],
+      "direct_names": ["中芯国际","北方华创","中微公司"],
+      "weight": "P0",
+      "note": "TSM业绩/资本开支指引全球半导体景气"
+    },
+    {
+      "us_name": "AMD",
+      "us_code": "AMD.US",
+      "us_sector": "AI芯片/CPU/GPU",
+      "a_concepts": ["芯片概念", "AI智能体", "算力租赁"],
+      "weight": "P1",
+      "note": "AMD与NVDA竞争格局影响AI芯片板块"
+    },
+    {
+      "us_name": "美光",
+      "us_code": "MU.US",
+      "us_sector": "存储芯片",
+      "a_concepts": ["存储芯片", "芯片概念"],
+      "weight": "P1",
+      "note": "MU业绩指引存储价格周期"
+    },
+    {
+      "us_name": "微软",
+      "us_code": "MSFT.US",
+      "us_sector": "AI软件/云计算",
+      "a_concepts": ["AI应用", "AIGC概念", "多模态AI", "智谱AI"],
+      "weight": "P2",
+      "note": "微软Copilot/Azure影响AI软件情绪"
+    },
+    {
+      "us_name": "谷歌",
+      "us_code": "GOOGL.US",
+      "us_sector": "AI/互联网",
+      "a_concepts": ["AI应用", "AIGC概念", "多模态AI"],
+      "weight": "P2",
+      "note": "谷歌Gemini影响AI应用板块"
+    },
+    {
+      "us_name": "亚马逊",
+      "us_code": "AMZN.US",
+      "us_sector": "云计算/电商",
+      "a_concepts": ["数据中心(AIDC)", "AI应用"],
+      "weight": "P2",
+      "note": "AWS资本开支影响AIDC板块"
+    },
+    {
+      "us_name": "阿斯麦",
+      "us_code": "ASML.US",
+      "us_sector": "半导体设备",
+      "a_concepts": ["芯片概念"],
+      "direct_codes": ["002371.SZ","688012.SH","688072.SH"],
+      "direct_names": ["北方华创","中微公司","拓荆科技"],
+      "weight": "P1",
+      "note": "ASML光刻机出货量指引半导体设备板块"
+    },
+    {
+      "us_name": "纳斯达克100",
+      "us_code": "NDX.US",
+      "us_sector": "科技整体",
+      "a_concepts": ["芯片概念", "AI应用", "新能源汽车", "数据中心(AIDC)"],
+      "weight": "P2",
+      "note": "纳指涨跌影响A股科技整体情绪"
+    },
+    {
+      "us_name": "标普500",
+      "us_code": "SPX.US",
+      "us_sector": "大盘整体",
+      "a_concepts": [],
+      "weight": "P2",
+      "note": "标普为A股开盘情绪锚"
+    },
+    {
+      "us_name": "中概互联",
+      "us_code": "KWEB.US",
+      "us_sector": "中概/互联网",
+      "a_concepts": [],
+      "direct_codes": ["600519.SH","300059.SZ","0700.HK"],
+      "direct_names": ["贵州茅台","东方财富","腾讯控股"],
+      "weight": "P2",
+      "note": "中概股映射A股核心资产"
+    },
+    {
+      "us_name": "比特币/加密货币",
+      "us_code": "BTC.US",
+      "us_sector": "加密货币",
+      "a_concepts": [],
+      "direct_codes": ["300377.SZ","002152.SZ"],
+      "direct_names": ["赢时胜","广电运通"],
+      "weight": "P2",
+      "note": "比特币大幅波动影响区块链概念"
+    }
+  ]
+}

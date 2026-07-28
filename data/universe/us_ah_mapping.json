@@ -1,0 +1,160 @@
+{
+  "description": "美股→A股映射表。美股标的涨跌通过产业链/比价/情绪传导到A股对应股票",
+  "updated": "2026-07-03",
+  "mappings": [
+    {
+      "us_name": "英伟达 NVDA",
+      "us_code": "NVDA.US",
+      "theme": "AI算力",
+      "relation": "产业链映射",
+      "direction": "same",
+      "a_share_codes": ["300308.SZ", "300394.SZ", "002281.SZ", "300502.SZ", "688981.SH", "603986.SH"],
+      "a_share_names": ["中际旭创", "天孚通信", "光迅科技", "新易盛", "中芯国际", "兆易创新"],
+      "impact": "英伟达涨→AI算力光模块/半导体受益;跌→调整压力",
+      "weight": "P0"
+    },
+    {
+      "us_name": "特斯拉 TSLA",
+      "us_code": "TSLA.US",
+      "theme": "新能源车",
+      "relation": "产业链映射+情绪",
+      "direction": "same",
+      "a_share_codes": ["002920.SZ", "300750.SZ", "002074.SZ", "601689.SH", "002126.SZ"],
+      "a_share_names": ["德赛西威", "宁德时代", "国轩高科", "拓普集团", "银轮股份"],
+      "impact": "特斯拉涨→新能源车链受益;跌→承压",
+      "weight": "P1"
+    },
+    {
+      "us_name": "苹果 AAPL",
+      "us_code": "AAPL.US",
+      "theme": "消费电子",
+      "relation": "产业链映射",
+      "direction": "same",
+      "a_share_codes": ["002475.SZ", "002241.SZ", "600745.SH", "601138.SH", "300433.SZ"],
+      "a_share_names": ["立讯精密", "歌尔股份", "闻泰科技", "工业富联", "蓝思科技"],
+      "impact": "苹果涨→果链受益;跌→承压",
+      "weight": "P1"
+    },
+    {
+      "us_name": "微软 MSFT",
+      "us_code": "MSFT.US",
+      "theme": "AI软件/云计算",
+      "relation": "情绪映射",
+      "direction": "same",
+      "a_share_codes": ["688111.SH", "300496.SZ", "300624.SZ", "002230.SZ"],
+      "a_share_names": ["金山办公", "中科创达", "万兴科技", "科大讯飞"],
+      "impact": "微软涨→AI软件/云计算受益;跌→承压",
+      "weight": "P2"
+    },
+    {
+      "us_name": "谷歌 GOOGL",
+      "us_code": "GOOGL.US",
+      "theme": "AI/互联网",
+      "relation": "情绪映射",
+      "direction": "same",
+      "a_share_codes": ["002230.SZ", "300418.SZ", "300624.SZ"],
+      "a_share_names": ["科大讯飞", "昆仑万维", "万兴科技"],
+      "impact": "谷歌涨→AI应用受益;跌→承压",
+      "weight": "P2"
+    },
+    {
+      "us_name": "亚马逊 AMZN",
+      "us_code": "AMZN.US",
+      "theme": "云计算/电商",
+      "relation": "情绪映射+产业链",
+      "direction": "same",
+      "a_share_codes": ["688111.SH", "300454.SZ", "002410.SZ"],
+      "a_share_names": ["金山办公", "深信服", "广联达"],
+      "impact": "亚马逊涨→云计算受益;跌→承压",
+      "weight": "P2"
+    },
+    {
+      "us_name": "台积电 TSM",
+      "us_code": "TSM.US",
+      "theme": "半导体代工",
+      "relation": "产业链映射",
+      "direction": "same",
+      "a_share_codes": ["688981.SH", "603986.SH", "002371.SZ", "688012.SH"],
+      "a_share_names": ["中芯国际", "兆易创新", "北方华创", "中微公司"],
+      "impact": "台积电涨→半导体受益;跌→承压",
+      "weight": "P0"
+    },
+    {
+      "us_name": "AMD",
+      "us_code": "AMD.US",
+      "theme": "AI芯片",
+      "relation": "产业链映射",
+      "direction": "same",
+      "a_share_codes": ["300308.SZ", "688981.SH", "603986.SH"],
+      "a_share_names": ["中际旭创", "中芯国际", "兆易创新"],
+      "impact": "AMD涨→AI芯片链受益;跌→承压",
+      "weight": "P1"
+    },
+    {
+      "us_name": "美光 MU",
+      "us_code": "MU.US",
+      "theme": "存储芯片",
+      "relation": "产业链映射",
+      "direction": "same",
+      "a_share_codes": ["603986.SH", "002916.SZ", "688525.SH"],
+      "a_share_names": ["兆易创新", "深南电路", "佰维存储"],
+      "impact": "美光涨→存储芯片受益;跌→承压",
+      "weight": "P1"
+    },
+    {
+      "us_name": "阿斯麦 ASML",
+      "us_code": "ASML.US",
+      "theme": "半导体设备",
+      "relation": "产业链映射",
+      "direction": "same",
+      "a_share_codes": ["002371.SZ", "688012.SH", "688072.SH"],
+      "a_share_names": ["北方华创", "中微公司", "拓荆科技"],
+      "impact": "ASML涨→半导体设备受益;跌→承压",
+      "weight": "P1"
+    },
+    {
+      "us_name": "中概互联 KWEB",
+      "us_code": "KWEB.US",
+      "theme": "中概/互联网",
+      "relation": "情绪映射",
+      "direction": "same",
+      "a_share_codes": ["600519.SH", "300059.SZ", "002230.SZ"],
+      "a_share_names": ["贵州茅台", "东方财富", "科大讯飞"],
+      "impact": "中概涨→A股科技消费情绪受益;跌→承压",
+      "weight": "P2"
+    },
+    {
+      "us_name": "费城半导体 SOX",
+      "us_code": "SOX.US",
+      "theme": "半导体整体",
+      "relation": "情绪+产业链综合",
+      "direction": "same",
+      "a_share_codes": ["__ALL_SEMI__"],
+      "a_share_names": ["半导体板块整体"],
+      "impact": "SOX涨→A股半导体板块受益;跌→承压",
+      "weight": "P1"
+    },
+    {
+      "us_name": "纳斯达克100 NDX",
+      "us_code": "NDX.US",
+      "theme": "科技整体",
+      "relation": "情绪映射",
+      "direction": "same",
+      "a_share_codes": ["__ALL_TECH__"],
+      "a_share_names": ["科技板块整体"],
+      "impact": "纳指涨→A股科技情绪正面;跌→负面",
+      "weight": "P2"
+    },
+    {
+      "us_name": "标普500 SPX",
+      "us_code": "SPX.US",
+      "theme": "大盘整体",
+      "relation": "情绪映射",
+      "direction": "same",
+      "a_share_codes": ["__ALL__"],
+      "a_share_names": ["全市场情绪"],
+      "impact": "标普涨→A股开盘情绪正面;跌→负面",
+      "weight": "P2"
+    }
+  ]
+}

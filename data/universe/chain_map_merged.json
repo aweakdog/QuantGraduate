@@ -1,0 +1,1212 @@
+{
+  "meta": {
+    "generated_by": "chain_map_merger.py",
+    "generated_at": "2026-06-29 14:32",
+    "sources": [
+      "supply_chain_map.json",
+      "chain_leader_universe.json"
+    ]
+  },
+  "chains": [
+    {
+      "theme": "光通信/AI算力动脉",
+      "chain_leader": {
+        "name": "Corning",
+        "code": "GLW",
+        "market": "US",
+        "market_cap_usd": "~450亿",
+        "desc": "全球光纤龙头+特殊玻璃巨头，英伟达$32亿投资/Meta$60亿订单/Amazon数十亿订单，光通信产能扩10倍",
+        "watch_events": [
+          "earnings",
+          "major_deal",
+          "capacity_expansion",
+          "technology_release",
+          "partnership"
+        ],
+        "next_earnings": "2026-07-28"
+      },
+      "demand_links": [
+        {
+          "component": "光连接器/MPO",
+          "direction": "正向（康宁光纤出货↑ → 连接器配套需求↑）",
+          "reaction_speed": "盘中~1日",
+          "elasticity": "高",
+          "a_share_suppliers": [
+            {
+              "name": "太辰光",
+              "code": "300570.SZ",
+              "role": "康宁最大MPO连接器供应商",
+              "exposure": "核心",
+              "evidence": {
+                "level": 1,
+                "source": "年报/互动易",
+                "detail": "康宁占营收70%+，供应60-70% MPO连接器",
+                "revenue_pct": "70%+"
+              },
+              "scoring": {
+                "binding": 9.5
+              }
+            },
+            {
+              "name": "仕佳光子",
+              "code": "688313.SH",
+              "role": "MPO/MT插芯获康宁认证",
+              "exposure": "高",
+              "evidence": {
+                "level": 2,
+                "source": "公司官微/互动易",
+                "detail": "多款光芯片及连接器产品获康宁认证，切入数据中心布线方案",
+                "revenue_pct": "~5-10%"
+              },
+              "scoring": {
+                "binding": 7.0
+              }
+            },
+            {
+              "name": "致尚科技",
+              "code": "301191.SZ",
+              "role": "MPO连接器供康宁",
+              "exposure": "中",
+              "evidence": {
+                "level": 2,
+                "source": "互动易/招股书",
+                "detail": "MPO连接器产品已进入康宁供应链体系",
+                "revenue_pct": "~5%"
+              },
+              "scoring": {
+                "binding": 6.5
+              }
+            },
+            {
+              "name": "铭普光磁",
+              "code": "002902.SZ",
+              "role": "MPO连接器+光模块",
+              "exposure": "中",
+              "evidence": {
+                "level": 2,
+                "source": "互动易",
+                "detail": "MPO连接器进入康宁供应链，采购康宁光纤做800G LPO光模块",
+                "revenue_pct": "~3-5%"
+              },
+              "scoring": {
+                "binding": 6.0
+              }
+            }
+          ]
+        },
+        {
+          "component": "光纤涂覆材料",
+          "direction": "正向（康宁光纤产能↑ → 涂覆材料采购↑）",
+          "reaction_speed": "1-2日",
+          "elasticity": "中高",
+          "a_share_suppliers": [
+            {
+              "name": "飞凯材料",
+              "code": "300398.SZ",
+              "role": "康宁独家光纤涂覆树脂供应商",
+              "exposure": "核心",
+              "evidence": {
+                "level": 1,
+                "source": "年报/互动易",
+                "detail": "康宁独家供应商，全球市占20-25%，同时供长飞/亨通/中天",
+                "revenue_pct": "~15%"
+              },
+              "scoring": {
+                "binding": 9.0
+              }
+            }
+          ]
+        },
+        {
+          "component": "光纤代工/OEM",
+          "direction": "正向（康宁自有产能不足 → 外协代工需求↑）",
+          "reaction_speed": "1-2日",
+          "elasticity": "中",
+          "a_share_suppliers": [
+            {
+              "name": "特发信息",
+              "code": "000070.SZ",
+              "role": "康宁国内核心代工厂",
+              "exposure": "核心",
+              "evidence": {
+                "level": 2,
+                "source": "互动易确认审厂+产业调研",
+                "detail": "互动易确认康宁审厂通关，2026年6月二次回访，代工份额约50-70%，年2000-3000万芯公里",
+                "revenue_pct": "~10-15%"
+              },
+              "scoring": {
+                "binding": 8.0
+              }
+            },
+            {
+              "name": "通鼎互联",
+              "code": "002491.SZ",
+              "role": "光棒采购+光纤代工认证",
+              "exposure": "中",
+              "evidence": {
+                "level": 2,
+                "source": "互动易+年报",
+                "detail": "康宁（海南）确认是光棒供应商；代工关系被官方公告部分澄清，但产业信息指向认证代工",
+                "revenue_pct": "~5-8%"
+              },
+              "scoring": {
+                "binding": 6.0
+              }
+            }
+          ]
+        },
+        {
+          "component": "石英辅材/光纤预制棒材料",
+          "direction": "正向（康宁扩产拉动上游石英材料需求）",
+          "reaction_speed": "2-3日",
+          "elasticity": "中",
+          "a_share_suppliers": [
+            {
+              "name": "菲利华",
+              "code": "300395.SZ",
+              "role": "康宁石英辅材核心供应商",
+              "exposure": "核心",
+              "evidence": {
+                "level": 1,
+                "source": "年报+互动易",
+                "detail": "康宁上游石英辅材核心供应商，供货占比超30%，供应光棒生产用高纯石英辅材",
+                "revenue_pct": "~10-15%"
+              },
+              "scoring": {
+                "binding": 8.5
+              }
+            },
+            {
+              "name": "石英股份",
+              "code": "603688.SH",
+              "role": "高纯石英砂/管供应商",
+              "exposure": "高",
+              "evidence": {
+                "level": 2,
+                "source": "年报+行业调研",
+                "detail": "国内唯一可规模化供应光纤预制棒用高纯石英耗材，市占率超80%，康宁为间接客户",
+                "revenue_pct": "~5%"
+              },
+              "scoring": {
+                "binding": 6.5
+              }
+            },
+            {
+              "name": "三孚股份",
+              "code": "603938.SH",
+              "role": "高纯四氯化硅",
+              "exposure": "中",
+              "evidence": {
+                "level": 3,
+                "source": "券商研报",
+                "detail": "高纯四氯化硅为预制棒核心硅源，与长飞等厂商深度绑定",
+                "revenue_pct": "~5%"
+              },
+              "scoring": {
+                "binding": 5.0
+              }
+            }
+          ]
+        },
+        {
+          "component": "精密光学/检测设备",
+          "direction": "正向（康宁扩产拉动设备采购）",
+          "reaction_speed": "2-5日",
+          "elasticity": "中",
+          "a_share_suppliers": [
+            {
+              "name": "茂莱光学",
+              "code": "688502.SH",
+              "role": "康宁精密光学检测组件供应商",
+              "exposure": "高",
+              "evidence": {
+                "level": 2,
+                "source": "互动易/调研",
+                "detail": "直供康宁精密光学检测组件，用于Glass Bridge光耦合器件",
+                "revenue_pct": "~5-10%"
+              },
+              "scoring": {
+                "binding": 7.0
+              }
+            },
+            {
+              "name": "罗博特科",
+              "code": "300757.SZ",
+              "role": "光通信自动化设备",
+              "exposure": "中",
+              "evidence": {
+                "level": 2,
+                "source": "公司公告/互动易",
+                "detail": "境外子公司德国ficonTEC为康宁供应光通信高端自动化设备，直接受益康宁全球扩产",
+                "revenue_pct": "~3-5%"
+              },
+              "scoring": {
+                "binding": 6.5
+              }
+            }
+          ]
+        },
+        {
+          "component": "高速光模块（800G/1.6T）",
+          "direction": "正向（康宁Glass Bridge + AI光互联→高速光模块需求↑）",
+          "reaction_speed": "1-3日",
+          "elasticity": "中",
+          "a_share_suppliers": [
+            {
+              "name": "天孚通信",
+              "code": "300394.SZ",
+              "role": "光器件龙头，与康宁协同",
+              "exposure": "高",
+              "evidence": {
+                "level": 3,
+                "source": "券商研报",
+                "detail": "光器件龙头与康宁光连接产品协同服务算力网络建设，中际旭创的供应链地位也间接关联",
+                "revenue_pct": "~2-3%"
+              },
+              "scoring": {
+                "binding": 5.0
+              }
+            },
+            {
+              "name": "中际旭创",
+              "code": "300308.SZ",
+              "role": "全球光模块龙头",
+              "exposure": "中",
+              "evidence": {
+                "level": 3,
+                "source": "券商研报",
+                "detail": "率先导入康宁玻璃桥技术研发新品，但无直接供应关系",
+                "revenue_pct": "~1-2%"
+              },
+              "scoring": {
+                "binding": 4.0
+              }
+            }
+          ]
+        },
+        {
+          "component": "CPO交换机/整机（康宁最大客户）",
+          "direction": "正向（康宁光连接器供货↑ → 工业富联CPO产能释放）",
+          "reaction_speed": "1-2日",
+          "elasticity": "中",
+          "a_share_suppliers": [
+            {
+              "name": "工业富联",
+              "code": "601138.SH",
+              "role": "康宁最大采购方，CPO交换机代工",
+              "exposure": "核心",
+              "evidence": {
+                "level": 3,
+                "source": "产业调研/券商",
+                "detail": "康宁高端光连接产品30-40%供给工业富联，康宁为工业富联第一大光纤供应商，三方闭环（英伟达→康宁→工业富联）",
+                "revenue_pct": "康宁为富联上游,非下游——富联是康宁的客户"
+              },
+              "scoring": {
+                "binding": 7.0,
+                "note": "此为反向供应链（客户而非供应商），评分逻辑不同"
+              }
+            }
+          ]
+        },
+        {
+          "component": "显示玻璃基板+先进封装",
+          "direction": "正向（康宁×京东方合作深化 → 玻璃基板产业链受益）",
+          "reaction_speed": "1-3日",
+          "elasticity": "中高",
+          "a_share_suppliers": [
+            {
+              "name": "京东方A",
+              "code": "000725.SZ",
+              "role": "康宁战略合作伙伴（MoU）",
+              "exposure": "核心",
+              "evidence": {
+                "level": 1,
+                "source": "2026-05-20官方公告",
+                "detail": "签署3年合作备忘录，聚焦玻璃基封装载板/可折叠玻璃/钙钛矿玻璃/光互连四大领域，董事长出席签约",
+                "revenue_pct": "N/A（战略合作）"
+              },
+              "scoring": {
+                "binding": 8.0,
+                "note": "战略合作非直接供应关系"
+              }
+            },
+            {
+              "name": "沃格光电",
+              "code": "603773.SH",
+              "role": "TGV玻璃通孔加工龙头",
+              "exposure": "高",
+              "evidence": {
+                "level": 2,
+                "source": "互动易/调研",
+                "detail": "TGV加工产品已送样英伟达等厂商验证，玻璃桥产业趋势直接受益标的",
+                "revenue_pct": "~5%"
+              }
+            },
+            {
+              "name": "信濠光电",
+              "code": "301051.SZ",
+              "role": "康宁基板后段精密加工",
+              "exposure": "中",
+              "evidence": {
+                "level": 3,
+                "source": "券商研报/产业调研",
+                "detail": "康宁玻璃基板后段精密加工战略配套商",
+                "revenue_pct": "~3-5%"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "theme": "AI算力基础设施",
+      "chain_leader": {
+        "name": "NVIDIA",
+        "code": "NVDA",
+        "market": "US",
+        "watch_events": [
+          "earnings",
+          "product_launch",
+          "supply_chain",
+          "sanctions",
+          "guidance"
+        ],
+        "next_earnings": "2026-08-20"
+      },
+      "demand_links": [
+        {
+          "component": "AI服务器/GB200/GB300",
+          "direction": "正向（NVDA出货量↑ → 服务器需求↑）",
+          "reaction_speed": "盘中反应（NVDA财报后次日开盘）",
+          "elasticity": "高（NVDA营收+10% → 服务器厂营收+15~20%）",
+          "a_share_suppliers": [
+            {
+              "name": "工业富联",
+              "code": "601138.SH",
+              "role": "GB200/GB300整机代工",
+              "exposure": "核心",
+              "evidence": {
+                "level": 1,
+                "source": "年报/产业调研",
+                "detail": "英伟达AI服务器核心代工厂",
+                "revenue_pct": "~30-40% AI营收占比"
+              }
+            },
+            {
+              "name": "浪潮信息",
+              "code": "000977.SZ",
+              "role": "国产AI服务器",
+              "exposure": "高"
+            },
+            {
+              "name": "中科曙光",
+              "code": "603019.SH",
+              "role": "国产算力服务器",
+              "exposure": "高"
+            },
+            {
+              "name": "紫光股份",
+              "code": "000938.SZ",
+              "role": "交换机+服务器",
+              "exposure": "中"
+            }
+          ]
+        },
+        {
+          "component": "光模块（800G/1.6T）",
+          "direction": "正向（NVDA算力↑ → 数据中心互联需求↑ → 光模块升级↑）",
+          "reaction_speed": "次交易日反应",
+          "elasticity": "高（NVDA资本开支+10% → 光模块营收+20~30%）",
+          "a_share_suppliers": [
+            {
+              "name": "中际旭创",
+              "code": "300308.SZ",
+              "role": "全球光模块出货量第一",
+              "exposure": "核心"
+            },
+            {
+              "name": "新易盛",
+              "code": "300502.SZ",
+              "role": "1.6T光模块主力",
+              "exposure": "核心"
+            },
+            {
+              "name": "天孚通信",
+              "code": "300394.SZ",
+              "role": "光引擎龙头",
+              "exposure": "核心"
+            },
+            {
+              "name": "光迅科技",
+              "code": "002281.SZ",
+              "role": "电信+数通光模块",
+              "exposure": "中"
+            }
+          ]
+        },
+        {
+          "component": "PCB（高层数加速卡/交换机板）",
+          "direction": "正向",
+          "a_share_suppliers": [
+            {
+              "name": "沪电股份",
+              "code": "002463.SZ",
+              "role": "AI服务器PCB龙头",
+              "exposure": "核心"
+            },
+            {
+              "name": "胜宏科技",
+              "code": "300476.SZ",
+              "role": "AI加速卡PCB主力",
+              "exposure": "核心"
+            },
+            {
+              "name": "深南电路",
+              "code": "002916.SZ",
+              "role": "通信+服务器PCB",
+              "exposure": "高"
+            },
+            {
+              "name": "鹏鼎控股",
+              "code": "002938.SZ",
+              "role": "FPC+HDI龙头",
+              "exposure": "中"
+            }
+          ]
+        },
+        {
+          "component": "HBM/高带宽存储",
+          "direction": "正向",
+          "a_share_suppliers": [
+            {
+              "name": "兆易创新",
+              "code": "603986.SH",
+              "role": "存储芯片设计",
+              "exposure": "中"
+            },
+            {
+              "name": "澜起科技",
+              "code": "688008.SH",
+              "role": "内存接口芯片",
+              "exposure": "中"
+            }
+          ]
+        },
+        {
+          "component": "液冷散热",
+          "direction": "",
+          "reaction_speed": "",
+          "elasticity": "",
+          "a_share_suppliers": [
+            {
+              "name": "英维克",
+              "code": "002837.SZ",
+              "role": "液冷散热龙头",
+              "exposure": "高",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 4.0
+              }
+            },
+            {
+              "name": "高澜股份",
+              "code": "300499.SZ",
+              "role": "电力电子散热",
+              "exposure": "中",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 3.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "theme": "AI算力基础设施",
+      "chain_leader": {
+        "name": "华为",
+        "code": "HUAWEI",
+        "market": "Unlisted",
+        "watch_events": [
+          "product_launch",
+          "sanctions",
+          "supply_chain",
+          "partnership"
+        ],
+        "next_earnings": null
+      },
+      "demand_links": [
+        {
+          "component": "昇腾AI芯片/服务器",
+          "direction": "正向（华为昇腾出货↑ → 国产算力链受益）",
+          "a_share_suppliers": [
+            {
+              "name": "拓维信息",
+              "code": "002261.SZ",
+              "role": "昇腾整机合作伙伴",
+              "exposure": "高"
+            },
+            {
+              "name": "神州数码",
+              "code": "000034.SZ",
+              "role": "昇腾服务器分销+整机",
+              "exposure": "高"
+            },
+            {
+              "name": "四川长虹",
+              "code": "600839.SH",
+              "role": "昇腾服务器（华鲲振宇）",
+              "exposure": "高"
+            },
+            {
+              "name": "广电运通",
+              "code": "002152.SZ",
+              "role": "昇腾服务器（广电五舟）",
+              "exposure": "中"
+            }
+          ]
+        },
+        {
+          "component": "华为汽车（鸿蒙智行）",
+          "direction": "正向",
+          "a_share_suppliers": [
+            {
+              "name": "赛力斯",
+              "code": "601127.SH",
+              "role": "问界品牌合作方",
+              "exposure": "核心"
+            },
+            {
+              "name": "江淮汽车",
+              "code": "600418.SH",
+              "role": "尊界合作方",
+              "exposure": "高"
+            },
+            {
+              "name": "北汽蓝谷",
+              "code": "600733.SH",
+              "role": "享界合作方",
+              "exposure": "中"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "theme": "人形机器人/具身智能",
+      "chain_leader": {
+        "name": "Tesla",
+        "code": "TSLA",
+        "market": "US",
+        "watch_events": [
+          "earnings",
+          "product_launch",
+          "ai_day",
+          "supply_chain"
+        ],
+        "next_earnings": "2026-07-15"
+      },
+      "demand_links": [
+        {
+          "component": "机器人执行器/减速器",
+          "direction": "正向",
+          "a_share_suppliers": [
+            {
+              "name": "拓普集团",
+              "code": "601689.SH",
+              "role": "机器人执行器总成",
+              "exposure": "核心"
+            },
+            {
+              "name": "三花智控",
+              "code": "002050.SZ",
+              "role": "机电执行器",
+              "exposure": "核心"
+            },
+            {
+              "name": "绿的谐波",
+              "code": "688017.SH",
+              "role": "谐波减速器",
+              "exposure": "核心"
+            },
+            {
+              "name": "双环传动",
+              "code": "002472.SZ",
+              "role": "RV减速器+齿轮",
+              "exposure": "高"
+            },
+            {
+              "name": "五洲新春",
+              "code": "603667.SH",
+              "role": "丝杠/轴承",
+              "exposure": "高"
+            }
+          ]
+        },
+        {
+          "component": "传感器/灵巧手",
+          "direction": "正向",
+          "a_share_suppliers": [
+            {
+              "name": "长盈精密",
+              "code": "300115.SZ",
+              "role": "灵巧手结构件",
+              "exposure": "高"
+            },
+            {
+              "name": "奥比中光",
+              "code": "688322.SH",
+              "role": "3D视觉传感器",
+              "exposure": "高"
+            },
+            {
+              "name": "鸣志电器",
+              "code": "603728.SH",
+              "role": "空心杯电机",
+              "exposure": "高"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "theme": "半导体/国产替代",
+      "chain_leader": {
+        "name": "台积电",
+        "code": "TSM",
+        "market": "US",
+        "watch_events": [
+          "earnings",
+          "capacity",
+          "technology_node",
+          "guidance"
+        ],
+        "next_earnings": "2026-07-16"
+      },
+      "demand_links": [
+        {
+          "component": "晶圆代工",
+          "direction": "正向",
+          "a_share_suppliers": [
+            {
+              "name": "北方华创",
+              "code": "002371.SZ",
+              "role": "刻蚀/薄膜/清洗设备",
+              "exposure": "核心"
+            },
+            {
+              "name": "中微公司",
+              "code": "688012.SH",
+              "role": "刻蚀/MOCVD设备",
+              "exposure": "核心"
+            },
+            {
+              "name": "盛美上海",
+              "code": "688082.SH",
+              "role": "清洗/电镀设备",
+              "exposure": "高"
+            }
+          ]
+        },
+        {
+          "component": "半导体设备（映射/国产替代）",
+          "direction": "",
+          "reaction_speed": "",
+          "elasticity": "",
+          "a_share_suppliers": [
+            {
+              "name": "芯源微",
+              "code": "688037.SH",
+              "role": "涂胶显影",
+              "exposure": "中",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 3.0
+              }
+            }
+          ]
+        },
+        {
+          "component": "CoWoS封装供应链",
+          "direction": "",
+          "reaction_speed": "",
+          "elasticity": "",
+          "a_share_suppliers": [
+            {
+              "name": "长电科技",
+              "code": "600584.SH",
+              "role": "先进封装龙头",
+              "exposure": "核心",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 5.0
+              }
+            },
+            {
+              "name": "通富微电",
+              "code": "002156.SZ",
+              "role": "AMD封装代工",
+              "exposure": "高",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 4.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "theme": "新能源/储能/固态电池",
+      "chain_leader": {
+        "name": "宁德时代",
+        "code": "300750.SZ",
+        "market": "SZ",
+        "watch_events": [
+          "earnings",
+          "capacity_expansion",
+          "technology",
+          "contract"
+        ],
+        "next_earnings": "2026-08-25"
+      },
+      "demand_links": [
+        {
+          "component": "锂电池材料",
+          "direction": "正向",
+          "a_share_suppliers": [
+            {
+              "name": "天赐材料",
+              "code": "002709.SZ",
+              "role": "电解液龙头",
+              "exposure": "高"
+            },
+            {
+              "name": "璞泰来",
+              "code": "603659.SH",
+              "role": "负极+隔膜涂覆",
+              "exposure": "高"
+            },
+            {
+              "name": "恩捷股份",
+              "code": "002812.SZ",
+              "role": "湿法隔膜龙头",
+              "exposure": "高"
+            },
+            {
+              "name": "科达利",
+              "code": "002850.SZ",
+              "role": "精密结构件",
+              "exposure": "高"
+            }
+          ]
+        },
+        {
+          "component": "储能",
+          "direction": "正向",
+          "a_share_suppliers": [
+            {
+              "name": "阳光电源",
+              "code": "300274.SZ",
+              "role": "逆变器+储能系统龙头",
+              "exposure": "核心"
+            },
+            {
+              "name": "上能电气",
+              "code": "300827.SZ",
+              "role": "储能PCS",
+              "exposure": "高"
+            },
+            {
+              "name": "固德威",
+              "code": "688390.SH",
+              "role": "逆变器+储能",
+              "exposure": "中"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "theme": "消费电子/AI终端",
+      "chain_leader": {
+        "name": "Apple",
+        "code": "AAPL",
+        "market": "US",
+        "watch_events": [
+          "earnings",
+          "product_launch",
+          "supply_chain",
+          "ai_strategy"
+        ],
+        "next_earnings": "2026-07-30"
+      },
+      "demand_links": [
+        {
+          "component": "果链组装/零部件",
+          "direction": "正向",
+          "a_share_suppliers": [
+            {
+              "name": "立讯精密",
+              "code": "002475.SZ",
+              "role": "整机组装+零部件",
+              "exposure": "核心"
+            },
+            {
+              "name": "歌尔股份",
+              "code": "002241.SZ",
+              "role": "声学+VR/AR",
+              "exposure": "高"
+            },
+            {
+              "name": "蓝思科技",
+              "code": "300433.SZ",
+              "role": "玻璃盖板+外观件",
+              "exposure": "高"
+            },
+            {
+              "name": "领益智造",
+              "code": "002600.SZ",
+              "role": "精密功能件",
+              "exposure": "高"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "theme": "光模块/AI互联",
+      "chain_leader": {
+        "name": "中际旭创",
+        "code": "300308.SZ",
+        "market": "SZ",
+        "desc": "A级(A股光模块链主)",
+        "watch_events": [
+          "earnings",
+          "product_launch",
+          "customer_order",
+          "capacity"
+        ],
+        "next_earnings": "2026-08-25",
+        "universe_id": "zqxc"
+      },
+      "demand_links": [
+        {
+          "component": "光器件/光芯片上游",
+          "direction": "正向",
+          "reaction_speed": "1-3日",
+          "elasticity": "中",
+          "a_share_suppliers": [
+            {
+              "name": "天孚通信",
+              "code": "300394.SZ",
+              "role": "光引擎/光器件",
+              "exposure": "核心",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 5.0
+              }
+            },
+            {
+              "name": "光库科技",
+              "code": "300620.SZ",
+              "role": "高速光调制器",
+              "exposure": "高",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 4.0
+              }
+            },
+            {
+              "name": "源杰科技",
+              "code": "688498.SH",
+              "role": "高速光芯片",
+              "exposure": "高",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 4.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "theme": "AI服务器/代工",
+      "chain_leader": {
+        "name": "工业富联",
+        "code": "601138.SH",
+        "market": "SH",
+        "desc": "A级(A股AI服务器链主)",
+        "watch_events": [
+          "earnings",
+          "customer_order",
+          "capacity_expansion",
+          "supply_chain"
+        ],
+        "next_earnings": "2026-08-14",
+        "universe_id": "foxconn"
+      },
+      "demand_links": [
+        {
+          "component": "AI服务器零部件",
+          "direction": "正向",
+          "reaction_speed": "2-3日",
+          "elasticity": "中",
+          "a_share_suppliers": [
+            {
+              "name": "沪电股份",
+              "code": "002463.SZ",
+              "role": "AI服务器PCB",
+              "exposure": "核心",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 5.0
+              }
+            },
+            {
+              "name": "胜宏科技",
+              "code": "300476.SZ",
+              "role": "AI加速卡PCB",
+              "exposure": "高",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 4.0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "theme": "新能源车",
+      "chain_leader": {
+        "name": "比亚迪",
+        "code": "002594.SZ",
+        "market": "SZ",
+        "desc": "A级",
+        "watch_events": [
+          "earnings",
+          "product_launch",
+          "sales_data",
+          "policy"
+        ],
+        "next_earnings": "2026-08-28",
+        "universe_id": "byd"
+      },
+      "demand_links": [
+        {
+          "component": "新能源车零部件",
+          "direction": "正向",
+          "reaction_speed": "1-2日",
+          "elasticity": "中",
+          "a_share_suppliers": [
+            {
+              "name": "德赛西威",
+              "code": "002920.SZ",
+              "role": "智能座舱+智驾",
+              "exposure": "高",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 4.0
+              }
+            },
+            {
+              "name": "华阳集团",
+              "code": "002906.SZ",
+              "role": "HUD/智能座舱",
+              "exposure": "中",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 3.0
+              }
+            },
+            {
+              "name": "福耀玻璃",
+              "code": "600660.SH",
+              "role": "汽车玻璃",
+              "exposure": "中",
+              "evidence": {
+                "level": 4,
+                "source": "",
+                "detail": "",
+                "revenue_pct": ""
+              },
+              "scoring": {
+                "binding": 3.0
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "cross_leader_relations": [
+    {
+      "from": "NVIDIA",
+      "to": "Corning",
+      "relation": "投资/供应商",
+      "detail": "英伟达$32亿投资康宁锁光纤产能，康宁为NVDA光连接核心供应商",
+      "impact": "双向利好"
+    },
+    {
+      "from": "NVIDIA",
+      "to": "工业富联",
+      "relation": "代工客户",
+      "detail": "NVDA AI服务器核心代工厂，GB200/GB300份额~60%",
+      "impact": "利好后向"
+    },
+    {
+      "from": "NVIDIA",
+      "to": "台积电",
+      "relation": "代工客户",
+      "detail": "NVDA AI芯片全部由台积电CoWoS封装",
+      "impact": "双向利好"
+    },
+    {
+      "from": "Corning",
+      "to": "工业富联",
+      "relation": "供应商/最大客户",
+      "detail": "康宁光连接30-40%供给工业富联，富联为康宁AI业务最大客户",
+      "impact": "双向利好"
+    },
+    {
+      "from": "Corning",
+      "to": "京东方A",
+      "relation": "战略合作",
+      "detail": "2026-05签署MoU，玻璃基封装/可折叠玻璃/钙钛矿玻璃/光互连",
+      "impact": "利好后向"
+    },
+    {
+      "from": "特斯拉",
+      "to": "拓普集团",
+      "relation": "供应商",
+      "detail": "Optimus执行器总成，特斯拉收入占比~15%",
+      "impact": "利好后向"
+    },
+    {
+      "from": "特斯拉",
+      "to": "三花智控",
+      "relation": "供应商",
+      "detail": "机电执行器，机器人+电车双赛道",
+      "impact": "利好后向"
+    },
+    {
+      "from": "苹果",
+      "to": "立讯精密",
+      "relation": "代工供应商",
+      "detail": "整机组装+零部件，苹果收入占比~75%",
+      "impact": "利好后向"
+    },
+    {
+      "from": "苹果",
+      "to": "京东方A",
+      "relation": "供应商",
+      "detail": "OLED屏幕供应商，折叠屏潜在供应商",
+      "impact": "利好后向"
+    },
+    {
+      "from": "台积电",
+      "to": "NVIDIA",
+      "relation": "代工厂",
+      "detail": "台积电CoWoS产能决定NVDA芯片出货量",
+      "impact": "利好前向"
+    },
+    {
+      "from": "台积电",
+      "to": "中芯国际",
+      "relation": "对标/替代",
+      "detail": "台积电技术进展→映射国产替代预期→中芯受益(反相关)",
+      "impact": "对标映射"
+    },
+    {
+      "from": "宁德时代",
+      "to": "阳光电源",
+      "relation": "客户/供应商",
+      "detail": "宁王储电芯→阳光电源储能系统集成，产业链协同",
+      "impact": "双向利好"
+    },
+    {
+      "from": "华为",
+      "to": "中芯国际",
+      "relation": "代工供应商",
+      "detail": "华为昇腾芯片由中芯国际代工(受限条件下)",
+      "impact": "利好后向"
+    },
+    {
+      "from": "华为",
+      "to": "赛力斯",
+      "relation": "智选车合作",
+      "detail": "问界品牌深度合作，华为提供智驾系统+三电",
+      "impact": "利好后向"
+    },
+    {
+      "from": "华为",
+      "to": "拓维信息",
+      "relation": "昇腾合作伙伴",
+      "detail": "昇腾整机合作伙伴，华为收入占比~30%",
+      "impact": "利好后向"
+    }
+  ]
+}

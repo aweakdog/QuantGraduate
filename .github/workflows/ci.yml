@@ -1,0 +1,56 @@
+# 量化策略系统 — CI 流水线
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - "**.md"
+      - "data/**"
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+      - name: Ruff lint
+        run: ruff check --output-format=github .
+      - name: Ruff format check
+        run: ruff format --check .
+      - name: MyPy type check
+        run: mypy pipeline/ engine/ --ignore-missing-imports --no-strict-optional
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+      - name: Run tests
+        env:
+          # 模拟最小配置环境（API token 不可用时不调用外部服务）
+          QUANT_MODE: test
+          QUANT_DATA_DIR: /tmp/quant-test-data
+        run: |
+          mkdir -p /tmp/quant-test-data/universe
+          # 创建最小测试数据
+          echo '{"watchlist": []}' > /tmp/quant-test-data/universe/watchlist.json
+          echo '{}' > /tmp/quant-test-data/universe/supply_chain_map.json
+          pytest -v --tb=short --ignore=tests/test_ifind_pipeline.py

@@ -1,0 +1,16 @@
+{
+  "top_n": 300,
+  "lookback": 60,
+  "min_listed_years": 2.0,
+  "freq": "semiannual",
+  "rank_by": "mcap",
+  "min_adv": 50000000.0,
+  "start": "2022-01-01",
+  "end": "2026-07-27",
+  "rule": "mcap排序取前N; 已上市满N年; 未退市; 窗口数据覆盖>=75%; ADV>=5e+07",
+  "mcap_definition": "median(vwap x outstanding_share), vwap=amount/volume 为真实未复权均价",
+  "known_limitations": [
+    "退市股缺K线 195/195 只, 残留幸存者偏差",
+    "历史ST状态不可得, 未做ST剔除(偏保守: ST股通常跑输)"
+  ]
+}

@@ -1,0 +1,237 @@
+{
+  "meta": {
+    "created_at": "2026-06-29",
+    "description": "A股主线板块链主清单 + 关注圈配置",
+    "market_context": "2026年6月A股处于箱体震荡(4000-4150点)，主线切换至中报业绩驱动。AI硬件(算力/半导体)仍是核心主线但高位分化，创新药逆势爆发成新主线，有色资源品景气上行，低空经济/商业航天持续政策催化。"
+  },
+  "themes": [
+    {
+      "name": "AI算力基础设施",
+      "rank": 1,
+      "description": "AI核心主线，算力/光模块/AI服务器/PCB等高景气，但高位分化需精选",
+      "chain_leaders": [
+        {"name": "NVIDIA", "code": "NVDA", "market": "US", "role": "全球AI芯片霸主，算力标准制定者"},
+        {"name": "台积电", "code": "TSM", "market": "US", "role": "全球AI芯片制造核心"},
+        {"name": "华为", "code": "HUAWEI", "market": "Unlisted", "role": "国产算力/昇腾芯片链主"},
+        {"name": "中际旭创", "code": "300308", "market": "SZ", "role": "全球光模块龙头，1.6T领先"},
+        {"name": "工业富联", "code": "601138", "market": "SH", "role": "AI服务器制造全球龙头"}
+      ],
+      "a_share_focus": [
+        {"name": "中际旭创", "code": "300308", "market": "SZ", "reason": "全球光模块龙头，1.6T出货领先"},
+        {"name": "新易盛", "code": "300502", "market": "SZ", "reason": "1.6T光模块龙头，业绩高增"},
+        {"name": "天孚通信", "code": "300394", "market": "SZ", "reason": "光引擎龙头，800G/1.6T量产"},
+        {"name": "工业富联", "code": "601138", "market": "SH", "reason": "AI服务器全球龙头，GB200量产"},
+        {"name": "浪潮信息", "code": "000977", "market": "SZ", "reason": "国产AI服务器龙头"},
+        {"name": "中科曙光", "code": "603019", "market": "SH", "reason": "国产算力基础设施龙头"},
+        {"name": "沪电股份", "code": "002463", "market": "SZ", "reason": "AI服务器PCB龙头，40层+高多层板"},
+        {"name": "深南电路", "code": "002916", "market": "SZ", "reason": "算力PCB龙头，封装基板领先"},
+        {"name": "胜宏科技", "code": "300476", "market": "SZ", "reason": "HDI+高多层PCB龙头，AI订单爆发"},
+        {"name": "生益科技", "code": "600183", "market": "SH", "reason": "覆铜板龙头，AI PCB上游材料"}
+      ],
+      "keywords": ["AI", "算力", "GPU", "光模块", "CPO", "AI服务器", "PCB", "液冷", "数据中心"]
+    },
+    {
+      "name": "半导体/国产替代",
+      "rank": 2,
+      "description": "存储超级周期+国产替代加速，设备/材料/设计/制造全面受益",
+      "chain_leaders": [
+        {"name": "台积电", "code": "TSM", "market": "US", "role": "全球晶圆代工龙头"},
+        {"name": "SK海力士", "code": "000660", "market": "KR", "role": "HBM存储全球霸主"},
+        {"name": "中芯国际", "code": "688981", "market": "SH", "role": "大陆晶圆代工龙头"},
+        {"name": "长鑫存储", "code": "CX", "market": "Unlisted", "role": "国产DRAM龙头"},
+        {"name": "长江存储", "code": "YMTC", "market": "Unlisted", "role": "国产NAND Flash龙头"}
+      ],
+      "a_share_focus": [
+        {"name": "中芯国际", "code": "688981", "market": "SH", "reason": "大陆晶圆代工龙头，产能利用率95%+"},
+        {"name": "海光信息", "code": "688041", "market": "SH", "reason": "国产CPU/DCU龙头，AI芯片核心"},
+        {"name": "寒武纪", "code": "688256", "market": "SH", "reason": "云端AI芯片先锋，思元系列"},
+        {"name": "兆易创新", "code": "603986", "market": "SH", "reason": "NOR Flash+MCU+DRAM龙头"},
+        {"name": "北方华创", "code": "002371", "market": "SZ", "reason": "半导体设备平台型龙头"},
+        {"name": "中微公司", "code": "688012", "market": "SH", "reason": "刻蚀+薄膜沉积设备龙头"},
+        {"name": "拓荆科技", "code": "688072", "market": "SH", "reason": "薄膜沉积设备龙头，三维集成布局"},
+        {"name": "长电科技", "code": "600584", "market": "SH", "reason": "先进封装龙头，2.5D/3D封装"},
+        {"name": "通富微电", "code": "002156", "market": "SZ", "reason": "AMD封测供应商，先进封装"},
+        {"name": "江波龙", "code": "301308", "market": "SZ", "reason": "企业级存储龙头，UFS主控自研"}
+      ],
+      "keywords": ["半导体", "芯片", "国产替代", "存储", "HBM", "设备", "封装", "先进制程", "EDA"]
+    },
+    {
+      "name": "人形机器人/具身智能",
+      "rank": 3,
+      "description": "2026年人形机器人量产元年，特斯拉+国产链双重催化，Physical AI时代开启",
+      "chain_leaders": [
+        {"name": "Tesla", "code": "TSLA", "market": "US", "role": "Optimus人形机器人全球标杆"},
+        {"name": "英伟达", "code": "NVDA", "market": "US", "role": "Physical AI平台+算力提供商"},
+        {"name": "宇树科技", "code": "Unlisted", "market": "Unlisted", "role": "国产人形机器人领军"},
+        {"name": "优必选", "code": "9880", "market": "HK", "role": "港股人形机器人第一股"}
+      ],
+      "a_share_focus": [
+        {"name": "拓普集团", "code": "601689", "market": "SH", "reason": "机器人执行器+底盘龙头"},
+        {"name": "三花智控", "code": "002050", "market": "SZ", "reason": "机器人机电执行器核心供应商"},
+        {"name": "绿的谐波", "code": "688017", "market": "SH", "reason": "谐波减速器龙头，机器人核心部件"},
+        {"name": "长盈精密", "code": "300115", "market": "SZ", "reason": "机器人结构件+灵巧手供应商"},
+        {"name": "五洲新春", "code": "603667", "market": "SH", "reason": "丝杠+轴承，机器人传动核心"},
+        {"name": "震裕科技", "code": "300953", "market": "SZ", "reason": "机器人精密结构件"},
+        {"name": "中控技术", "code": "688777", "market": "SH", "reason": "工业AI+物理AI平台"},
+        {"name": "索辰科技", "code": "688507", "market": "SH", "reason": "物理AI仿真龙头"},
+        {"name": "能科科技", "code": "603859", "market": "SH", "reason": "具身智能大脑，物理AI全链条"},
+        {"name": "汇川技术", "code": "300124", "market": "SZ", "reason": "伺服+控制器，机器人核心驱动"}
+      ],
+      "keywords": ["人形机器人", "具身智能", "Physical AI", "减速器", "丝杠", "执行器", "灵巧手", "传感器"]
+    },
+    {
+      "name": "创新药/医药生物",
+      "rank": 4,
+      "description": "2026年6月最强主线！估值历史底部+业绩拐点+政策扶持+回购潮四重共振",
+      "chain_leaders": [
+        {"name": "药明康德", "code": "603259", "market": "SH", "role": "CXO全球龙头，A+H双线回购"},
+        {"name": "恒瑞医药", "code": "600276", "market": "SH", "role": "中国创新药绝对龙头"},
+        {"name": "百济神州", "code": "6160", "market": "HK", "role": "全球化创新药标杆"}
+      ],
+      "a_share_focus": [
+        {"name": "恒瑞医药", "code": "600276", "market": "SH", "reason": "创新药龙头，回购20亿，管线丰富"},
+        {"name": "药明康德", "code": "603259", "market": "SH", "reason": "CXO全球龙头，A+H回购32亿+"},
+        {"name": "迈瑞医疗", "code": "300760", "market": "SZ", "reason": "医疗器械龙头，出海加速"},
+        {"name": "凯莱英", "code": "002821", "market": "SZ", "reason": "CDMO龙头，化学大分子+生物大分子"},
+        {"name": "百利天恒", "code": "688506", "market": "SH", "reason": "ADC/BsADC创新药领军"},
+        {"name": "荣昌生物", "code": "688331", "market": "SH", "reason": "ADC龙头，泰它西普出海"},
+        {"name": "泽璟制药", "code": "688266", "market": "SH", "reason": "小分子创新药，多纳非尼等"},
+        {"name": "艾力斯", "code": "688578", "market": "SH", "reason": "非小细胞肺癌创新药龙头"},
+        {"name": "科伦博泰", "code": "6990", "market": "HK", "reason": "ADC重磅，sac-TMT全球III期成功"},
+        {"name": "康方生物", "code": "9926", "market": "HK", "reason": "依沃西全球III期成功，双抗龙头"}
+      ],
+      "keywords": ["创新药", "CXO", "ADC", "双抗", "PD-1", "医药", "生物科技", "出海", "License-out"]
+    },
+    {
+      "name": "低空经济/商业航天",
+      "rank": 5,
+      "description": "十五五重点方向，GW星座+千帆星座组网加速，SpaceX IPO催化，蓝箭航天冲刺科创板",
+      "chain_leaders": [
+        {"name": "SpaceX", "code": "SPCX", "market": "US", "role": "全球商业航天龙头，2026年6月IPO"},
+        {"name": "蓝箭航天", "code": "Unlisted", "market": "Unlisted", "role": "中国商业火箭第一股冲刺科创板"},
+        {"name": "大疆", "code": "Unlisted", "market": "Unlisted", "role": "全球无人机霸主，低空经济核心"}
+      ],
+      "a_share_focus": [
+        {"name": "中国卫星", "code": "600118", "market": "SH", "reason": "卫星制造龙头，GW星座核心研制方"},
+        {"name": "中国卫通", "code": "601698", "market": "SH", "reason": "高轨卫星运营龙头"},
+        {"name": "航天电子", "code": "600879", "market": "SH", "reason": "火箭测控+电子系统龙头"},
+        {"name": "中航高科", "code": "600862", "market": "SH", "reason": "航空复材龙头，无人机/eVTOL受益"},
+        {"name": "中天火箭", "code": "003009", "market": "SZ", "reason": "小型固体火箭+探空火箭"},
+        {"name": "航发科技", "code": "600391", "market": "SH", "reason": "航空发动机零部件"},
+        {"name": "国博电子", "code": "688375", "market": "SH", "reason": "星载T/R组件龙头"},
+        {"name": "海格通信", "code": "002465", "market": "SZ", "reason": "卫星通信终端龙头"},
+        {"name": "亿航智能", "code": "EH", "market": "US", "reason": "eVTOL全球龙头，适航取证领先"},
+        {"name": "万丰奥威", "code": "002085", "market": "SZ", "reason": "eVTOL飞机制造+轻量化"}
+      ],
+      "keywords": ["低空经济", "商业航天", "卫星互联网", "eVTOL", "无人机", "火箭", "星座", "SpaceX"]
+    },
+    {
+      "name": "新能源/储能/固态电池",
+      "rank": 6,
+      "description": "出海加速+储能需求爆发+固态电池技术突破，龙头公司全球化布局",
+      "chain_leaders": [
+        {"name": "宁德时代", "code": "300750", "market": "SZ", "role": "全球动力电池+储能龙头"},
+        {"name": "比亚迪", "code": "002594", "market": "SZ", "role": "新能源车全球销量冠军"},
+        {"name": "阳光电源", "code": "300274", "market": "SZ", "role": "全球逆变器+储能系统龙头"}
+      ],
+      "a_share_focus": [
+        {"name": "宁德时代", "code": "300750", "market": "SZ", "reason": "全球动力电池+储能龙头"},
+        {"name": "比亚迪", "code": "002594", "market": "SZ", "reason": "新能源车+动力电池+智驾"},
+        {"name": "阳光电源", "code": "300274", "market": "SZ", "reason": "全球逆变器+储能龙头"},
+        {"name": "隆基绿能", "code": "601012", "market": "SH", "reason": "光伏硅片+组件全球龙头"},
+        {"name": "晶澳科技", "code": "002459", "market": "SZ", "reason": "光伏组件龙头"},
+        {"name": "亿纬锂能", "code": "300014", "market": "SZ", "reason": "消费+动力+储能电池"},
+        {"name": "天赐材料", "code": "002709", "market": "SZ", "reason": "电解液龙头，六氟磷酸锂"},
+        {"name": "先导智能", "code": "300450", "market": "SZ", "reason": "锂电设备龙头"},
+        {"name": "璞泰来", "code": "603659", "market": "SH", "reason": "负极+涂覆隔膜龙头"},
+        {"name": "华友钴业", "code": "600516", "market": "SH", "reason": "镍钴锂资源+正极材料龙头"}
+      ],
+      "keywords": ["新能源", "储能", "固态电池", "锂电池", "光伏", "逆变器", "电动车", "出海", "钠离子"]
+    },
+    {
+      "name": "有色金属/资源品",
+      "rank": 7,
+      "description": "铜铝金景气周期，AI数据中心+新能源电网驱动铜需求，黄金挑战5000美元",
+      "chain_leaders": [
+        {"name": "紫金矿业", "code": "601899", "market": "SH", "role": "全球铜金矿龙头，资源储量最大"},
+        {"name": "洛阳钼业", "code": "603993", "market": "SH", "role": "铜钴钼全球龙头"},
+        {"name": "江西铜业", "code": "600362", "market": "SH", "role": "中国最大铜生产基地"}
+      ],
+      "a_share_focus": [
+        {"name": "紫金矿业", "code": "601899", "market": "SH", "reason": "全球铜金矿龙头"},
+        {"name": "洛阳钼业", "code": "603993", "market": "SH", "reason": "铜钴钼全球布局"},
+        {"name": "江西铜业", "code": "600362", "market": "SH", "reason": "中国最大铜生产商"},
+        {"name": "中国铝业", "code": "601600", "market": "SH", "reason": "电解铝龙头"},
+        {"name": "中金黄金", "code": "600489", "market": "SH", "reason": "黄金龙头"},
+        {"name": "山东黄金", "code": "600547", "market": "SH", "reason": "黄金龙头，海外矿山扩张"},
+        {"name": "北方铜业", "code": "000737", "market": "SZ", "reason": "铜矿采选冶炼"},
+        {"name": "金钼股份", "code": "601958", "market": "SH", "reason": "钼矿龙头，AI+军工需求"},
+        {"name": "中孚实业", "code": "600595", "market": "SH", "reason": "绿色水电铝龙头"},
+        {"name": "云铝股份", "code": "000807", "market": "SZ", "reason": "水电铝龙头"}
+      ],
+      "keywords": ["铜", "铝", "黄金", "有色金属", "贵金属", "稀土", "钼", "资源品", "大宗商品"]
+    },
+    {
+      "name": "消费电子/AI终端",
+      "rank": 8,
+      "description": "AI手机/AI眼镜/AIPC等终端创新元年，折叠屏+端侧AI驱动换机潮",
+      "chain_leaders": [
+        {"name": "Apple", "code": "AAPL", "market": "US", "role": "消费电子王者，AI+折叠屏布局"},
+        {"name": "立讯精密", "code": "002475", "market": "SZ", "role": "果链核心，AI终端组件龙头"},
+        {"name": "京东方A", "code": "000725", "market": "SZ", "role": "显示面板全球龙头，玻璃基板布局"}
+      ],
+      "a_share_focus": [
+        {"name": "立讯精密", "code": "002475", "market": "SZ", "reason": "果链+汽车电子+AI组件龙头"},
+        {"name": "京东方A", "code": "000725", "market": "SZ", "reason": "面板龙头+玻璃基板新成长"},
+        {"name": "歌尔股份", "code": "002241", "market": "SZ", "reason": "VR/AR+声学龙头"},
+        {"name": "韦尔股份", "code": "603501", "market": "SH", "reason": "CIS图像传感器全球龙头"},
+        {"name": "蓝思科技", "code": "300433", "market": "SZ", "reason": "玻璃盖板+外观件龙头"},
+        {"name": "传音控股", "code": "688036", "market": "SH", "reason": "非洲手机之王，AI手机布局"},
+        {"name": "鹏鼎控股", "code": "002938", "market": "SZ", "reason": "PCB龙头，果链核心"},
+        {"name": "水晶光电", "code": "002273", "market": "SZ", "reason": "光学滤光片+AR光波导"},
+        {"name": "东山精密", "code": "002384", "market": "SZ", "reason": "FPC+精密结构件龙头"},
+        {"name": "领益智造", "code": "002600", "market": "SZ", "reason": "精密功能件龙头，AI终端受益"}
+      ],
+      "keywords": ["消费电子", "AI手机", "AI眼镜", "折叠屏", "VR/AR", "智能终端", "AIPC", "果链"]
+    },
+    {
+      "name": "6G/通信",
+      "rank": 9,
+      "description": "工信部6G部省协同试点，2026年6月新主线，卫星+地面融合",
+      "chain_leaders": [
+        {"name": "华为", "code": "HUAWEI", "market": "Unlisted", "role": "6G标准制定核心参与者"},
+        {"name": "中兴通讯", "code": "000063", "market": "SZ", "role": "5G/6G电信设备龙头"}
+      ],
+      "a_share_focus": [
+        {"name": "中兴通讯", "code": "000063", "market": "SZ", "reason": "电信设备龙头，6G标准参与"},
+        {"name": "烽火通信", "code": "600498", "market": "SH", "reason": "光通信龙头，6G传输网络"},
+        {"name": "盛路通信", "code": "002446", "market": "SZ", "reason": "微波天线，6G射频"},
+        {"name": "创远信科", "code": "831961", "market": "BJ", "reason": "通信测试仪器，6G测试"},
+        {"name": "信科移动", "code": "688387", "market": "SH", "reason": "移动通信标准+设备"},
+        {"name": "亨通光电", "code": "600487", "market": "SH", "reason": "光纤光缆+海缆龙头"},
+        {"name": "中际旭创", "code": "300308", "market": "SZ", "reason": "高速光模块，6G光互联"}
+      ],
+      "keywords": ["6G", "通信", "卫星通信", "太赫兹", "光通信", "5G-A", "星地融合"]
+    },
+    {
+      "name": "玻纤/新材料",
+      "rank": 10,
+      "description": "6月新主线，玻璃基板先进封装+玻纤涨价，电子布景气度向好",
+      "chain_leaders": [
+        {"name": "中国巨石", "code": "600176", "market": "SH", "role": "玻纤全球龙头，电子布景气"},
+        {"name": "京东方A", "code": "000725", "market": "SZ", "role": "玻璃基板先进封装布局"}
+      ],
+      "a_share_focus": [
+        {"name": "中国巨石", "code": "600176", "market": "SH", "reason": "玻纤全球龙头，机构金股"},
+        {"name": "三峡新材", "code": "600293", "market": "SH", "reason": "玻璃基板概念，连板活跃"},
+        {"name": "沃格光电", "code": "603773", "market": "SH", "reason": "玻璃基板先进封装"},
+        {"name": "凯盛科技", "code": "600552", "market": "SH", "reason": "UTG超薄柔性玻璃"},
+        {"name": "旗滨集团", "code": "601636", "market": "SH", "reason": "浮法玻璃龙头"},
+        {"name": "光启技术", "code": "002625", "market": "SZ", "reason": "超材料隐身+商业航天"},
+        {"name": "中简科技", "code": "300777", "market": "SZ", "reason": "碳纤维，航空航天材料"},
+        {"name": "光威复材", "code": "300699", "market": "SZ", "reason": "碳纤维龙头"}
+      ],
+      "keywords": ["玻纤", "玻璃基板", "电子布", "先进封装", "新材料", "碳纤维", "超材料"]
+    }
+  ]
+}

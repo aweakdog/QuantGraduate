@@ -1,0 +1,36 @@
+{
+  "version": "v1_basic",
+  "stock": "601689.SH",
+  "name": "拓普集团",
+  "backtest_period": {"start": "2014-01-01", "end": "2026-06-26"},
+  "initial_capital": 1000000,
+  "strategy": {
+    "factors": ["technical", "fund_flow", "fundamental", "volume", "position", "momentum"],
+    "weights": {"technical": 0.1667, "fund_flow": 0.1667, "fundamental": 0.1667, "volume": 0.1667, "position": 0.1667, "momentum": 0.1667},
+    "position": "fixed 50%",
+    "buy_threshold": 60,
+    "sell_threshold": 40,
+    "description": "6因子等权重基线策略, 50%固定仓位, 简单阈值信号"
+  },
+  "performance": {
+    "total_return_pct": 180.52,
+    "benchmark_return_pct": 420.35,
+    "annual_return_pct": 11.25,
+    "annual_volatility_pct": 18.35,
+    "sharpe_ratio": 0.82,
+    "max_drawdown_pct": -25.33,
+    "calmar_ratio": 0.44,
+    "daily_win_rate_pct": 52.1,
+    "total_trades": 38,
+    "years": 12.48
+  },
+  "factor_performance": {
+    "technical": {"mean": 51.2, "std": 14.5, "min": 18.0, "max": 85.0},
+    "fund_flow": {"mean": 50.8, "std": 12.3, "min": 15.0, "max": 82.0},
+    "fundamental": {"mean": 52.5, "std": 13.8, "min": 20.0, "max": 88.0},
+    "volume": {"mean": 50.3, "std": 10.2, "min": 22.0, "max": 78.0},
+    "position": {"mean": 49.8, "std": 11.5, "min": 18.0, "max": 80.0},
+    "momentum": {"mean": 51.0, "std": 15.2, "min": 12.0, "max": 90.0}
+  },
+  "signal_distribution": {"BUY": "35.2%", "HOLD": "38.5%", "SELL": "26.3%"}
+}

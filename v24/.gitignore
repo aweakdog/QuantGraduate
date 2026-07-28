@@ -1,0 +1,9 @@
+# v24 snapshot — data/ is a junction to parent data/, track only code
+data/
+Web/.playwright-cli/
+Web/data/web.db
+Web/data/web.db-wal
+Web/data/web.db-shm
+Web/data/self_selected.json
+__pycache__/
+*.pyc

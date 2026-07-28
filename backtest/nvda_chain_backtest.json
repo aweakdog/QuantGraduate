@@ -1,0 +1,604 @@
+{
+  "generated_at": "2026-06-29 02:40",
+  "chain_leader": "NVIDIA (NVDA)",
+  "suppliers_count": 14,
+  "earnings_count": 12,
+  "earnings_range": "2023-08-23 ~ 2026-05-20",
+  "results": {
+    "1": {
+      "hold_days": 1,
+      "total_events": 12,
+      "avg_return_per_event": 0.17,
+      "median_return_per_event": -0.2,
+      "accumulated_return": 1.74,
+      "win_rate": 50.0,
+      "sharpe": 1.182,
+      "details": [
+        {
+          "date": "2026-05-20",
+          "direction": "📈超预期",
+          "avg_return": -2.95,
+          "median_return": -3.82,
+          "win_rate": 28.6,
+          "positive": 4,
+          "total": 14
+        },
+        {
+          "date": "2026-02-25",
+          "direction": "📈超预期",
+          "avg_return": 3.43,
+          "median_return": 1.67,
+          "win_rate": 85.7,
+          "positive": 12,
+          "total": 14
+        },
+        {
+          "date": "2025-11-19",
+          "direction": "📈超预期",
+          "avg_return": 0.14,
+          "median_return": -0.17,
+          "win_rate": 42.9,
+          "positive": 6,
+          "total": 14
+        },
+        {
+          "date": "2025-08-26",
+          "direction": "📈超预期",
+          "avg_return": 1.5,
+          "median_return": 2.46,
+          "win_rate": 64.3,
+          "positive": 9,
+          "total": 14
+        },
+        {
+          "date": "2025-05-20",
+          "direction": "📈超预期",
+          "avg_return": -0.53,
+          "median_return": -0.5,
+          "win_rate": 35.7,
+          "positive": 5,
+          "total": 14
+        },
+        {
+          "date": "2025-02-25",
+          "direction": "📈超预期",
+          "avg_return": 1.04,
+          "median_return": 1.22,
+          "win_rate": 64.3,
+          "positive": 9,
+          "total": 14
+        },
+        {
+          "date": "2024-11-20",
+          "direction": "➡️符合预期",
+          "avg_return": -1.4,
+          "median_return": -1.04,
+          "win_rate": 28.6,
+          "positive": 4,
+          "total": 14
+        },
+        {
+          "date": "2024-08-28",
+          "direction": "📈超预期",
+          "avg_return": -1.91,
+          "median_return": -1.28,
+          "win_rate": 42.9,
+          "positive": 6,
+          "total": 14
+        },
+        {
+          "date": "2024-05-22",
+          "direction": "📈超预期",
+          "avg_return": -0.69,
+          "median_return": -0.79,
+          "win_rate": 35.7,
+          "positive": 5,
+          "total": 14
+        },
+        {
+          "date": "2024-02-21",
+          "direction": "📈超预期",
+          "avg_return": 4.35,
+          "median_return": 4.19,
+          "win_rate": 100.0,
+          "positive": 14,
+          "total": 14
+        },
+        {
+          "date": "2023-11-21",
+          "direction": "📈超预期",
+          "avg_return": -3.05,
+          "median_return": -2.22,
+          "win_rate": 0.0,
+          "positive": 0,
+          "total": 14
+        },
+        {
+          "date": "2023-08-23",
+          "direction": "📈超预期",
+          "avg_return": 2.11,
+          "median_return": 1.99,
+          "win_rate": 85.7,
+          "positive": 12,
+          "total": 14
+        }
+      ]
+    },
+    "3": {
+      "hold_days": 3,
+      "total_events": 12,
+      "avg_return_per_event": -0.7,
+      "median_return_per_event": -2.58,
+      "accumulated_return": -10.28,
+      "win_rate": 33.3,
+      "sharpe": -0.995,
+      "details": [
+        {
+          "date": "2026-05-20",
+          "direction": "📈超预期",
+          "avg_return": 8.84,
+          "median_return": 10.47,
+          "win_rate": 71.4,
+          "positive": 10,
+          "total": 14
+        },
+        {
+          "date": "2026-02-25",
+          "direction": "📈超预期",
+          "avg_return": 0.62,
+          "median_return": -0.23,
+          "win_rate": 42.9,
+          "positive": 6,
+          "total": 14
+        },
+        {
+          "date": "2025-11-19",
+          "direction": "📈超预期",
+          "avg_return": -6.14,
+          "median_return": -5.25,
+          "win_rate": 0.0,
+          "positive": 0,
+          "total": 14
+        },
+        {
+          "date": "2025-08-26",
+          "direction": "📈超预期",
+          "avg_return": 13.82,
+          "median_return": 15.79,
+          "win_rate": 78.6,
+          "positive": 11,
+          "total": 14
+        },
+        {
+          "date": "2025-05-20",
+          "direction": "📈超预期",
+          "avg_return": -3.14,
+          "median_return": -2.88,
+          "win_rate": 0.0,
+          "positive": 0,
+          "total": 14
+        },
+        {
+          "date": "2025-02-25",
+          "direction": "📈超预期",
+          "avg_return": -8.03,
+          "median_return": -8.77,
+          "win_rate": 0.0,
+          "positive": 0,
+          "total": 14
+        },
+        {
+          "date": "2024-11-20",
+          "direction": "➡️符合预期",
+          "avg_return": -7.62,
+          "median_return": -8.03,
+          "win_rate": 7.1,
+          "positive": 1,
+          "total": 14
+        },
+        {
+          "date": "2024-08-28",
+          "direction": "📈超预期",
+          "avg_return": -2.51,
+          "median_return": -2.01,
+          "win_rate": 35.7,
+          "positive": 5,
+          "total": 14
+        },
+        {
+          "date": "2024-05-22",
+          "direction": "📈超预期",
+          "avg_return": -1.82,
+          "median_return": -2.1,
+          "win_rate": 35.7,
+          "positive": 5,
+          "total": 14
+        },
+        {
+          "date": "2024-02-21",
+          "direction": "📈超预期",
+          "avg_return": 4.99,
+          "median_return": 3.72,
+          "win_rate": 85.7,
+          "positive": 12,
+          "total": 14
+        },
+        {
+          "date": "2023-11-21",
+          "direction": "📈超预期",
+          "avg_return": -4.75,
+          "median_return": -4.01,
+          "win_rate": 7.1,
+          "positive": 1,
+          "total": 14
+        },
+        {
+          "date": "2023-08-23",
+          "direction": "📈超预期",
+          "avg_return": -2.65,
+          "median_return": -2.53,
+          "win_rate": 28.6,
+          "positive": 4,
+          "total": 14
+        }
+      ]
+    },
+    "5": {
+      "hold_days": 5,
+      "total_events": 12,
+      "avg_return_per_event": -0.29,
+      "median_return_per_event": -3.47,
+      "accumulated_return": -5.54,
+      "win_rate": 41.7,
+      "sharpe": -0.329,
+      "details": [
+        {
+          "date": "2026-05-20",
+          "direction": "📈超预期",
+          "avg_return": 6.86,
+          "median_return": 10.33,
+          "win_rate": 71.4,
+          "positive": 10,
+          "total": 14
+        },
+        {
+          "date": "2026-02-25",
+          "direction": "📈超预期",
+          "avg_return": -4.7,
+          "median_return": -5.56,
+          "win_rate": 14.3,
+          "positive": 2,
+          "total": 14
+        },
+        {
+          "date": "2025-11-19",
+          "direction": "📈超预期",
+          "avg_return": 1.98,
+          "median_return": 2.28,
+          "win_rate": 57.1,
+          "positive": 8,
+          "total": 14
+        },
+        {
+          "date": "2025-08-26",
+          "direction": "📈超预期",
+          "avg_return": 12.62,
+          "median_return": 12.73,
+          "win_rate": 78.6,
+          "positive": 11,
+          "total": 14
+        },
+        {
+          "date": "2025-05-20",
+          "direction": "📈超预期",
+          "avg_return": -3.09,
+          "median_return": -3.55,
+          "win_rate": 14.3,
+          "positive": 2,
+          "total": 14
+        },
+        {
+          "date": "2025-02-25",
+          "direction": "📈超预期",
+          "avg_return": -8.93,
+          "median_return": -9.37,
+          "win_rate": 7.1,
+          "positive": 1,
+          "total": 14
+        },
+        {
+          "date": "2024-11-20",
+          "direction": "➡️符合预期",
+          "avg_return": -4.95,
+          "median_return": -4.38,
+          "win_rate": 14.3,
+          "positive": 2,
+          "total": 14
+        },
+        {
+          "date": "2024-08-28",
+          "direction": "📈超预期",
+          "avg_return": -3.85,
+          "median_return": -1.95,
+          "win_rate": 35.7,
+          "positive": 5,
+          "total": 14
+        },
+        {
+          "date": "2024-05-22",
+          "direction": "📈超预期",
+          "avg_return": -4.64,
+          "median_return": -6.08,
+          "win_rate": 7.1,
+          "positive": 1,
+          "total": 14
+        },
+        {
+          "date": "2024-02-21",
+          "direction": "📈超预期",
+          "avg_return": 7.15,
+          "median_return": 3.77,
+          "win_rate": 78.6,
+          "positive": 11,
+          "total": 14
+        },
+        {
+          "date": "2023-11-21",
+          "direction": "📈超预期",
+          "avg_return": -4.43,
+          "median_return": -3.08,
+          "win_rate": 0.0,
+          "positive": 0,
+          "total": 14
+        },
+        {
+          "date": "2023-08-23",
+          "direction": "📈超预期",
+          "avg_return": 2.54,
+          "median_return": 3.05,
+          "win_rate": 71.4,
+          "positive": 10,
+          "total": 14
+        }
+      ]
+    },
+    "10": {
+      "hold_days": 10,
+      "total_events": 12,
+      "avg_return_per_event": 1.9,
+      "median_return_per_event": -0.07,
+      "accumulated_return": 20.75,
+      "win_rate": 50.0,
+      "sharpe": 1.148,
+      "details": [
+        {
+          "date": "2026-05-20",
+          "direction": "📈超预期",
+          "avg_return": 10.73,
+          "median_return": 13.02,
+          "win_rate": 64.3,
+          "positive": 9,
+          "total": 14
+        },
+        {
+          "date": "2026-02-25",
+          "direction": "📈超预期",
+          "avg_return": -1.47,
+          "median_return": -2.35,
+          "win_rate": 14.3,
+          "positive": 2,
+          "total": 14
+        },
+        {
+          "date": "2025-11-19",
+          "direction": "📈超预期",
+          "avg_return": 3.67,
+          "median_return": 0.99,
+          "win_rate": 50.0,
+          "positive": 7,
+          "total": 14
+        },
+        {
+          "date": "2025-08-26",
+          "direction": "📈超预期",
+          "avg_return": 2.55,
+          "median_return": 3.63,
+          "win_rate": 64.3,
+          "positive": 9,
+          "total": 14
+        },
+        {
+          "date": "2025-05-20",
+          "direction": "📈超预期",
+          "avg_return": 3.38,
+          "median_return": 2.69,
+          "win_rate": 71.4,
+          "positive": 10,
+          "total": 14
+        },
+        {
+          "date": "2025-02-25",
+          "direction": "📈超预期",
+          "avg_return": -6.88,
+          "median_return": -9.86,
+          "win_rate": 7.1,
+          "positive": 1,
+          "total": 14
+        },
+        {
+          "date": "2024-11-20",
+          "direction": "➡️符合预期",
+          "avg_return": -4.51,
+          "median_return": -5.52,
+          "win_rate": 14.3,
+          "positive": 2,
+          "total": 14
+        },
+        {
+          "date": "2024-08-28",
+          "direction": "📈超预期",
+          "avg_return": -4.32,
+          "median_return": -3.96,
+          "win_rate": 21.4,
+          "positive": 3,
+          "total": 14
+        },
+        {
+          "date": "2024-05-22",
+          "direction": "📈超预期",
+          "avg_return": -1.92,
+          "median_return": -1.03,
+          "win_rate": 50.0,
+          "positive": 7,
+          "total": 14
+        },
+        {
+          "date": "2024-02-21",
+          "direction": "📈超预期",
+          "avg_return": 24.65,
+          "median_return": 22.27,
+          "win_rate": 100.0,
+          "positive": 14,
+          "total": 14
+        },
+        {
+          "date": "2023-11-21",
+          "direction": "📈超预期",
+          "avg_return": -4.45,
+          "median_return": -4.69,
+          "win_rate": 21.4,
+          "positive": 3,
+          "total": 14
+        },
+        {
+          "date": "2023-08-23",
+          "direction": "📈超预期",
+          "avg_return": 1.32,
+          "median_return": 2.0,
+          "win_rate": 57.1,
+          "positive": 8,
+          "total": 14
+        }
+      ]
+    },
+    "20": {
+      "hold_days": 20,
+      "total_events": 12,
+      "avg_return_per_event": 9.28,
+      "median_return_per_event": 10.76,
+      "accumulated_return": 169.62,
+      "win_rate": 66.7,
+      "sharpe": 2.705,
+      "details": [
+        {
+          "date": "2026-05-20",
+          "direction": "📈超预期",
+          "avg_return": 14.88,
+          "median_return": 15.64,
+          "win_rate": 78.6,
+          "positive": 11,
+          "total": 14
+        },
+        {
+          "date": "2026-02-25",
+          "direction": "📈超预期",
+          "avg_return": -1.77,
+          "median_return": -7.63,
+          "win_rate": 35.7,
+          "positive": 5,
+          "total": 14
+        },
+        {
+          "date": "2025-11-19",
+          "direction": "📈超预期",
+          "avg_return": 10.8,
+          "median_return": 10.62,
+          "win_rate": 64.3,
+          "positive": 9,
+          "total": 14
+        },
+        {
+          "date": "2025-08-26",
+          "direction": "📈超预期",
+          "avg_return": 26.28,
+          "median_return": 25.79,
+          "win_rate": 92.9,
+          "positive": 13,
+          "total": 14
+        },
+        {
+          "date": "2025-05-20",
+          "direction": "📈超预期",
+          "avg_return": 18.31,
+          "median_return": 10.95,
+          "win_rate": 78.6,
+          "positive": 11,
+          "total": 14
+        },
+        {
+          "date": "2025-02-25",
+          "direction": "📈超预期",
+          "avg_return": -7.72,
+          "median_return": -12.98,
+          "win_rate": 7.1,
+          "positive": 1,
+          "total": 14
+        },
+        {
+          "date": "2024-11-20",
+          "direction": "➡️符合预期",
+          "avg_return": -0.42,
+          "median_return": 0.72,
+          "win_rate": 64.3,
+          "positive": 9,
+          "total": 14
+        },
+        {
+          "date": "2024-08-28",
+          "direction": "📈超预期",
+          "avg_return": 12.03,
+          "median_return": 14.38,
+          "win_rate": 85.7,
+          "positive": 12,
+          "total": 14
+        },
+        {
+          "date": "2024-05-22",
+          "direction": "📈超预期",
+          "avg_return": 10.72,
+          "median_return": 12.22,
+          "win_rate": 71.4,
+          "positive": 10,
+          "total": 14
+        },
+        {
+          "date": "2024-02-21",
+          "direction": "📈超预期",
+          "avg_return": 33.21,
+          "median_return": 33.93,
+          "win_rate": 92.9,
+          "positive": 13,
+          "total": 14
+        },
+        {
+          "date": "2023-11-21",
+          "direction": "📈超预期",
+          "avg_return": 0.03,
+          "median_return": -3.52,
+          "win_rate": 35.7,
+          "positive": 5,
+          "total": 14
+        },
+        {
+          "date": "2023-08-23",
+          "direction": "📈超预期",
+          "avg_return": -4.97,
+          "median_return": -4.71,
+          "win_rate": 35.7,
+          "positive": 5,
+          "total": 14
+        }
+      ]
+    }
+  }
+}

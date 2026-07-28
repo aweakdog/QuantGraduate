@@ -1,0 +1,97 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 环境隔离
+# 注: 本仓库为【私有仓库】, .env 内含同花顺账号密码, 按需求随仓库一起提交。
+#     若将来改为公开仓库, 必须先把下一行的注释去掉并清理 git 历史。
+# .env
+venv/
+.venv/
+*venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 敏感配置
+cookies*.json
+cookies*.txt
+*.key
+*.pem
+jupyter_config.json
+*.secret
+credentials.json
+
+# 运行时
+logs/
+*.log
+*.csv
+*.b64
+
+# ── 数据: 凡是能通过 pipeline/ scripts/ 联网拉取或计算重建的, 一律不入库 ──
+# data/raw       : 行情/公告/财务/资金流, 由 update_kline_akshare.py 等重新拉取
+# data/processed : 训练集/特征/回测结果, 由 build_training_*.py + wf_v35_*.py 重建
+# data/universe  : 例外, 仅 756K, 是股票池定义(相当于配置), 保留以保证可复现
+data/*
+!data/universe/
+data/universe/*
+!data/universe/*.json
+!data/universe/*.parquet
+
+*.h5
+*.hdf5
+*.pkl
+
+# 项目特有
+_hermes/
+.hermes/
+_playwright-cli/
+.playwright-cli/
+_backtest_results/
+reports/
+.history/
+quant_strategy.egg-info/
+uv.lock
+ai_backtest_log.txt
+results_wf_dashboard.html
+
+# 临时文件
+_tmp_*
+tmp/
+
+# Neo4j: 官网可重新下载的第三方发行版, 整个目录不入库
+neo4j/
+
+# Claude Code 本地配置
+.claude/
+
+# Web 平台运行时数据库 (SQLite, 由 Web/backend/database.py init_db 自动生成)
+# 属 UI 层训练记录缓存; 真资产为版本化 data/processed/wf_daily_v*.json, 不入版本库
+Web/data/web.db
+Web/data/web.db-wal
+Web/data/web.db-shm
+Web/data/self_selected.json
+
+# 本地记忆 / 临时产物 / 大文件
+.workbuddy/
+Web.rar
+data/com-reports/
+scripts/_probe_*.py
+scripts/_dbg_*.py
+scripts/_audit_*.py
+scripts/fix_kline_columns.py
+data/processed/wf_daily_v15*.json

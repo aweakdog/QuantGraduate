@@ -1,0 +1,66 @@
+{
+  "version": "v3_optimized",
+  "stock": "601689.SH",
+  "name": "拓普集团",
+  "backtest_period": {"start": "2014-01-01", "end": "2026-06-26"},
+  "initial_capital": 1000000,
+  "strategy": {
+    "factors": ["technical", "fund_flow", "fundamental", "volume", "position", "momentum"],
+    "weights": {"technical": 0.18, "fund_flow": 0.12, "fundamental": 0.22, "volume": 0.16, "position": 0.12, "momentum": 0.20},
+    "position": "dynamic (score × volatility × trend × fundamental × technical)",
+    "stop_loss": "-8%",
+    "trailing_stop": "ATR×3.0, activate at +5%",
+    "buy_threshold": 58,
+    "sell_threshold": 35,
+    "max_position": "80%",
+    "target_volatility": "30%",
+    "description": "动态仓位+波动率调整+移动止盈+参数网格优化(900组)"
+  },
+  "performance": {
+    "total_return_pct": 198.67,
+    "benchmark_return_pct": 420.35,
+    "annual_return_pct": 12.05,
+    "annual_volatility_pct": 16.45,
+    "sharpe_ratio": 0.95,
+    "sortino_ratio": 1.32,
+    "max_drawdown_pct": -18.92,
+    "calmar_ratio": 0.64,
+    "daily_win_rate_pct": 55.3,
+    "total_trades": 28,
+    "stop_loss_triggers": 3,
+    "trailing_stop_triggers": 8,
+    "years": 12.48
+  },
+  "parameter_optimization": {
+    "method": "grid_search",
+    "grid": {
+      "BUY_THRESHOLD": [55, 58, 60, 62, 65],
+      "SELL_THRESHOLD": [30, 35, 38, 40, 42],
+      "MAX_POSITION": [0.6, 0.7, 0.8],
+      "TARGET_VOLATILITY": [0.25, 0.30, 0.35],
+      "TRAILING_STOP_ATR_MULT": [2.0, 2.5, 3.0, 3.5]
+    },
+    "total_combinations": 900,
+    "optimal": {
+      "BUY_THRESHOLD": 58,
+      "SELL_THRESHOLD": 35,
+      "MAX_POSITION": 0.7,
+      "TARGET_VOLATILITY": 0.30,
+      "TRAILING_STOP_ATR_MULT": 3.0
+    }
+  },
+  "improvements_vs_r2": [
+    "动态仓位: 评分驱动×波动率×趋势×基本面×技术面 五维乘数",
+    "波动率调整: 目标波动率30%限制, 高波动降仓",
+    "移动止盈: ATR×3追踪止盈, 盈利>5%激活",
+    "ADX趋势强度: 额外动量信号过滤",
+    "3年估值分位: 更长期基本面判断",
+    "参数网格优化: 900组参数组合自动搜索最优",
+    "量能稳定度: 成交量波动率过滤"
+  ],
+  "round_comparison": {
+    "R1_baseline": {"return": "180.5%", "sharpe": 0.82, "max_dd": "-25.3%"},
+    "R2_optimized": {"return": "175.0%", "sharpe": 0.88, "max_dd": "-22.0%"},
+    "R3_final": {"return": "198.7%", "sharpe": 0.95, "max_dd": "-18.9%"}
+  }
+}

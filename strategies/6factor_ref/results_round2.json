@@ -1,0 +1,36 @@
+{
+  "version": "v2_enhanced",
+  "stock": "601689.SH",
+  "name": "拓普集团",
+  "backtest_period": {"start": "2014-01-01", "end": "2026-06-26"},
+  "initial_capital": 1000000,
+  "strategy": {
+    "factors": ["technical", "fund_flow", "fundamental", "volume", "position", "momentum"],
+    "weights": {"technical": 0.15, "fund_flow": 0.10, "fundamental": 0.25, "volume": 0.15, "position": 0.10, "momentum": 0.25},
+    "position": "Kelly dynamic (max 70%)",
+    "stop_loss": "-8%",
+    "buy_threshold": 62,
+    "sell_threshold": 38,
+    "description": "基于R1因子表现调优权重, Kelly公式动态仓位, -8%硬止损, 信号阈值优化"
+  },
+  "performance": {
+    "total_return_pct": 175.03,
+    "benchmark_return_pct": 420.35,
+    "annual_return_pct": 10.82,
+    "annual_volatility_pct": 15.82,
+    "sharpe_ratio": 0.88,
+    "max_drawdown_pct": -22.05,
+    "calmar_ratio": 0.49,
+    "daily_win_rate_pct": 53.8,
+    "total_trades": 32,
+    "stop_loss_triggered": 5,
+    "years": 12.48
+  },
+  "improvements_vs_r1": {
+    "factor_weights": "基于R1因子表现调优: 基本面+动量提权至25%, 资金面+筹码降权至10%",
+    "position_sizing": "固定50% → Kelly动态仓位(最大70%)",
+    "risk_control": "新增-8%硬止损, 尾部风险降低",
+    "threshold_tuning": "买入阈值60→62减少假信号, 卖出阈值40→38降低过度交易",
+    "signal_confirmation": "增加同向信号确认机制"
+  }
+}
