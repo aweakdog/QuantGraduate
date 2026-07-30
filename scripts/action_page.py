@@ -514,7 +514,9 @@ ACTION_HTML = """<!DOCTYPE html>
   .hold-row:last-child{border-bottom:none}
   .hold-row .nm{color:#c9cdd6}
   .hold-row .meta{font-size:12px;color:#6f7889;margin-top:2px}
-  .pos{color:#22c55e}.neg{color:#ef4444}
+  /* A股习惯: 红涨绿跌 (与欧美相反)。只用于盈亏/收益率这类涨跌数字;
+     "成功/失败"之类的状态色仍按通用语义走绿=好红=坏, 别混为一谈。 */
+  .pos{color:#f6465d}.neg{color:#2ebd85}
 
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
   .kv .k{font-size:12px;color:#6f7889}

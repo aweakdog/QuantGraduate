@@ -629,8 +629,10 @@ async function doLogout(){
 function dl(){ window.location = '/api/bt/xlsx?name=' + encodeURIComponent($('sel').value); }
 
 function num(v,d=2,suf=''){ return (v==null||isNaN(v)) ? '--' : (+v).toFixed(d)+suf; }
+// 收益类数字按 A股习惯: 红涨绿跌 (与欧美相反)。
+// 下面的 badge-green/red 是"跑赢/跑输""成功/失败"这类状态语义, 不跟着变。
 function sgn(v,d=1,suf='%'){ if(v==null||isNaN(v))return '<span class="gray">--</span>';
-  const c = v>=0?'green':'red'; return `<span class="${c}">${v>=0?'+':''}${(+v).toFixed(d)}${suf}</span>`; }
+  const c = v>=0?'red':'green'; return `<span class="${c}">${v>=0?'+':''}${(+v).toFixed(d)}${suf}</span>`; }
 
 // 纯 SVG 折线, 不引外部图表库
 function curveSVG(curve){
@@ -1014,8 +1016,9 @@ HTML_PAGE = """<!DOCTYPE html>
            white-space: nowrap; }
   th { color: #888; font-weight: 600; font-size: 12px; text-transform: uppercase; }
   td { color: #ccc; }
-  .pnl-pos { color: #4caf50; }
-  .pnl-neg { color: #f44336; }
+  /* A股习惯: 红涨绿跌 (与欧美相反), 与首页保持一致 */
+  .pnl-pos { color: #f6465d; }
+  .pnl-neg { color: #2ebd85; }
   .btn { display: inline-block; padding: 10px 20px; border: none; border-radius: 8px;
          font-size: 14px; cursor: pointer; margin-right: 8px; margin-bottom: 8px;
          transition: opacity 0.2s; }
@@ -1158,7 +1161,7 @@ async function refresh() {
     const ret = s.total_return_pct;
     const retEl = document.getElementById('ret');
     retEl.textContent = (ret>=0?'+':'') + ret + '%';
-    retEl.className = 'value ' + (ret>=0?'green':'red');
+    retEl.className = 'value ' + (ret>=0?'red':'green');   // A股: 红涨绿跌
     let meta = '估值基准日: ' + (s.ref_date||'--');
     if (s.last_signal_date) meta += ' | 上次信号: ' + s.last_signal_date;
     if (s.last_synced_at) meta += ' | 上次对账: ' + s.last_synced_at;
