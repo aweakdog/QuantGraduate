@@ -49,6 +49,79 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
+# ══════════════════════════════════════════════════════════════
+# 写操作鉴权
+# ══════════════════════════════════════════════════════════════
+# 改名/切记账方式/校准现金/出入金 都会改动账目, 需要口令。
+# 与回测页 (QUANT_BT_PASSWORD) 用不同的口令和不同的 cookie —— 能看报表
+# 不等于能改账。口令只从环境变量读, 绝不写进仓库。
+OPS_COOKIE = "ops_token"
+OPS_TTL = 12 * 3600          # 12 小时后要重新输, 比回测页的 7 天短得多
+
+
+def _ops_password():
+    return os.environ.get("QUANT_OPS_PASSWORD") or ""
+
+
+def _ops_sign(exp: int) -> str:
+    # 签名密钥掺入用途字符串, 使回测页的 token 无法当作写权限使用
+    key = ("ops:" + _ops_password()).encode()
+    return hmac.new(key, str(exp).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _ops_ok(req: Request) -> bool:
+    if not _ops_password():
+        return False
+    tok = req.cookies.get(OPS_COOKIE, "")
+    if "." not in tok:
+        return False
+    exp_s, sig = tok.split(".", 1)
+    try:
+        exp = int(exp_s)
+    except ValueError:
+        return False
+    if exp < time.time():
+        return False
+    return hmac.compare_digest(sig, _ops_sign(exp))
+
+
+def _ops_deny():
+    """401 让前端弹出输密码框"""
+    if not _ops_password():
+        return JSONResponse(
+            {"error": "服务器未设置 QUANT_OPS_PASSWORD, 所有改账操作已禁用",
+             "need_password": False}, status_code=503)
+    return JSONResponse({"error": "需要密码", "need_password": True}, status_code=401)
+
+
+@app.post("/api/ops/login")
+async def api_ops_login(req: Request):
+    pw = _ops_password()
+    if not pw:
+        return JSONResponse({"error": "服务器未设置 QUANT_OPS_PASSWORD"}, status_code=503)
+    body = await req.json()
+    got = str(body.get("password", ""))
+    if not hmac.compare_digest(got, pw):
+        return JSONResponse({"error": "密码错误"}, status_code=403)
+    exp = int(time.time()) + OPS_TTL
+    r = JSONResponse({"ok": True, "expires_in": OPS_TTL})
+    r.set_cookie(OPS_COOKIE, f"{exp}.{_ops_sign(exp)}", max_age=OPS_TTL,
+                 httponly=True, samesite="lax", path="/")
+    return r
+
+
+@app.post("/api/ops/logout")
+async def api_ops_logout():
+    r = JSONResponse({"ok": True})
+    r.delete_cookie(OPS_COOKIE, path="/")
+    return r
+
+
+@app.get("/api/ops/status")
+async def api_ops_status(req: Request):
+    return {"authed": _ops_ok(req), "configured": bool(_ops_password())}
+
+
 # ── 全局 ──
 PY = sys.executable
 SIGNAL_SCRIPT = str(ROOT / "scripts" / "live_signal.py")
@@ -698,6 +771,8 @@ async def api_profiles():
 @app.post("/api/profile/rename")
 async def api_rename(req: Request):
     """改显示名。传空串 = 恢复代码里的默认名"""
+    if not _ops_ok(req):
+        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if pid not in PROFILES:
@@ -719,6 +794,8 @@ async def api_auto(req: Request):
     切到实盘模式时, 若已有一份挂单计划, 那份计划就会转为"待确认"状态 ——
     因为我们无法知道你到底有没有按它下单。
     """
+    if not _ops_ok(req):
+        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if pid not in PROFILES:
@@ -740,6 +817,8 @@ async def api_confirm(req: Request):
     fills 为空数组 = 「当天没下单」, 直接作废该计划且不动账。
     这一步会跑完整模型, 耗时约 30~60 秒, 所以走后台线程 + 轮询 /api/run-status。
     """
+    if not _ops_ok(req):
+        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if pid not in PROFILES:
@@ -774,6 +853,74 @@ async def api_confirm(req: Request):
     return {"ok": True, "profile": pid, "n_fills": len(clean),
             "confirm_file": cf.name,
             "note": "已提交, 正在结算并生成下一份计划 (约 30~60 秒)"}
+
+
+def _cash_op(pid, extra, task):
+    """现金类操作统一走 live_signal 的快通道 (秒级, 不跑模型)。
+
+    必须经由 live_signal 而不是网页直接改 state —— 状态文件规定单写,
+    而且 live_signal 里有备份、校验和 history 记录这些不能绕过的东西。
+    """
+    cmd = [PY, "-u", SIGNAL_SCRIPT] + signal_args(pid) + extra
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(ROOT), timeout=120)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        # live_signal 的拒绝理由都是 ERROR: 开头的人话, 直接回给前端
+        msg = next((ln.strip() for ln in out.splitlines() if "ERROR" in ln), "")
+        detail = out[out.find("ERROR"):].strip() if "ERROR" in out else out[-800:]
+        return JSONResponse({"error": msg or f"{task}失败", "detail": detail},
+                            status_code=400)
+    return {"ok": True, "profile": pid, "log": out[-2000:]}
+
+
+@app.post("/api/profile/set-cash")
+async def api_set_cash(req: Request):
+    """现金校准: 把记录的现金改成券商 App 里的真实数字。
+
+    修账, 不是盈亏也不是出入金: 只动现金, 本金不动, 所以收益率会被修正
+    到真实水平。用来消除自动记账(收盘价+估算佣金)的累积偏差。
+    """
+    if not _ops_ok(req):
+        return _ops_deny()
+    body = await req.json()
+    pid = body.get("profile")
+    if pid not in PROFILES:
+        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    try:
+        cash = float(body.get("cash"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "请填一个数字"}, status_code=400)
+    if cash < 0:
+        return JSONResponse({"error": "现金不能为负"}, status_code=400)
+    extra = ["--set-cash", repr(cash)]
+    if body.get("note"):
+        extra += ["--note", str(body["note"])[:100]]
+    return _cash_op(pid, extra, "现金校准")
+
+
+@app.post("/api/profile/cash-flow")
+async def api_cash_flow(req: Request):
+    """存入(正)/取出(负)现金。
+
+    本金变动, 不是盈亏: 现金和本金同额增减, 收益率保持不变。
+    否则存进 1 万会被算成"赚了 1 万"。
+    """
+    if not _ops_ok(req):
+        return _ops_deny()
+    body = await req.json()
+    pid = body.get("profile")
+    if pid not in PROFILES:
+        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    try:
+        amt = float(body.get("amount"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "请填一个数字"}, status_code=400)
+    if amt == 0:
+        return JSONResponse({"error": "金额不能为 0"}, status_code=400)
+    extra = ["--cash-flow", repr(amt)]
+    if body.get("note"):
+        extra += ["--note", str(body["note"])[:100]]
+    return _cash_op(pid, extra, "出入金")
 
 
 @app.get("/api/today")

@@ -124,7 +124,13 @@ def build_recommend(root: Path, pid=None):
     state = _load_json(live / state_file(pid))
 
     rec = list((plan or {}).get("recommend") or [])
-    equity = (plan or {}).get("equity") or (state or {}).get("cash") or prof["capital"]
+    # 每只预算决定"买不买得起", 必须用当前真实总资产, 否则存取现金后
+    # 这里还按旧数字标"买不起", 会误导人。
+    st = state or {}
+    equity = float(st.get("cash") or 0) + sum(
+        (l.get("shares") or 0) * (l.get("buy_price") or 0) for l in (st.get("lots") or []))
+    if equity <= 0:
+        equity = (plan or {}).get("equity") or prof["capital"]
     n = prof["tranche-n"]
     budget = equity / n if n else None
 
@@ -208,9 +214,18 @@ def build_today(root: Path, pid=None):
         subline = f"继续持有 {len(hold)} 只, 到期自动提示卖出" if hold else "当前空仓, 等待下个换仓日"
 
     nxt_date, nxt_left = _next_rebal(state, plan)
-    mv = sum((h.get("shares") or 0) * (h.get("ref_close") or 0) for h in hold)
-    cash = (plan or {}).get("cash", state.get("cash", 0))
-    equity = (plan or {}).get("equity", cash + mv)
+    # 现金必须取 state 而不是 plan —— plan 是出信号那一刻的快照, 之后的
+    # 现金校准/出入金只写 state, 用 plan 的话页面会一直显示旧数字, 而这正是
+    # 「防止偏差」功能最不能出的错。持仓市值仍按计划里的参考价估, 但股数以
+    # state 的实际批次为准。
+    cash = float(state.get("cash") or 0)
+    hold_by_code = {str(h.get("code"))[:6]: h for h in hold}
+    mv = 0.0
+    for lot in (state.get("lots") or []):
+        c6 = str(lot.get("code"))[:6]
+        ref = (hold_by_code.get(c6) or {}).get("ref_close") or lot.get("buy_price") or 0
+        mv += (lot.get("shares") or 0) * ref
+    equity = cash + mv
     init_cap = state.get("initial_capital") or 0
 
     def _fmt_row(r, side):
@@ -253,6 +268,10 @@ def build_today(root: Path, pid=None):
             "market_value": round(mv, 2),
             "initial_capital": init_cap,
             "total_return_pct": round(equity / init_cap * 100 - 100, 2) if init_cap else None,
+            # 绝对盈亏。出入金后百分比会被稀释(分母变大), 但这个数不会 ——
+            # 存款同额加进 cash 和 initial_capital, 相减后盈亏不变。
+            # 所以做过出入金的条线应以这个数为准。
+            "total_pnl": round(equity - init_cap, 2) if init_cap else None,
         },
         "next_rebal": {"date": nxt_date, "trading_days_left": nxt_left},
         "strategy": {
@@ -339,9 +358,14 @@ ACTION_HTML = """<!DOCTYPE html>
          padding:18px;width:100%;max-width:340px}
   .modal h3{font-size:16px;font-weight:600;margin-bottom:6px}
   .modal p{font-size:13px;color:#8a93a6;line-height:1.7;margin-bottom:12px}
-  .modal input[type=text]{width:100%;background:#0b0d12;border:1px solid #2a3040;
+  .modal input[type=text],.modal input[type=password],.modal input[type=number]{
+         width:100%;background:#0b0d12;border:1px solid #2a3040;
          color:#e8eaed;border-radius:8px;padding:10px;font-size:15px;font-family:inherit}
-  .modal input[type=text]:focus{outline:none;border-color:#2563eb}
+  .modal input:focus{outline:none;border-color:#2563eb}
+  .modal .err{color:#fca5a5;font-size:12px;margin-top:8px;min-height:16px}
+  .modal .hint{font-size:12px;color:#6f7889;margin-top:8px;line-height:1.6}
+  .modal .cur{background:#0b0d12;border-radius:8px;padding:9px 11px;margin-bottom:10px;
+              font-size:12px;color:#8a93a6;line-height:1.7}
   .mbtns{display:flex;gap:8px;margin-top:14px}
   .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);
          background:#1e222b;border:1px solid #2a3040;color:#e8eaed;font-size:13px;
@@ -546,12 +570,52 @@ function toast(msg, ms){
 
 function closeModal(){ $('#modal').innerHTML = ''; }
 
+// 所有改账操作都要口令。401 时弹密码框, 输对了自动重试原操作,
+// 这样用户不会因为"密码过期"丢掉刚填的表单内容。
 async function api(path, body){
   const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
                               body: JSON.stringify(body)});
   const d = await r.json().catch(() => ({}));
+  if (r.status === 401 && d.need_password){
+    await askPassword();                 // 用户取消会 reject, 直接冒泡出去
+    return api(path, body);
+  }
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
   return d;
+}
+
+// 返回一个 Promise: 登录成功 resolve, 用户取消则 reject
+function askPassword(){
+  return new Promise((resolve, reject) => {
+    $('#modal').innerHTML = `
+      <div class="mask">
+        <div class="modal">
+          <h3>需要密码</h3>
+          <p>改名、切换记账方式、校准现金、存取现金都会改动账目，
+             需要输入密码。一次输入 12 小时内有效。</p>
+          <input type="password" id="pw" inputmode="numeric" placeholder="密码"
+                 onkeydown="if(event.key==='Enter')window.__pwOk()">
+          <div class="err" id="pwerr"></div>
+          <div class="mbtns">
+            <div class="btn" onclick="window.__pwCancel()">取消</div>
+            <div class="btn btn-pri" onclick="window.__pwOk()">确定</div>
+          </div>
+        </div>
+      </div>`;
+    setTimeout(() => { const i = $('#pw'); if (i) i.focus(); }, 50);
+
+    window.__pwCancel = () => { closeModal(); reject(new Error('已取消')); };
+    window.__pwOk = async () => {
+      const pw = ($('#pw') || {}).value || '';
+      const r = await fetch('/api/ops/login', {method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pw})});
+      if (r.ok){ closeModal(); resolve(); return; }
+      const d = await r.json().catch(() => ({}));
+      const e = $('#pwerr');
+      if (e) e.textContent = d.error || '密码错误';
+      const i = $('#pw'); if (i){ i.value = ''; i.focus(); }
+    };
+  });
 }
 
 // 当前这条线的信息 (从 PROFS 里取, 避免和后端载荷字段重复)
@@ -562,10 +626,14 @@ function renderProfs(active){
     <div class="prof ${p.id===active?'on':''}" onclick="setPid('${p.id}')">
       <div class="pn">${esc(p.name)}<span class="mode ${p.auto?'mode-auto':'mode-man'}">${
         p.auto?'纸面':'实盘'}</span></div>
-      <div class="pm">${p.positions} 只 · 每只 ${money(p.capital/p.positions)}</div>
+      <div class="pm">${p.positions} 只 · 每只 ${money(
+        (p.equity != null ? p.equity : p.capital) / p.positions)}</div>
     </div>`).join('');
   renderActs();
 }
+
+// 最近一次 /api/today 的账户数字, 给现金弹窗做预填和对照
+let ACCT = {};
 
 function renderActs(){
   const p = curProf();
@@ -574,7 +642,101 @@ function renderActs(){
     <div class="btn" onclick="askRename()">重命名</div>
     ${p.auto
       ? `<div class="btn btn-off" onclick="askAuto(false)">取消自动操作</div>`
-      : `<div class="btn btn-on"  onclick="askAuto(true)">开启自动操作</div>`}`;
+      : `<div class="btn btn-on"  onclick="askAuto(true)">开启自动操作</div>`}
+    <div class="btn" onclick="askSetCash()">校准现金</div>
+    <div class="btn" onclick="askCashFlow()">存取现金</div>`;
+}
+
+function acctBox(){
+  return `<div class="cur">
+    记录的现金 <b style="color:#c9cdd6">${money(ACCT.cash)}</b><br>
+    持仓市值 <b style="color:#c9cdd6">${money(ACCT.market_value)}</b> ·
+    总资产 <b style="color:#c9cdd6">${money(ACCT.equity)}</b><br>
+    本金 <b style="color:#c9cdd6">${money(ACCT.initial_capital)}</b>
+  </div>`;
+}
+
+// ── 现金校准 ──
+// 自动记账用收盘价 + 估算手续费, 和真实成交总有零点几个百分点的差,
+// 几十次换仓累积下来就可观。这里只改现金、不改本金, 所以收益率被修正
+// 到真实水平 (而不是被"洗掉")。
+function askSetCash(){
+  const p = curProf();
+  $('#modal').innerHTML = `
+    <div class="mask" onclick="if(event.target===this)closeModal()">
+      <div class="modal">
+        <h3>校准现金 · ${esc(p.name)}</h3>
+        ${acctBox()}
+        <p>填券商 App 里的<b>真实可用现金</b>。用来消除自动记账
+           (按收盘价 + 估算手续费) 累积下来的偏差。<br>
+           这是<b>修账不是盈亏</b>：本金不动，所以收益率会被修正到真实水平。</p>
+        <input type="number" id="sc" step="0.01" min="0" inputmode="decimal"
+               value="${ACCT.cash==null?'':ACCT.cash}">
+        <div class="hint">只改现金。如果持仓股数也不对，请去
+          <a href="/pro" style="color:#60a5fa">运维页</a>做整体对账。</div>
+        <div class="err" id="scerr"></div>
+        <div class="mbtns">
+          <div class="btn" onclick="closeModal()">取消</div>
+          <div class="btn btn-pri" onclick="doSetCash()">保存</div>
+        </div>
+      </div>
+    </div>`;
+  setTimeout(() => { const i = $('#sc'); if (i){ i.focus(); i.select(); } }, 50);
+}
+
+async function doSetCash(){
+  const v = parseFloat(($('#sc') || {}).value);
+  const e = $('#scerr');
+  if (!(v >= 0)){ if (e) e.textContent = '请填一个不小于 0 的数字'; return; }
+  try {
+    await api('/api/profile/set-cash', {profile: PID, cash: v, note: '网页校准'});
+    closeModal(); toast('现金已校准为 ' + money(v), 4000);
+    load();
+  } catch(err){
+    if (e) e.textContent = err.message; else toast(err.message, 6000);
+  }
+}
+
+// ── 存取现金 ──
+// 本金变动而非盈亏, 所以现金和本金同额增减, 收益率保持不变。
+// 若只加现金不加本金, 存进 1 万会被算成"赚了 1 万"。
+function askCashFlow(){
+  const p = curProf();
+  $('#modal').innerHTML = `
+    <div class="mask" onclick="if(event.target===this)closeModal()">
+      <div class="modal">
+        <h3>存取现金 · ${esc(p.name)}</h3>
+        ${acctBox()}
+        <p>往这条线里<b>加钱或抽钱</b>。填正数是存入，负数是取出。</p>
+        <input type="number" id="cfv" step="0.01" inputmode="decimal" placeholder="例如 10000 或 -5000">
+        <div class="hint">这是<b>本金变动，不算盈亏</b>：现金和本金同额增减，
+          所以<b>累计盈亏的金额不会变</b>。<br>
+          但注意：收益<b>百分比会被稀释</b>，因为分母(本金)变大了。
+          例如亏 150 元时存入 1 万，-0.75% 会变成 -0.5%，亏的钱其实一样多。
+          做过出入金后请看「累计盈亏」的金额，别看百分比。<br>
+          存入会提高每只预算 (总资产 ÷ ${p.positions} 只)，也就能买更高价的股票。</div>
+        <div class="err" id="cferr"></div>
+        <div class="mbtns">
+          <div class="btn" onclick="closeModal()">取消</div>
+          <div class="btn btn-pri" onclick="doCashFlow()">确认</div>
+        </div>
+      </div>
+    </div>`;
+  setTimeout(() => { const i = $('#cfv'); if (i) i.focus(); }, 50);
+}
+
+async function doCashFlow(){
+  const v = parseFloat(($('#cfv') || {}).value);
+  const e = $('#cferr');
+  if (!v){ if (e) e.textContent = '请填一个非 0 的数字'; return; }
+  try {
+    await api('/api/profile/cash-flow', {profile: PID, amount: v, note: '网页出入金'});
+    closeModal();
+    toast((v > 0 ? '已存入 ' : '已取出 ') + money(Math.abs(v)), 4000);
+    load();
+  } catch(err){
+    if (e) e.textContent = err.message; else toast(err.message, 6000);
+  }
 }
 
 function askRename(){
@@ -796,11 +958,17 @@ async function loadAct(){
 
   // 账户
   const a = d.account || {};
+  ACCT = a;                      // 给现金弹窗做预填与对照
   const rp = a.total_return_pct;
+  const pl = a.total_pnl;
   h += `<div class="card"><h2>账户</h2><div class="grid">
       <div class="kv"><div class="k">总资产</div><div class="v">${money(a.equity)}</div></div>
-      <div class="kv"><div class="k">累计收益</div>
+      <div class="kv"><div class="k">累计盈亏</div>
+        <div class="v ${pl==null?'':(pl>=0?'pos':'neg')}">${
+          pl==null?'--':(pl>=0?'+':'-')+money(Math.abs(pl)).slice(1)}</div></div>
+      <div class="kv"><div class="k">收益率</div>
         <div class="v ${rp==null?'':(rp>=0?'pos':'neg')}">${rp==null?'--':(rp>=0?'+':'')+rp+'%'}</div></div>
+      <div class="kv"><div class="k">本金</div><div class="v">${money(a.initial_capital)}</div></div>
       <div class="kv"><div class="k">现金</div><div class="v">${money(a.cash)}</div></div>
       <div class="kv"><div class="k">持仓市值</div><div class="v">${money(a.market_value)}</div></div>
     </div></div>`;

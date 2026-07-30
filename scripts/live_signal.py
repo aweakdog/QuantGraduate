@@ -121,6 +121,14 @@ ap.add_argument("--sync", default=None,
                 help="整体对账: 用该 json 里的真实持仓/现金覆盖服务器状态 (以券商App为准)")
 ap.add_argument("--sync-template", action="store_true",
                 help="导出一份以当前状态预填的对账表单 json, 改完再用 --sync 回填")
+ap.add_argument("--set-cash", type=float, default=None,
+                help="现金校准: 把记录的现金改成券商App里的真实数字。"
+                     "用于修正手续费/成交价的累积误差 —— 这是修账不是盈亏, "
+                     "所以本金(initial_capital)不动, 收益率会随之修正")
+ap.add_argument("--cash-flow", type=float, default=None,
+                help="出入金: 正数存入, 负数取出。这是本金变动不是盈亏, "
+                     "所以现金和本金同额增减, 收益率保持不变")
+ap.add_argument("--note", default="", help="给 --set-cash / --cash-flow 附一句备注")
 args = ap.parse_args()
 
 DATA_DIR = settings.DATA_DIR
@@ -792,6 +800,105 @@ def do_sync(st, kl, names):
     print("  python scripts/live_signal.py")
 
 
+def do_set_cash(st, kl, names):
+    """现金校准: 把记录的现金改成券商 App 里的真实数字。
+
+    为什么需要: 自动记账用的是收盘价 + 估算的手续费, 和你真实成交价、真实
+    佣金总有零点几个百分点的差。几十次换仓累积下来就是可观的偏差。
+
+    关键: 这是"修账", 不是盈亏, 也不是出入金。所以只动 cash, 不动
+    initial_capital —— 收益率的分母保持原样, 分子被修正, 于是收益率跟着
+    修正到真实水平。这正是我们想要的: 之前记的收益率是虚的, 现在变实。
+    """
+    new_cash = float(args.set_cash)
+    if new_cash < 0:
+        raise SystemExit(f"ERROR: 现金不能为负 (收到 {new_cash})")
+    before = snapshot(st, kl, names)
+    old_cash = float(st["cash"])
+    delta = new_cash - old_cash
+
+    # 防手滑: 一次性改动超过总资产的 50% 极可能是输错(比如少打一位)
+    if before["equity"] > 0 and abs(delta) > before["equity"] * 0.5:
+        raise SystemExit(
+            f"ERROR: 这次校准要把现金从 ¥{old_cash:,.2f} 改成 ¥{new_cash:,.2f} "
+            f"(变动 ¥{delta:+,.2f}), 超过总资产 ¥{before['equity']:,.2f} 的一半, 已拒绝。\n"
+            "  校准是用来修几百块的累积误差的。如果确实要大改, 说明该用整体对账\n"
+            "  (--sync) 把持仓也一起改; 若是存取现金请用 --cash-flow。")
+
+    bak = backup_state("setcash")
+    st["cash"] = new_cash
+    after = snapshot(st, kl, names)
+    st.setdefault("history", []).append({
+        "type": "set_cash", "at": datetime.now().isoformat(timespec="seconds"),
+        "note": args.note, "delta": round(delta, 2),
+        "before": {"cash": before["cash"], "equity": before["equity"]},
+        "after": {"cash": after["cash"], "equity": after["equity"]},
+    })
+
+    W = 68
+    print(f"\n{'='*W}\n  现金校准 (修账, 不计为盈亏)\n{'='*W}")
+    print(f"  现金   : ¥{before['cash']:,.2f}  ->  ¥{after['cash']:,.2f}  ({delta:+,.2f})")
+    print(f"  总资产 : ¥{before['equity']:,.2f}  ->  ¥{after['equity']:,.2f}")
+    print(f"  本金   : ¥{st.get('initial_capital', 0):,.2f}  (不变)")
+    if before["total_return_pct"] is not None and after["total_return_pct"] is not None:
+        print(f"  收益率 : {before['total_return_pct']:+.2f}%  ->  "
+              f"{after['total_return_pct']:+.2f}%  (修正到真实水平)")
+    if args.note:
+        print(f"  备注   : {args.note}")
+    if bak:
+        print(f"  已备份 : {bak.name}")
+    save_state(st)
+
+
+def do_cash_flow(st, kl, names):
+    """出入金: 存入(正)或取出(负)。
+
+    关键: 这是本金变动, 不是赚了或亏了。所以 cash 和 initial_capital 同额
+    增减 —— 否则存进 1 万会被算成"赚了 1 万", 收益率立刻虚高一大截。
+    """
+    amt = float(args.cash_flow)
+    if amt == 0:
+        raise SystemExit("ERROR: 金额不能为 0")
+    before = snapshot(st, kl, names)
+    if amt < 0 and float(st["cash"]) + amt < 0:
+        raise SystemExit(
+            f"ERROR: 要取出 ¥{-amt:,.2f}, 但可用现金只有 ¥{st['cash']:,.2f}。\n"
+            "  持仓市值不能直接取现, 需要先卖出。")
+
+    bak = backup_state("cashflow")
+    st["cash"] = float(st["cash"]) + amt
+    st["initial_capital"] = float(st.get("initial_capital") or 0) + amt
+    after = snapshot(st, kl, names)
+    st.setdefault("history", []).append({
+        "type": "deposit" if amt > 0 else "withdraw",
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "note": args.note, "amount": round(amt, 2),
+        "before": {"cash": before["cash"], "equity": before["equity"],
+                   "initial_capital": before["initial_capital"]},
+        "after": {"cash": after["cash"], "equity": after["equity"],
+                  "initial_capital": after["initial_capital"]},
+    })
+
+    W = 68
+    act = "存入" if amt > 0 else "取出"
+    print(f"\n{'='*W}\n  {act}现金 ¥{abs(amt):,.2f} (本金变动, 不计为盈亏)\n{'='*W}")
+    print(f"  现金   : ¥{before['cash']:,.2f}  ->  ¥{after['cash']:,.2f}")
+    print(f"  总资产 : ¥{before['equity']:,.2f}  ->  ¥{after['equity']:,.2f}")
+    print(f"  本金   : ¥{before['initial_capital']:,.2f}  ->  "
+          f"¥{after['initial_capital']:,.2f}  (同额调整)")
+    if before["total_return_pct"] is not None and after["total_return_pct"] is not None:
+        print(f"  收益率 : {before['total_return_pct']:+.2f}%  ->  "
+              f"{after['total_return_pct']:+.2f}%  (应基本不变)")
+    n = TRANCHE_N
+    print(f"  每只预算: ¥{before['equity']/n:,.0f}  ->  ¥{after['equity']/n:,.0f} "
+          f"(总资产/{n}只, 决定能买多高价的股票)")
+    if args.note:
+        print(f"  备注   : {args.note}")
+    if bak:
+        print(f"  已备份 : {bak.name}")
+    save_state(st)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════════════
@@ -809,6 +916,15 @@ if args.sync_template:
     sys.exit(0)
 if args.sync:
     do_sync(state, kl, names)
+    sys.exit(0)
+if args.set_cash is not None and args.cash_flow is not None:
+    raise SystemExit("ERROR: --set-cash 和 --cash-flow 不能同时用 —— 一个是修账"
+                     "(本金不动), 一个是出入金(本金同额变动), 混在一起账就说不清了")
+if args.set_cash is not None:
+    do_set_cash(state, kl, names)
+    sys.exit(0)
+if args.cash_flow is not None:
+    do_cash_flow(state, kl, names)
     sys.exit(0)
 
 print(f"加载 {TRAIN_PATH.name} ...")
