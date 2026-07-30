@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +33,8 @@ from fastapi.middleware.cors import CORSMiddleware
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from action_page import (ACTION_HTML, build_recommend, build_today,  # noqa: E402
                          list_profiles)
-from live_config import DEFAULT_PROFILE, PROFILES, signal_args, state_file  # noqa: E402
+from live_config import (DEFAULT_PROFILE, PROFILES, is_auto, set_auto,  # noqa: E402
+                         set_name, signal_args, state_file)
 
 # ── 路径 ──
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +52,27 @@ app.add_middleware(
 # ── 全局 ──
 PY = sys.executable
 SIGNAL_SCRIPT = str(ROOT / "scripts" / "live_signal.py")
-_running = {"active": False, "log": "", "started_at": None, "done_at": None}
+_running = {"active": False, "log": "", "started_at": None, "done_at": None,
+            "task": None}
+
+
+def _run_bg(cmd, task, timeout=900):
+    """后台跑一个子进程, 进度结果写 _running 供 /api/signal-status 轮询。
+
+    共用同一个 _running 是故意的: live_signal 同时读写状态文件,
+    两个实例并行会互相覆盖。单一门闩简单且安全。
+    """
+    _running.update(active=True, log="", task=task,
+                    started_at=datetime.now().isoformat(timespec="seconds"), done_at=None)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           cwd=str(ROOT), timeout=timeout)
+        _running["log"] = (r.stdout or "") + (r.stderr or "")
+    except Exception as e:
+        _running["log"] = f"{task} 失败: {e}"
+    finally:
+        _running["active"] = False
+        _running["done_at"] = datetime.now().isoformat(timespec="seconds")
 
 
 # 网页上的手动触发/对账默认作用于默认条线; 参数从 live_config 取,
@@ -671,6 +693,87 @@ async def api_profiles():
                                                 for l in (st.get("lots") or [])), 2),
                     "n_positions": None if st is None else len(st.get("lots") or [])})
     return {"profiles": out, "default": DEFAULT_PROFILE}
+
+
+@app.post("/api/profile/rename")
+async def api_rename(req: Request):
+    """改显示名。传空串 = 恢复代码里的默认名"""
+    body = await req.json()
+    pid = body.get("profile")
+    if pid not in PROFILES:
+        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    try:
+        name = set_name(pid, body.get("name"))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "profile": pid, "name": name}
+
+
+@app.post("/api/profile/auto")
+async def api_auto(req: Request):
+    """切换记账方式。
+
+    auto=true  纸面模式: 每天按 T+1 真实行情自动记账
+    auto=false 实盘模式: 不自动记账, 每次换仓都要你确认真实成交价
+
+    切到实盘模式时, 若已有一份挂单计划, 那份计划就会转为"待确认"状态 ——
+    因为我们无法知道你到底有没有按它下单。
+    """
+    body = await req.json()
+    pid = body.get("profile")
+    if pid not in PROFILES:
+        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    auto = bool(body.get("auto"))
+    set_auto(pid, auto)
+    st = _state_of(pid) or {}
+    return {"ok": True, "profile": pid, "auto": auto,
+            "has_pending": bool(st.get("pending")),
+            "note": ("已切回纸面模式, 今后按行情自动记账。"
+                     if auto else
+                     "已切到实盘模式。下次换仓需要你填真实成交价, 否则不会记账、也不会出新信号。")}
+
+
+@app.post("/api/profile/confirm")
+async def api_confirm(req: Request):
+    """提交真实成交回报, 结算这条线的挂单并出下一份信号。
+
+    fills 为空数组 = 「当天没下单」, 直接作废该计划且不动账。
+    这一步会跑完整模型, 耗时约 30~60 秒, 所以走后台线程 + 轮询 /api/run-status。
+    """
+    body = await req.json()
+    pid = body.get("profile")
+    if pid not in PROFILES:
+        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    if _running["active"]:
+        return JSONResponse({"error": "已有任务在跑, 请稍候"}, status_code=409)
+
+    fills = body.get("fills")
+    if not isinstance(fills, list):
+        return JSONResponse({"error": "fills 必须是数组"}, status_code=400)
+    clean = []
+    for i, f in enumerate(fills, 1):
+        try:
+            code = str(f["code"]).zfill(6)[:6]
+            act = f["action"]
+            shares = int(f["shares"])
+            price = float(f["price"])
+        except (KeyError, TypeError, ValueError):
+            return JSONResponse({"error": f"第{i}条成交记录字段不全或格式错误"}, status_code=400)
+        if act not in ("buy", "sell"):
+            return JSONResponse({"error": f"第{i}条 action 必须是 buy/sell"}, status_code=400)
+        if shares <= 0 or price <= 0:
+            return JSONResponse({"error": f"第{i}条 {code} 股数和成交价必须为正"}, status_code=400)
+        clean.append({"code": code, "action": act, "shares": shares, "price": price})
+
+    cf = LIVE_DIR / f"confirm_{pid}_{datetime.now():%Y%m%d_%H%M%S}.json"
+    cf.parent.mkdir(parents=True, exist_ok=True)
+    cf.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    cmd = [PY, "-u", SIGNAL_SCRIPT] + signal_args(pid) + ["--confirm", str(cf)]
+    threading.Thread(target=_run_bg, args=(cmd, f"确认成交 {pid}"), daemon=True).start()
+    return {"ok": True, "profile": pid, "n_fills": len(clean),
+            "confirm_file": cf.name,
+            "note": "已提交, 正在结算并生成下一份计划 (约 30~60 秒)"}
 
 
 @app.get("/api/today")

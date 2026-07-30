@@ -106,6 +106,10 @@ ap.add_argument("--capital", type=float, default=20000.0, help="初始本金 (�
 ap.add_argument("--init", action="store_true", help="重置状态文件, 用 --capital 作为起始现金")
 ap.add_argument("--state", default="state.json", help="状态文件名 (data/live/ 下)")
 ap.add_argument("--confirm", default=None, help="手工成交回报 json 路径, 用它替代自动结算")
+ap.add_argument("--require-confirm", action="store_true",
+                help="实盘模式: 禁止按行情自动记账。有挂单未确认时原地等待, 既不结算也不出"
+                     "新信号, 直到用 --confirm 填入真实成交价。适合真金白银在跑的条线 —— "
+                     "自动记账会假设你按参考价成交了, 你若没下单账目就会悄悄偏离现实")
 ap.add_argument("--dry-run", action="store_true", help="只打印, 不写状态/不落盘")
 ap.add_argument("--allow-stale", action="store_true", help="训练集比K线旧时仍继续")
 ap.add_argument("--as-of", default=None,
@@ -863,6 +867,26 @@ if pending:
         print(f"\n[结算] {p_sig.date()} 的挂单尚无 T+1 行情, 计划保持有效, 本次不重新出信号。")
         print(f"耗时 {(datetime.now()-t0).total_seconds():.0f}s")
         sys.exit(0)
+    # 实盘模式的闸门: 没有真实成交回报就不许动账。
+    # 自动记账会假设"你按参考价买到了", 如果你其实没下单, 状态就会静默偏离
+    # 真实账户, 而且越积越歪。所以这里原地停住, 也不出新信号 —— 新信号依赖
+    # 当前持仓, 拿一份错的持仓算出来的信号只会误导人。
+    if args.require_confirm and not args.confirm:
+        print(f"\n[等待确认] {p_sig.date()} 的计划应在 "
+              f"{pd.Timestamp(exec_date).date()}"
+              f"{'开盘' if EXEC_FIELD == 'open' else '尾盘'}执行。")
+        print("  这条线是实盘模式, 不会按行情自动记账。请在网页上填写真实成交价")
+        print("  (或用 --confirm 提交成交回报) 后, 才会结算并出下一份信号。")
+        print("  若当天实际没有下单, 在网页上选「未成交」即可跳过。")
+        state["awaiting_confirm"] = {
+            "signal_date": str(p_sig.date()),
+            "exec_date": str(pd.Timestamp(exec_date).date()),
+            "since": datetime.now().isoformat(timespec="seconds"),
+        }
+        save_state(state)
+        print(f"耗时 {(datetime.now()-t0).total_seconds():.0f}s")
+        sys.exit(0)
+
     print(f"\n[结算] {p_sig.date()} 信号 -> {pd.Timestamp(exec_date).date()} "
           f"{'开盘' if EXEC_FIELD == 'open' else '尾盘'}成交"
           f"{' (手工回报)' if args.confirm else ' (按行情自动模拟)'}")
@@ -878,8 +902,10 @@ if pending:
         print("    无成交")
     state["history"].append({"signal_date": str(p_sig.date()),
                              "exec_date": str(pd.Timestamp(exec_date).date()),
-                             "fills": fills, "rejected": rej})
+                             "fills": fills, "rejected": rej,
+                             "source": "manual" if args.confirm else "auto"})
     state["pending"] = None
+    state["awaiting_confirm"] = None
 else:
     print("\n[结算] 无待结算挂单")
 

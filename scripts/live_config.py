@@ -26,6 +26,8 @@ web_server.py(网页手动触发/对账)、人工命令行。之前这三处各�
 不进指纹 (它们不影响持仓记账)。
 """
 import argparse
+import json
+from pathlib import Path
 
 # ── 所有 profile 共用的基础参数 ─────────────────────────
 BASE_PARAMS = {
@@ -117,6 +119,78 @@ def state_file(pid):
     return f"state_{pid}.json"
 
 
+# ── 运行时可改的设置 ────────────────────────────────────
+# 名字和"自动记账开关"是用户在网页上随时改的, 不能写进代码, 也不能写进
+# state_<id>.json —— 状态文件规定只由 live_signal.py 单方写入, 网页再去写
+# 就会和收盘后的定时任务撞车、造成账目错位。所以单独一个小文件。
+SETTINGS_PATH = Path(__file__).resolve().parents[1] / "data" / "live" / "profile_settings.json"
+
+# auto=True  : 按 T+1 真实行情自动记账 (纸面跟踪, 默认)
+# auto=False : 实盘模式 —— 不自动记账, 等你填真实成交价才入账。
+#              这条线会停在"待确认成交"状态, 不会自动往前推进。
+DEFAULT_SETTING = {"name": None, "auto": True}
+
+NAME_MAX = 16
+
+
+def load_settings():
+    """读全部设置; 文件不存在或损坏都退回默认, 绝不因此让出信号失败"""
+    try:
+        raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for pid, v in raw.items():
+        if pid in PROFILES and isinstance(v, dict):
+            out[pid] = {"name": v.get("name") or None,
+                        "auto": bool(v.get("auto", True))}
+    return out
+
+
+def save_settings(s):
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SETTINGS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(SETTINGS_PATH)          # 原子替换, 避免读到写一半的文件
+
+
+def setting(pid):
+    return {**DEFAULT_SETTING, **load_settings().get(pid, {})}
+
+
+def display_name(pid):
+    """用户改过就用用户的, 否则用代码里的默认名"""
+    return setting(pid)["name"] or PROFILES[pid]["name"]
+
+
+def is_auto(pid):
+    return setting(pid)["auto"]
+
+
+def set_name(pid, name):
+    """name 传 None 或空串 = 恢复默认名"""
+    if pid not in PROFILES:
+        raise KeyError(pid)
+    name = (name or "").strip()
+    if len(name) > NAME_MAX:
+        raise ValueError(f"名字最长 {NAME_MAX} 个字")
+    s = load_settings()
+    s.setdefault(pid, dict(DEFAULT_SETTING))["name"] = name or None
+    save_settings(s)
+    return display_name(pid)
+
+
+def set_auto(pid, auto):
+    if pid not in PROFILES:
+        raise KeyError(pid)
+    s = load_settings()
+    s.setdefault(pid, dict(DEFAULT_SETTING))["auto"] = bool(auto)
+    save_settings(s)
+    return bool(auto)
+
+
 def signal_args(pid, include_features=True):
     """展开成指定 profile 的 live_signal.py 命令行参数"""
     if pid not in PROFILES:
@@ -128,6 +202,12 @@ def signal_args(pid, include_features=True):
     for k, v in params.items():
         out += [f"--{k}", str(v)]
     out += ["--state", state_file(pid)]
+    # 手动模式的线不得自动记账。放在这里而不是各调用方自己判断,
+    # 是因为 daily_rebuild / web_server / 命令行 三处都走 signal_args,
+    # 写在这里就不可能出现"定时任务绕过了开关把账记了"这种事。
+    # 此参数不在 FINGERPRINT_KEYS 里, 所以来回切换不会弄坏已有持仓。
+    if not is_auto(pid):
+        out += ["--require-confirm"]
     if include_features and FEATURES_FROM:
         out += ["--features-from", FEATURES_FROM]
     return out
@@ -152,7 +232,10 @@ if __name__ == "__main__":
         print(f"  --features-from   {FEATURES_FROM}\n")
         for pid, p in PROFILES.items():
             mark = " (默认)" if pid == DEFAULT_PROFILE else ""
-            print(f"{pid:10s} {p['name']}{mark}")
+            nm = display_name(pid)
+            alias = "" if nm == p["name"] else f"  [原名 {p['name']}]"
+            print(f"{pid:10s} {nm}{mark}{alias}")
             print(f"           本金 {p['capital']:,.0f} / {p['tranche-n']} 只 / "
                   f"每只预算 {p['capital']/p['tranche-n']:,.0f}")
+            print(f"           记账 {'自动(按行情)' if is_auto(pid) else '手动(等确认成交)'}")
             print(f"           状态 {state_file(pid)}")

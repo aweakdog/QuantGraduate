@@ -19,7 +19,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from live_config import DEFAULT_PROFILE, PROFILES, state_file
+from live_config import (DEFAULT_PROFILE, PROFILES, display_name, is_auto,
+                         state_file)
 
 # 尾盘集合竞价前的下单窗口; t1open 则是次日开盘
 EXEC_WHEN = {
@@ -102,8 +103,9 @@ def _freshness(root: Path, state, plan):
 
 def list_profiles():
     """给前端做切换用的简表"""
-    return [{"id": k, "name": v["name"], "capital": v["capital"],
-             "positions": v["tranche-n"], "desc": v["desc"]}
+    return [{"id": k, "name": display_name(k), "default_name": v["name"],
+             "capital": v["capital"], "positions": v["tranche-n"],
+             "desc": v["desc"], "auto": is_auto(k)}
             for k, v in PROFILES.items()]
 
 
@@ -148,7 +150,8 @@ def build_recommend(root: Path, pid=None):
 
     return {
         "profile": pid,
-        "profile_name": prof["name"],
+        "profile_name": display_name(pid),
+        "auto": is_auto(pid),
         "profiles": list_profiles(),
         "signal_date": (plan or {}).get("signal_date"),
         "exec_when": EXEC_WHEN.get(((plan or {}).get("config") or {}).get("exec_mode", "t1close"),
@@ -170,8 +173,8 @@ def build_today(root: Path, pid=None):
     state = _load_json(live / state_file(pid))
     plan = _latest_plan(live, pid)
     if state is None:
-        return {"profile": pid, "profile_name": prof["name"],
-                "profiles": list_profiles(),
+        return {"profile": pid, "profile_name": display_name(pid),
+                "auto": is_auto(pid), "profiles": list_profiles(),
                 "action": "init", "headline": "这条线还没建仓",
                 "subline": f"本金 {prof['capital']:,.0f} / {prof['tranche-n']} 只, "
                            f"还没初始化。跑 init_profiles.py 建立。",
@@ -226,8 +229,12 @@ def build_today(root: Path, pid=None):
 
     return {
         "profile": pid,
-        "profile_name": prof["name"],
+        "profile_name": display_name(pid),
         "profile_desc": prof["desc"],
+        "auto": is_auto(pid),
+        # 实盘模式下的"等你填真实成交价"状态。存在时这条线已停止推进:
+        # 不会记账也不会出新信号, 直到提交成交回报。
+        "awaiting_confirm": state.get("awaiting_confirm") or None,
         "profiles": list_profiles(),
         "action": action,
         "headline": headline,
@@ -291,6 +298,55 @@ ACTION_HTML = """<!DOCTYPE html>
   .prof .pn{font-size:14px;font-weight:600;color:#e8eaed}
   .prof .pm{font-size:11px;color:#6f7889;margin-top:2px}
   .prof .pr{font-size:13px;font-weight:600;margin-top:3px}
+  /* 记账方式徽标: 纸面=自动按行情, 实盘=等你确认成交 */
+  .mode{display:inline-block;font-size:10px;font-weight:700;padding:1px 5px;
+        border-radius:4px;margin-left:4px;vertical-align:middle}
+  .mode-auto{background:#1e3a2b;color:#86efac}
+  .mode-man{background:#3a2a12;color:#fcd34d}
+
+  /* 操作按钮 */
+  .acts{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+  .btn{flex:1;min-width:96px;text-align:center;padding:9px 8px;border-radius:9px;
+       background:#1a1f29;color:#c9cdd6;font-size:13px;font-weight:600;cursor:pointer;
+       border:1px solid #262c38;transition:.15s;user-select:none}
+  .btn:active{transform:scale(.97)}
+  .btn-on{background:#14532d;border-color:#1a7a43;color:#bbf7d0}
+  .btn-off{background:#3a2a12;border-color:#7c5310;color:#fcd34d}
+  .btn-pri{background:#2563eb;border-color:#2563eb;color:#fff}
+  .btn[aria-disabled="true"]{opacity:.45;pointer-events:none}
+
+  /* 待确认成交面板 */
+  .cf{background:#14171e;border:1px solid #7c5310;border-radius:12px;
+      padding:14px;margin-bottom:14px}
+  .cf h3{font-size:15px;font-weight:600;color:#fcd34d;margin-bottom:4px}
+  .cf .cfs{font-size:12px;color:#8a93a6;margin-bottom:12px;line-height:1.7}
+  .cfr{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #1e222b}
+  .cfr:last-of-type{border-bottom:none}
+  .cfr .cfa{font-size:11px;font-weight:700;padding:2px 6px;border-radius:4px;flex:0 0 auto}
+  .cfa-sell{background:#4a1d1d;color:#fca5a5}
+  .cfa-buy{background:#14532d;color:#bbf7d0}
+  .cfr .cfn{flex:1;min-width:0;font-size:13px}
+  .cfr input{width:74px;background:#0b0d12;border:1px solid #2a3040;color:#e8eaed;
+             border-radius:6px;padding:6px 7px;font-size:13px;text-align:right;
+             font-family:inherit}
+  .cfr input:focus{outline:none;border-color:#2563eb}
+  .cfr .unit{font-size:11px;color:#6f7889;flex:0 0 auto}
+
+  /* 弹窗 */
+  .mask{position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;
+        align-items:center;justify-content:center;padding:20px;z-index:50}
+  .modal{background:#14171e;border:1px solid #2a3040;border-radius:14px;
+         padding:18px;width:100%;max-width:340px}
+  .modal h3{font-size:16px;font-weight:600;margin-bottom:6px}
+  .modal p{font-size:13px;color:#8a93a6;line-height:1.7;margin-bottom:12px}
+  .modal input[type=text]{width:100%;background:#0b0d12;border:1px solid #2a3040;
+         color:#e8eaed;border-radius:8px;padding:10px;font-size:15px;font-family:inherit}
+  .modal input[type=text]:focus{outline:none;border-color:#2563eb}
+  .mbtns{display:flex;gap:8px;margin-top:14px}
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);
+         background:#1e222b;border:1px solid #2a3040;color:#e8eaed;font-size:13px;
+         padding:10px 16px;border-radius:10px;z-index:60;max-width:88%;
+         box-shadow:0 8px 24px rgba(0,0,0,.5)}
 
   /* 主视图切换 */
   .tabs{display:flex;gap:6px;margin-bottom:12px}
@@ -382,6 +438,7 @@ ACTION_HTML = """<!DOCTYPE html>
     <div class="date" id="sigdate">加载中…</div>
   </div>
   <div class="profs" id="profs"></div>
+  <div class="acts" id="acts"></div>
   <div class="tabs">
     <div class="tab on" id="tab-act" onclick="setView('act')">明日操作</div>
     <div class="tab" id="tab-rec" onclick="setView('rec')">每日推荐</div>
@@ -392,6 +449,8 @@ ACTION_HTML = """<!DOCTYPE html>
     <span id="gen"></span>
   </div>
 </div>
+<div id="modal"></div>
+<div id="toast"></div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -475,12 +534,188 @@ function setPid(p){
   load();
 }
 
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+let toastT = null;
+function toast(msg, ms){
+  $('#toast').innerHTML = `<div class="toast">${esc(msg)}</div>`;
+  clearTimeout(toastT);
+  toastT = setTimeout(() => { $('#toast').innerHTML = ''; }, ms || 3200);
+}
+
+function closeModal(){ $('#modal').innerHTML = ''; }
+
+async function api(path, body){
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(body)});
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  return d;
+}
+
+// 当前这条线的信息 (从 PROFS 里取, 避免和后端载荷字段重复)
+const curProf = () => PROFS.find(p => p.id === PID) || {};
+
 function renderProfs(active){
   $('#profs').innerHTML = PROFS.map(p => `
     <div class="prof ${p.id===active?'on':''}" onclick="setPid('${p.id}')">
-      <div class="pn">${p.name}</div>
+      <div class="pn">${esc(p.name)}<span class="mode ${p.auto?'mode-auto':'mode-man'}">${
+        p.auto?'纸面':'实盘'}</span></div>
       <div class="pm">${p.positions} 只 · 每只 ${money(p.capital/p.positions)}</div>
     </div>`).join('');
+  renderActs();
+}
+
+function renderActs(){
+  const p = curProf();
+  if (!p.id){ $('#acts').innerHTML = ''; return; }
+  $('#acts').innerHTML = `
+    <div class="btn" onclick="askRename()">重命名</div>
+    ${p.auto
+      ? `<div class="btn btn-off" onclick="askAuto(false)">取消自动操作</div>`
+      : `<div class="btn btn-on"  onclick="askAuto(true)">开启自动操作</div>`}`;
+}
+
+function askRename(){
+  const p = curProf();
+  $('#modal').innerHTML = `
+    <div class="mask" onclick="if(event.target===this)closeModal()">
+      <div class="modal">
+        <h3>重命名</h3>
+        <p>只改显示名字，不影响这条线的本金、持仓数和已有持仓。<br>
+           留空则恢复默认名「${esc(p.default_name)}」。</p>
+        <input type="text" id="rn" maxlength="16" value="${esc(p.name)}"
+               placeholder="${esc(p.default_name)}">
+        <div class="mbtns">
+          <div class="btn" onclick="closeModal()">取消</div>
+          <div class="btn btn-pri" onclick="doRename()">保存</div>
+        </div>
+      </div>
+    </div>`;
+  setTimeout(() => { const i = $('#rn'); if (i){ i.focus(); i.select(); } }, 50);
+}
+
+async function doRename(){
+  const name = ($('#rn') || {}).value || '';
+  try {
+    const d = await api('/api/profile/rename', {profile: PID, name});
+    closeModal(); toast('已改名为「' + d.name + '」');
+    load();
+  } catch(e){ toast('改名失败: ' + e.message); }
+}
+
+function askAuto(on){
+  const p = curProf();
+  const body = on
+    ? `<p>切回<b style="color:#86efac">纸面模式</b>：系统每天按第二天的真实收盘价
+         自动记账，不需要你做任何确认。<br><br>
+         注意这是<b>模拟跟踪</b> —— 它假设你按计划成交了。如果你其实没下单，
+         账面就会和你的真实账户脱节。</p>`
+    : `<p>切到<b style="color:#fcd34d">实盘模式</b>：系统<b>不再自动记账</b>。
+         每次换仓后要你填真实成交价，填了才入账、才会出下一份计划。<br><br>
+         适合你真金白银在跑的那条线。代价是<b>你不确认它就会一直停在那</b>，
+         不会自己往前走。</p>`;
+  $('#modal').innerHTML = `
+    <div class="mask" onclick="if(event.target===this)closeModal()">
+      <div class="modal">
+        <h3>${on?'开启自动操作':'取消自动操作'} · ${esc(p.name)}</h3>
+        ${body}
+        <div class="mbtns">
+          <div class="btn" onclick="closeModal()">取消</div>
+          <div class="btn ${on?'btn-on':'btn-off'}" onclick="doAuto(${on})">确认切换</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function doAuto(on){
+  try {
+    const d = await api('/api/profile/auto', {profile: PID, auto: on});
+    closeModal(); toast(d.note, 5000);
+    load();
+  } catch(e){ toast('切换失败: ' + e.message); }
+}
+
+// ── 实盘模式: 待确认成交 ──
+// 计划里的每一笔预填「计划股数 + 参考价」, 你按券商实际成交改。
+// 没成交的把股数改成 0, 那笔就不入账。
+let CFROWS = [];
+
+function confirmPanel(d){
+  const a = d.awaiting_confirm;
+  CFROWS = [].concat(d.sell || [], d.buy || []);
+  if (!CFROWS.length) {
+    return `<div class="cf">
+      <h3>等你确认：${a.exec_date} 没有需要成交的单</h3>
+      <div class="cfs">这条线是实盘模式, 需要你确认后才继续。当天无买卖操作。</div>
+      <div class="btn btn-pri" onclick="submitConfirm(true)">确认无操作, 继续</div>
+    </div>`;
+  }
+  const rows = CFROWS.map((r, i) => `
+    <div class="cfr">
+      <span class="cfa ${r.side==='sell'?'cfa-sell':'cfa-buy'}">${r.side==='sell'?'卖':'买'}</span>
+      <span class="cfn">${esc(r.name||r.code)}<br>
+        <span style="color:#6f7889;font-size:11px">${r.code}</span></span>
+      <input type="number" id="cs${i}" value="${r.shares}" step="100" min="0" inputmode="numeric">
+      <span class="unit">股</span>
+      <input type="number" id="cp${i}" value="${r.ref_price==null?'':r.ref_price}"
+             step="0.001" min="0" inputmode="decimal">
+      <span class="unit">元</span>
+    </div>`).join('');
+  return `<div class="cf">
+    <h3>等你确认 ${a.exec_date} 的真实成交</h3>
+    <div class="cfs">
+      这条线是<b style="color:#fcd34d">实盘模式</b>，不会自动记账。<br>
+      下面预填的是计划股数和参考价，请按券商 App 里的<b>实际成交</b>改。<br>
+      某笔没成交就把股数改成 <b>0</b>。全都没做就点「当天没下单」。
+    </div>
+    ${rows}
+    <div class="mbtns">
+      <div class="btn" onclick="submitConfirm(true)">当天没下单</div>
+      <div class="btn btn-pri" onclick="submitConfirm(false)">提交成交</div>
+    </div>
+  </div>`;
+}
+
+async function submitConfirm(none){
+  let fills = [];
+  if (!none){
+    for (let i = 0; i < CFROWS.length; i++){
+      const r = CFROWS[i];
+      const sh = parseInt(($('#cs'+i)||{}).value, 10);
+      const px = parseFloat(($('#cp'+i)||{}).value);
+      if (!sh) continue;                         // 0 或空 = 这笔没成交
+      if (!(sh > 0)){ toast(`${r.name||r.code} 的股数不对`); return; }
+      if (!(px > 0)){ toast(`${r.name||r.code} 请填成交价`); return; }
+      fills.push({code: r.code, action: r.side, shares: sh, price: px});
+    }
+    if (!fills.length){
+      toast('一笔都没填, 如果确实没下单请点「当天没下单」'); return;
+    }
+  }
+  try {
+    const d = await api('/api/profile/confirm', {profile: PID, fills});
+    toast(d.note, 6000);
+    pollRun();
+  } catch(e){ toast('提交失败: ' + e.message); }
+}
+
+// 结算要跑一遍模型, 轮询到跑完再刷新页面
+async function pollRun(){
+  for (let i = 0; i < 90; i++){
+    await new Promise(r => setTimeout(r, 2000));
+    let s;
+    try { s = await (await fetch('/api/signal-status')).json(); } catch(e){ continue; }
+    if (!s.active){
+      const log = s.log || '';
+      if (/ERROR|Traceback/.test(log)) toast('结算报错, 详情见运维仪表盘', 6000);
+      else toast('已结算并生成新计划', 4000);
+      load();
+      return;
+    }
+  }
+  toast('结算耗时偏长, 请稍后刷新');
 }
 
 async function loadRec(){
@@ -525,6 +760,9 @@ async function loadAct(){
 
   const bcls = {none:'b-none', trade:'b-trade', cash:'b-cash', stale:'b-stale', init:'b-init'}[d.action] || 'b-init';
   let h = '';
+
+  // 实盘模式在等你确认成交时, 这个最紧要 —— 整条线都停在那儿了
+  if (d.awaiting_confirm) h += confirmPanel(d);
 
   // 主横幅
   h += `<div class="banner ${bcls}">
@@ -575,7 +813,9 @@ async function loadAct(){
         ${d.profile_desc||''}<br>
         持仓 <b style="color:#c9cdd6">${s.positions||'--'} 只</b> ·
         每 <b style="color:#c9cdd6">${s.hold_days||'--'} 个交易日</b>整体换仓 ·
-        每只预算 <b style="color:#c9cdd6">${money(s.per_slot_budget)}</b>
+        每只预算 <b style="color:#c9cdd6">${money(s.per_slot_budget)}</b><br>
+        记账方式 <b style="color:${d.auto?'#86efac':'#fcd34d'}">${
+          d.auto ? '纸面 · 每天按行情自动记账' : '实盘 · 等你确认真实成交'}</b>
       </div>
       <div style="font-size:13px;color:#8a93a6;line-height:2;margin-top:10px;
                   border-top:1px solid #1e222b;padding-top:10px">
@@ -590,7 +830,12 @@ async function loadAct(){
 function load(){ return VIEW === 'rec' ? loadRec() : loadAct(); }
 
 setView(VIEW);
-setInterval(load, 60000);
+// 定时刷新会重建 DOM, 正在填成交价或开着弹窗时刷新会把输入洗掉
+setInterval(() => {
+  if ($('#modal').innerHTML) return;
+  if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+  load();
+}, 60000);
 </script>
 </body>
 </html>
