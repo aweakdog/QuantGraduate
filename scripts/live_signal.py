@@ -136,6 +136,9 @@ ap.add_argument("--sold-at", type=float, default=None,
                 help="配合 --drop-lot: 真实卖出价, 现金按 股数x价格-手续费 增加")
 ap.add_argument("--phantom", action="store_true",
                 help="配合 --drop-lot: 这笔持仓本就不存在(记账错误), 只删记录不动现金")
+ap.add_argument("--drop-shares", type=int, default=None,
+                help="配合 --drop-lot: 只处理部分股数(部分卖出/部分记错), "
+                     "不填则整笔删除。剩下的仓位保留原开仓日, 到期节奏不变")
 ap.add_argument("--note", default="", help="给现金/持仓类操作附一句备注")
 args = ap.parse_args()
 
@@ -510,14 +513,31 @@ def settle(st, pending, exec_date, kl, names, cal):
             gross = px * sh
             fee = max(gross * TRADE_COST, MIN_FEE)
             if f["action"] == "sell":
-                lot = next((l for l in st["lots"] if str(l["code"])[:6] == code
-                            and l["shares"] == sh), None)
-                if lot is None:
-                    raise SystemExit(f"ERROR: 回报里的卖出 {code} x{sh} 找不到对应持仓")
-                st["lots"].remove(lot)
+                # 支持部分卖出: 实盘常有只成交一部分的情况(挂单没全成、
+                # 自己只卖了一半)。原先要求股数与持仓完全相等, 一旦部分成交
+                # 就直接报错退出, 逼人去做整体对账。
+                # 多笔同代码时按开仓先后(FIFO)扣减; 剩余仓位保留原
+                # open_signal_date, 所以到期节奏不变。
+                lots = [l for l in st["lots"] if str(l["code"])[:6] == code]
+                if not lots:
+                    raise SystemExit(f"ERROR: 回报里卖出了 {code}, 但持仓里没有这只")
+                total = sum(l["shares"] for l in lots)
+                if sh > total:
+                    raise SystemExit(
+                        f"ERROR: 回报里卖出 {code} x{sh} 股, 但只持有 {total} 股")
+                lots.sort(key=lambda l: (str(l.get("open_date") or ""), l.get("id") or 0))
+                left = sh
+                for l in lots:
+                    if left <= 0:
+                        break
+                    take = min(l["shares"], left)
+                    l["shares"] -= take
+                    left -= take
+                st["lots"] = [l for l in st["lots"] if l["shares"] > 0]
                 st["cash"] += gross - fee
                 fills.append({"code": code, "action": "sell", "shares": sh, "price": px,
                               "fee": round(fee, 2), "net": round(gross - fee, 2),
+                              "partial": sh < total, "remaining": total - sh,
                               "source": "manual"})
             else:
                 st["cash"] -= gross + fee
@@ -937,45 +957,63 @@ def do_drop_lot(st, kl, names):
     if not hits:
         held = ", ".join(sorted(str(l["code"])[:6] for l in st["lots"])) or "(空仓)"
         raise SystemExit(f"ERROR: 持仓里没有 {code}。当前持仓: {held}")
-    if len(hits) > 1:
-        raise SystemExit(f"ERROR: {code} 有 {len(hits)} 笔记录, 不确定删哪笔。"
-                         f"请用 /pro 的整体对账处理")
-    lot = hits[0]
     nm = names.get(code, "")
+    total = sum(l["shares"] for l in hits)
+    avg_cost = (sum(l["shares"] * l["buy_price"] for l in hits) / total) if total else 0
+
+    n_drop = total if args.drop_shares is None else int(args.drop_shares)
+    if n_drop <= 0:
+        raise SystemExit(f"ERROR: 股数必须为正 (收到 {n_drop})")
+    if n_drop > total:
+        raise SystemExit(f"ERROR: 要处理 {n_drop} 股, 但 {code} 只持有 {total} 股")
+    partial = n_drop < total
     before = snapshot(st, kl, names)
 
     bak = backup_state("droplot")
-    st["lots"] = [l for l in st["lots"] if l is not lot]
+    # 多笔同代码时按开仓先后(FIFO)扣减; 剩下的仓位不改
+    # open_signal_date, 所以到期节奏不变
+    hits.sort(key=lambda l: (str(l.get("open_date") or ""), l.get("id") or 0))
+    left = n_drop
+    for l in hits:
+        if left <= 0:
+            break
+        take = min(l["shares"], left)
+        l["shares"] -= take
+        left -= take
+    st["lots"] = [l for l in st["lots"] if l["shares"] > 0]
 
     if args.sold_at is not None:
         px = float(args.sold_at)
-        gross = lot["shares"] * px
+        gross = n_drop * px
         fee = max(gross * TRADE_COST, MIN_FEE)
         st["cash"] = float(st["cash"]) + gross - fee
-        kind, detail = "drop_sold", (f"按 {px} 卖出 {lot['shares']} 股, "
+        kind, detail = "drop_sold", (f"按 {px} 卖出 {n_drop} 股, "
                                      f"净入 ¥{gross - fee:,.2f} (手续费 {fee:,.2f})")
     else:
         px, gross, fee = None, 0.0, 0.0
-        kind, detail = "drop_phantom", "记账错误, 只删记录不动现金"
+        kind, detail = "drop_phantom", f"记账错误, 删掉 {n_drop} 股记录, 现金不动"
 
     after = snapshot(st, kl, names)
     st.setdefault("history", []).append({
         "type": kind, "at": datetime.now().isoformat(timespec="seconds"),
         "note": args.note,
-        "lot": {"code": code, "name": nm, "shares": lot["shares"],
-                "buy_price": lot["buy_price"], "open_date": lot.get("open_date")},
+        "lot": {"code": code, "name": nm, "shares": n_drop,
+                "buy_price": round(avg_cost, 4), "held_before": total},
+        "partial": partial, "remaining": total - n_drop,
         "sold_at": px, "fee": round(fee, 2) if fee else 0.0,
         "before": {"cash": before["cash"], "equity": before["equity"]},
         "after": {"cash": after["cash"], "equity": after["equity"]},
     })
 
     W = 68
-    print(f"\n{'='*W}\n  删除持仓 {code} {nm}\n{'='*W}")
-    print(f"  原持仓 : {lot['shares']} 股, 成本 {lot['buy_price']:.3f}, "
-          f"开仓 {lot.get('open_date')}")
+    title = "部分删除持仓" if partial else "删除持仓"
+    print(f"\n{'='*W}\n  {title} {code} {nm}\n{'='*W}")
+    print(f"  原持仓 : {total} 股, 均价成本 {avg_cost:.3f}")
+    print(f"  本次   : {n_drop} 股" + (f", 剩下 {total - n_drop} 股继续持有"
+                                       f"(到期节奏不变)" if partial else " (全部)"))
     print(f"  处理   : {detail}")
     if args.sold_at is not None:
-        pnl = gross - fee - lot["shares"] * lot["buy_price"]
+        pnl = gross - fee - n_drop * avg_cost
         print(f"  这笔盈亏: ¥{pnl:+,.2f}")
     print(f"  现金   : ¥{before['cash']:,.2f}  ->  ¥{after['cash']:,.2f}")
     print(f"  总资产 : ¥{before['equity']:,.2f}  ->  ¥{after['equity']:,.2f}")
@@ -1076,6 +1114,13 @@ if pending:
     gp = date_pos[p_sig]
     exec_date = all_dates[gp + 1] if gp + 1 < len(all_dates) else None
     if exec_date is None:
+        # 带了成交回报却无法结算时必须报错。否则网页那边会以为提交成功
+        # (进程退出码 0), 而账目其实一动没动 —— 用户会以为已经记上了。
+        if args.confirm:
+            raise SystemExit(
+                f"ERROR: {p_sig.date()} 的计划还没到执行日的行情 —— 数据最新只到 "
+                f"{pd.Timestamp(all_dates[-1]).date()}, 现在无法结算成交。\n"
+                "  执行日收盘、当晚数据更新完成后再提交成交回报。")
         print(f"\n[结算] {p_sig.date()} 的挂单尚无 T+1 行情, 计划保持有效, 本次不重新出信号。")
         print(f"耗时 {(datetime.now()-t0).total_seconds():.0f}s")
         sys.exit(0)

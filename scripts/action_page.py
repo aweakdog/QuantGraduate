@@ -286,6 +286,10 @@ def build_today(root: Path, pid=None):
         # 实盘模式下的"等你填真实成交价"状态。存在时这条线已停止推进:
         # 不会记账也不会出新信号, 直到提交成交回报。
         "awaiting_confirm": state.get("awaiting_confirm") or None,
+        # 现在能不能提交成交回报。只有系统确实在等确认时才能提交 ——
+        # 计划刚出、执行日还没到时提交是没法结算的(没有执行日行情),
+        # 前端据此把打勾锁住, 免得用户白填一遍。
+        "can_confirm": (not is_auto(pid)) and bool(state.get("awaiting_confirm")),
         "profiles": list_profiles(),
         "action": action,
         "headline": headline,
@@ -375,17 +379,25 @@ ACTION_HTML = """<!DOCTYPE html>
       padding:14px;margin-bottom:14px}
   .cf h3{font-size:15px;font-weight:600;color:#fcd34d;margin-bottom:4px}
   .cf .cfs{font-size:12px;color:#8a93a6;margin-bottom:12px;line-height:1.7}
-  .cfr{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #1e222b}
-  .cfr:last-of-type{border-bottom:none}
-  .cfr .cfa{font-size:11px;font-weight:700;padding:2px 6px;border-radius:4px;flex:0 0 auto}
-  .cfa-sell{background:#4a1d1d;color:#fca5a5}
-  .cfa-buy{background:#14532d;color:#bbf7d0}
-  .cfr .cfn{flex:1;min-width:0;font-size:13px}
-  .cfr input{width:74px;background:#0b0d12;border:1px solid #2a3040;color:#e8eaed;
-             border-radius:6px;padding:6px 7px;font-size:13px;text-align:right;
-             font-family:inherit}
-  .cfr input:focus{outline:none;border-color:#2563eb}
-  .cfr .unit{font-size:11px;color:#6f7889;flex:0 0 auto}
+  /* 纸面模式的操作行是只读的: 打勾不影响账目, 给勾反而误导 */
+  .op.ro{cursor:default;display:flex;align-items:center;gap:11px}
+  .op.ro .tick{display:none}
+  /* 实盘模式: 上半行点击打勾, 勾上后下半行出现真实股数/成交价 */
+  .op .rowtop{display:flex;align-items:center;gap:11px;cursor:pointer}
+  .fillbox{display:flex;align-items:center;gap:7px;margin-top:9px;padding-top:9px;
+           border-top:1px dashed #2a3040}
+  .fillbox .fl{font-size:12px;color:#8a93a6;flex:0 0 auto}
+  .fillbox input{width:82px;background:#0b0d12;border:1px solid #2a3040;color:#e8eaed;
+                 border-radius:6px;padding:6px 7px;font-size:13px;text-align:right;
+                 font-family:inherit}
+  .fillbox input:focus{outline:none;border-color:#2563eb}
+  .fillbox .unit{font-size:11px;color:#6f7889;flex:0 0 auto}
+  /* 说明条: 讲清打勾到底算不算数 */
+  .tipbox{background:#0b0d12;border-radius:9px;padding:10px 12px;margin-bottom:11px;
+          font-size:12px;color:#8a93a6;line-height:1.75}
+  .tipbox b{color:#c9cdd6}
+  .tipbox.warn-tip{border:1px solid #7c5310}
+  .tipbox.warn-tip b{color:#fcd34d}
 
   /* 弹窗 */
   .mask{position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;
@@ -458,14 +470,16 @@ ACTION_HTML = """<!DOCTYPE html>
   .card{background:#14171e;border-radius:14px;padding:16px;margin-bottom:12px}
   .card h2{font-size:13px;color:#8a93a6;font-weight:600;letter-spacing:.4px;margin-bottom:12px}
 
-  /* 操作行: 大字号 + 勾选框, 照着做完打勾 */
-  .op{display:flex;align-items:center;gap:12px;padding:13px 12px;border-radius:11px;
+  /* 操作行。外层用 block: 实盘模式下勾上后要在下方再放一行成交输入框,
+     横向排布交给内部的 .rowtop (实盘) 或 .op.ro 自身 (纸面只读)。 */
+  .op{display:block;padding:13px 12px;border-radius:11px;
       margin-bottom:8px;background:#1b1f28;border-left:4px solid #444}
   .op:last-child{margin-bottom:0}
   .op.sell{border-left-color:#ef4444}
   .op.buy{border-left-color:#22c55e}
   .op.hold{border-left-color:#3f4658}
-  .op.done{opacity:.4}
+  /* 打勾 = 这笔会记入系统, 所以是"选中"而不是"划掉", 用高亮不用变灰 */
+  .op.done{background:#182a1e;box-shadow:inset 0 0 0 1px #1a7a43}
   .op .tick{width:26px;height:26px;border-radius:7px;border:2px solid #4b5567;flex:0 0 auto;
             display:flex;align-items:center;justify-content:center;font-size:15px;color:transparent;
             cursor:pointer;transition:.15s}
@@ -537,29 +551,51 @@ const doneKey = () => 'done_' + PID + '_' + DAY;
 const getDone = () => { try { return JSON.parse(localStorage.getItem(doneKey())||'[]'); } catch(e){ return []; } };
 const setDone = a => localStorage.setItem(doneKey(), JSON.stringify(a));
 
-function toggle(id, el){
-  const d = getDone(), i = d.indexOf(id);
-  if (i >= 0) d.splice(i,1); else d.push(id);
-  setDone(d);
-  el.classList.toggle('done');
-}
-
 const money = v => v == null ? '--' : '¥' + Number(v).toLocaleString('zh-CN',{maximumFractionDigits:0});
 
-function opRow(r, side){
+// 操作行有三种形态, 取决于记账方式:
+//   纸面模式        -> 只读, 不给打勾。打勾不影响账目, 给了勾反而误导
+//   实盘 + 等确认   -> 打勾 = 记入系统, 勾上后可改真实股数与成交价
+//   实盘 + 还没到执行日 -> 只读, 提示明天收盘后回来确认
+function opRow(r, side, mode){
   const id = side + '_' + r.code;
-  const done = getDone().includes(id) ? ' done' : '';
   const tag = side === 'sell' ? '卖出' : '买入';
   const px = r.ref_price == null ? '' : ' · 参考价 ' + r.ref_price;
-  return `<div class="op ${side}${done}" onclick="toggle('${id}',this)">
-    <div class="tick">✓</div>
-    <div class="body">
-      <div class="line1"><span class="tag">${tag}</span>${r.name||r.code}
+  const head = `<div class="body">
+      <div class="line1"><span class="tag">${tag}</span>${esc(r.name||r.code)}
         <span style="font-size:13px;color:#6f7889;font-weight:400">${r.code}</span></div>
       <div class="line2">${r.shares} 股${px}</div>
     </div>
-    <div class="amt">${money(r.amount)}</div>
+    <div class="amt">${money(r.amount)}</div>`;
+
+  if (mode !== 'confirm'){
+    return `<div class="op ${side} ro">${head}</div>`;
+  }
+
+  const on = getDone().includes(id);
+  return `<div class="op ${side} ${on?'done':''}" id="row_${id}">
+    <div class="rowtop" onclick="tickRow('${id}')">
+      <div class="tick">✓</div>${head}
+    </div>
+    <div class="fillbox" id="fb_${id}" style="display:${on?'flex':'none'}">
+      <span class="fl">实际</span>
+      <input type="number" id="fs_${id}" value="${r.shares}" step="100" min="0" inputmode="numeric">
+      <span class="unit">股</span>
+      <input type="number" id="fp_${id}" value="${r.ref_price==null?'':r.ref_price}"
+             step="0.001" min="0" inputmode="decimal">
+      <span class="unit">元</span>
+    </div>
   </div>`;
+}
+
+// 打勾 = 这笔真的成交了, 会记入系统; 不打勾 = 没成交, 不动账
+function tickRow(id){
+  const d = getDone(), i = d.indexOf(id);
+  if (i >= 0) d.splice(i, 1); else d.push(id);
+  setDone(d);
+  const row = $('#row_' + id), fb = $('#fb_' + id);
+  if (row) row.classList.toggle('done', i < 0);
+  if (fb) fb.style.display = i < 0 ? 'flex' : 'none';
 }
 
 function holdRow(r){
@@ -919,68 +955,40 @@ async function doAuto(on){
   } catch(e){ toast('切换失败: ' + e.message); }
 }
 
-// ── 实盘模式: 待确认成交 ──
-// 计划里的每一笔预填「计划股数 + 参考价」, 你按券商实际成交改。
-// 没成交的把股数改成 0, 那笔就不入账。
-let CFROWS = [];
+// ── 实盘模式: 打勾即记账 ──
+// 打了勾的行才会记入系统, 每行可改真实股数与成交价(股数改小 = 部分成交)。
+// 没打勾的一律当作没成交, 不动账。
+let OPROWS = [];
 
-function confirmPanel(d){
-  const a = d.awaiting_confirm;
-  CFROWS = [].concat(d.sell || [], d.buy || []);
-  if (!CFROWS.length) {
-    return `<div class="cf">
-      <h3>等你确认：${a.exec_date} 没有需要成交的单</h3>
-      <div class="cfs">这条线是实盘模式, 需要你确认后才继续。当天无买卖操作。</div>
-      <div class="btn btn-pri" onclick="submitConfirm(true)">确认无操作, 继续</div>
-    </div>`;
-  }
-  const rows = CFROWS.map((r, i) => `
-    <div class="cfr">
-      <span class="cfa ${r.side==='sell'?'cfa-sell':'cfa-buy'}">${r.side==='sell'?'卖':'买'}</span>
-      <span class="cfn">${esc(r.name||r.code)}<br>
-        <span style="color:#6f7889;font-size:11px">${r.code}</span></span>
-      <input type="number" id="cs${i}" value="${r.shares}" step="100" min="0" inputmode="numeric">
-      <span class="unit">股</span>
-      <input type="number" id="cp${i}" value="${r.ref_price==null?'':r.ref_price}"
-             step="0.001" min="0" inputmode="decimal">
-      <span class="unit">元</span>
-    </div>`).join('');
-  return `<div class="cf">
-    <h3>等你确认 ${a.exec_date} 的真实成交</h3>
-    <div class="cfs">
-      这条线是<b style="color:#fcd34d">实盘模式</b>，不会自动记账。<br>
-      下面预填的是计划股数和参考价，请按券商 App 里的<b>实际成交</b>改。<br>
-      某笔没成交就把股数改成 <b>0</b>。全都没做就点「当天没下单」。
-    </div>
-    ${rows}
-    <div class="mbtns">
-      <div class="btn" onclick="submitConfirm(true)">当天没下单</div>
-      <div class="btn btn-pri" onclick="submitConfirm(false)">提交成交</div>
-    </div>
-  </div>`;
-}
-
-async function submitConfirm(none){
+async function submitTicked(none){
   let fills = [];
   if (!none){
-    for (let i = 0; i < CFROWS.length; i++){
-      const r = CFROWS[i];
-      const sh = parseInt(($('#cs'+i)||{}).value, 10);
-      const px = parseFloat(($('#cp'+i)||{}).value);
-      if (!sh) continue;                         // 0 或空 = 这笔没成交
-      if (!(sh > 0)){ toast(`${r.name||r.code} 的股数不对`); return; }
-      if (!(px > 0)){ toast(`${r.name||r.code} 请填成交价`); return; }
+    const done = getDone();
+    for (const r of OPROWS){
+      const id = r.side + '_' + r.code;
+      if (!done.includes(id)) continue;          // 没打勾 = 没成交
+      const sh = parseInt(($('#fs_' + id) || {}).value, 10);
+      const px = parseFloat(($('#fp_' + id) || {}).value);
+      if (!(sh > 0)){ toast(`${r.name||r.code}: 股数要大于 0，没成交就取消打勾`, 5000); return; }
+      if (sh % 100 && r.side === 'buy'){
+        toast(`${r.name||r.code}: 买入股数要是 100 的整数倍`, 5000); return;
+      }
+      if (!(px > 0)){ toast(`${r.name||r.code}: 请填真实成交价`, 5000); return; }
+      if (r.side === 'sell' && sh > r.shares){
+        toast(`${r.name||r.code}: 卖出 ${sh} 股超过持有的 ${r.shares} 股`, 5000); return;
+      }
       fills.push({code: r.code, action: r.side, shares: sh, price: px});
     }
     if (!fills.length){
-      toast('一笔都没填, 如果确实没下单请点「当天没下单」'); return;
+      toast('一笔都没打勾。如果确实都没成交, 请点「一笔都没成交」', 5000); return;
     }
   }
   try {
     const d = await api('/api/profile/confirm', {profile: PID, fills});
+    setDone([]);                                 // 已入账, 勾清掉免得下轮串
     toast(d.note, 6000);
     pollRun();
-  } catch(e){ toast('提交失败: ' + e.message); }
+  } catch(e){ toast('提交失败: ' + e.message, 8000); }
 }
 
 // 结算要跑一遍模型, 轮询到跑完再刷新页面
@@ -1043,8 +1051,20 @@ async function loadAct(){
   const bcls = {none:'b-none', trade:'b-trade', cash:'b-cash', stale:'b-stale', init:'b-init'}[d.action] || 'b-init';
   let h = '';
 
-  // 实盘模式在等你确认成交时, 这个最紧要 —— 整条线都停在那儿了
-  if (d.awaiting_confirm) h += confirmPanel(d);
+  // 实盘模式在等你确认时, 整条线都停着, 所以置顶提示。
+  // 有买卖单时确认入口在下面的操作清单里(打勾); 没有单时这里直接给个按钮。
+  if (d.awaiting_confirm){
+    const ac = d.awaiting_confirm;
+    const hasOrders = d.sell.length || d.buy.length;
+    h += `<div class="cf">
+      <h3>等你确认 ${ac.exec_date} 的成交</h3>
+      <div class="cfs">这条线是<b style="color:#fcd34d">实盘模式</b>，
+        在你确认之前<b>不会记账、也不会出新计划</b>。` +
+      (hasOrders ? `<br>请在下面的操作清单里给成交了的打勾。</div>`
+                 : `<br>当天没有需要买卖的单子。</div>
+        <div class="btn btn-pri" onclick="submitTicked(true)">确认无操作, 继续</div>`) +
+      `</div>`;
+  }
 
   // 主横幅
   h += `<div class="banner ${bcls}">
@@ -1059,16 +1079,42 @@ async function loadAct(){
   if (d.freshness && d.freshness.stale && d.action !== 'stale')
     h += `<div class="warn">${d.freshness.note}</div>`;
 
-  // 操作清单
+  // 操作清单。打勾的含义完全取决于记账方式, 所以标题和说明也跟着变
   if (d.sell.length || d.buy.length){
-    h += `<div class="card"><h2>操作清单 · 点一下打勾</h2>`;
-    h += d.sell.map(r => opRow(r,'sell')).join('');
-    h += d.buy.map(r => opRow(r,'buy')).join('');
-    h += `<ol class="steps">
-        <li>${d.exec_when} 打开券商 App</li>
-        <li>先卖后买, 按上面的股数下单</li>
-        <li>成交后逐条打勾, 明天页面会自动结算</li>
-      </ol></div>`;
+    const mode = d.can_confirm ? 'confirm' : 'ro';
+    OPROWS = [].concat(d.sell, d.buy);
+    h += `<div class="card"><h2>操作清单${
+      mode === 'confirm' ? ' · 打勾即记入系统' : ''}</h2>`;
+
+    if (mode === 'confirm'){
+      h += `<div class="tipbox warn-tip">
+        这条线是<b>实盘模式</b>：<b>打勾的才会记入系统</b>，没打勾的就当没成交。<br>
+        勾上后可以改成真实股数和成交价 —— <b>只成交了一部分就改股数</b>。</div>`;
+    } else if (!d.auto){
+      h += `<div class="tipbox">实盘模式：${d.exec_when}下单后，
+        <b>执行日当晚数据更新完</b>再回来打勾确认。现在还没到时候，先照着做即可。</div>`;
+    } else {
+      h += `<div class="tipbox">纸面模式：系统会<b>按行情自动记账</b>，不用打勾。<br>
+        想按你的真实成交来记账，就点上面的「取消自动操作」。</div>`;
+    }
+
+    h += d.sell.map(r => opRow(r,'sell',mode)).join('');
+    h += d.buy.map(r => opRow(r,'buy',mode)).join('');
+
+    if (mode === 'confirm'){
+      h += `<div class="mbtns">
+          <div class="btn" onclick="submitTicked(true)">一笔都没成交</div>
+          <div class="btn btn-pri" onclick="submitTicked(false)">提交打勾的成交</div>
+        </div>`;
+    } else {
+      h += `<ol class="steps">
+          <li>${d.exec_when} 打开券商 App</li>
+          <li>先卖后买, 按上面的股数下单</li>
+          ${d.auto ? '<li>系统次日按行情自动结算, 你不用回来操作</li>'
+                   : '<li>执行日当晚回来打勾, 填真实成交价</li>'}
+        </ol>`;
+    }
+    h += `</div>`;
   }
 
   // 持仓
