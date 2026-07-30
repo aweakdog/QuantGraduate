@@ -98,7 +98,8 @@ ap.add_argument("--n-features", type=int, default=80)
 ap.add_argument("--corr-threshold", type=float, default=0.9)
 ap.add_argument("--feat-cutoff", default="2023-09-19",
                 help="特征筛选只允许用该日期之前的数据 (与回测保持一致)")
-ap.add_argument("--features-from", default="wf_daily_em_t1close_s001_ts2022-09-01_te2026-07-27_cap20000.json",
+ap.add_argument("--features-from",
+                default="wf_daily_em_t1close_s001_fundfix_ts2022-09-01_te2026-07-27_cap20000.json",
                 help="直接复用回测结果 json 里的 selected_features (data/processed/ 下); "
                      "设为 none 则现场重新筛选")
 ap.add_argument("--capital", type=float, default=20000.0, help="初始本金 (仅 --init 时使用)")
@@ -123,6 +124,17 @@ TRAIN_PATH = DATA_DIR / "processed" / args.train_file
 KLINE_DIR = DATA_DIR / "raw" / "kline"
 LIVE_DIR = DATA_DIR / "live"
 STATE_PATH = LIVE_DIR / args.state
+
+# 计划文件名跟着状态文件走, 否则多条并行线(不同本金/持仓数)会写同一个
+# plan_<日期>.json 互相覆盖。state.json -> plan_<日期>.json (兼容旧数据);
+# state_aggr5w.json -> plan_aggr5w_<日期>.json
+_state_stem = Path(args.state).stem
+if _state_stem == "state":
+    PLAN_PREFIX = "plan"
+elif _state_stem.startswith("state_"):
+    PLAN_PREFIX = "plan_" + _state_stem[len("state_"):]
+else:
+    PLAN_PREFIX = "plan_" + _state_stem
 
 LABEL_RAW = "fwd_1d_ret" if args.label == "1d" else "fwd_5d_ret"
 LABEL = "y_target"
@@ -232,10 +244,13 @@ def apply_pit_universe(df, uni_file):
     u = pd.read_parquet(DATA_DIR / "universe" / uni_file)
     u["effective_date"] = pd.to_datetime(u["effective_date"])
     u["code6"] = u["code"].astype(str).str.zfill(6)
-    eff = np.array(sorted(u["effective_date"].unique()))
+    # 用 DatetimeIndex 而非 np.array(sorted(...)): 后者得到 object 数组,
+    # 与 datetime64[ns] 的 date 列做 searchsorted 会退化成 Timestamp<int 报错
+    # (训练集 parquet 的时间精度 ms/ns 不固定, 这里必须对精度不敏感)
+    eff = pd.DatetimeIndex(sorted(pd.to_datetime(u["effective_date"].unique())))
     members = {d: set(g["code6"]) for d, g in u.groupby("effective_date")}
     code6 = df["code"].astype(str).str[:6]
-    period = np.searchsorted(eff, df["date"].values, side="right") - 1
+    period = eff.searchsorted(pd.DatetimeIndex(df["date"]), side="right") - 1
     keep = np.zeros(len(df), dtype=bool)
     for i, d in enumerate(eff):
         m = period == i
@@ -661,6 +676,22 @@ def do_sync(st, kl, names):
         raise SystemExit("ERROR: 对账文件必须包含 cash 和 positions 两个字段")
     cal = cal_from_state(st)
     before = snapshot(st, kl, names)
+
+    # ── 防误操作: 空表单会把账户抹平 ──
+    # 网页端若现金输入框为空, parseFloat("")=NaN 经 ||0 会变成 0, 提交后
+    # 静默把现金清零。这种"0现金+0持仓"对纸面账户永远不是合理输入。
+    try:
+        cash_in = float(payload["cash"])
+    except (TypeError, ValueError):
+        raise SystemExit(f"ERROR: cash 必须是数字, 收到 {payload['cash']!r}")
+    if cash_in < 0:
+        raise SystemExit(f"ERROR: cash 不能为负 (收到 {cash_in})")
+    if cash_in == 0 and not payload["positions"] and not payload.get("confirm_empty"):
+        raise SystemExit(
+            "ERROR: 对账内容为「0 现金 + 0 持仓」, 会清空账户, 已拒绝。\n"
+            f"  当前状态: 现金 ¥{before['cash']:,.2f} / 总资产 ¥{before['equity']:,.2f}\n"
+            "  如果只是想看看, 直接关闭弹窗即可; 若确实要清空,\n"
+            "  请在对账 json 里显式加上 \"confirm_empty\": true")
     old_by_code = {str(l["code"])[:6]: l for l in st["lots"]}
 
     new_lots, notes = [], []
@@ -1006,6 +1037,22 @@ if not keep_plan:
 print(f"\n  注: 股数按 {pd.Timestamp(SIGNAL_DATE).date()} 收盘价估算。次日价格变动导致资金不足时, "
       f"按可用资金向下取整到 100 股。")
 
+# ── 每日推荐榜 ──
+# 模型当天打分最高的前 20 只, 自带名称/分数/收盘价, 网页不用再查行情。
+# 注意它只反映模型排序, 不含"买不买得起一手"的资金约束 —— 每只预算
+# = 总资产/持仓数, 买不起一手的会被跳过, 所以实际买入以 buy 为准。
+recommend = []
+for _i, _c in enumerate(list(ranked["code"].head(20))):
+    _px = kl.px(_c, SIGNAL_DATE, "close")
+    recommend.append({
+        "rank": _i + 1,
+        "code": _c,
+        "name": names.get(_c, ""),
+        "pred": round(float(pred_map[_c]), 6),
+        "close": round(_px, 3) if _px else None,
+        "blocked": _c in blocked,
+    })
+
 # ── 落盘 ──
 plan = {
     "signal_date": str(pd.Timestamp(SIGNAL_DATE).date()),
@@ -1019,13 +1066,14 @@ plan = {
     "sell": sell_plan, "buy": buy_plan, "hold": keep_plan,
     "alternates": alt_plan[:args.alternates],
     "ranked": list(ranked["code"].head(60)),
+    "recommend": recommend,
     "blocked": sorted(blocked),
     "config": fingerprint(),
     "generated_at": datetime.now().isoformat(timespec="seconds"),
 }
 if not args.dry_run:
     LIVE_DIR.mkdir(parents=True, exist_ok=True)
-    pp = LIVE_DIR / f"plan_{plan['signal_date']}.json"
+    pp = LIVE_DIR / f"{PLAN_PREFIX}_{plan['signal_date']}.json"
     pp.write_text(json.dumps(plan, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     print(f"\n计划已保存: {pp}")
 

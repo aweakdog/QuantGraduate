@@ -1,0 +1,1114 @@
+"""实盘信号 Web 服务器 — 轻量 FastAPI
+
+功能:
+  GET  /           → 仪表盘 (持仓 + 最新计划 + 操作按钮)
+  GET  /api/status → 当前持仓/现金 JSON (秒级, 不跑模型)
+  POST /api/signal→ 跑一次信号生成 (后台, ~30s)
+  GET  /api/plan   → 最新计划 JSON
+  POST /api/sync-template → 导出对账表单 JSON
+  POST /api/sync   → 用提交的 JSON 对账覆盖状态
+  GET  /api/history→ 历史成交记录
+
+用法:
+  python scripts/web_server.py --host 0.0.0.0 --port 8080
+"""
+import argparse
+import base64
+import glob
+import hashlib
+import hmac
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from action_page import (ACTION_HTML, build_recommend, build_today,  # noqa: E402
+                         list_profiles)
+from live_config import DEFAULT_PROFILE, PROFILES, signal_args, state_file  # noqa: E402
+
+# ── 路径 ──
+ROOT = Path(__file__).resolve().parents[1]
+LIVE_DIR = ROOT / "data" / "live"
+# /pro 这个运维页只看默认条线 (四条线的对比看首页)
+STATE_PATH = LIVE_DIR / state_file(DEFAULT_PROFILE)
+KLINE_DIR = ROOT / "data" / "raw" / "kline"
+PROC_DIR = ROOT / "data" / "processed"
+
+app = FastAPI(title="实盘信号")
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
+
+# ── 全局 ──
+PY = sys.executable
+SIGNAL_SCRIPT = str(ROOT / "scripts" / "live_signal.py")
+_running = {"active": False, "log": "", "started_at": None, "done_at": None}
+
+
+# 网页上的手动触发/对账默认作用于默认条线; 参数从 live_config 取,
+# 必须与 daily_rebuild 完全一致, 否则会写出不同指纹的状态
+SIGNAL_ARGS = signal_args(DEFAULT_PROFILE)
+
+
+def _state():
+    if STATE_PATH.exists():
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    return None
+
+
+def _state_of(pid):
+    """按 profile 读状态; 未建立返回 None"""
+    p = LIVE_DIR / state_file(pid)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _latest_plan():
+    plans = sorted(LIVE_DIR.glob(f"plan_{DEFAULT_PROFILE}_*.json"))
+    if not plans:
+        return None
+    return json.loads(plans[-1].read_text(encoding="utf-8"))
+
+
+def _names():
+    """从 all_stock_list 或 watchlist 加载股票名称"""
+    names = {}
+    for p in [ROOT / "data" / "raw" / "all_stock_list.parquet",
+              ROOT / "data" / "universe" / "watchlist_216.json"]:
+        if not p.exists():
+            continue
+        try:
+            if p.suffix == ".parquet":
+                import pandas as pd
+                df = pd.read_parquet(p)
+                for _, r in df.iterrows():
+                    code = str(r.get("code", r.get("symbol", "")))[:6]
+                    nm = str(r.get("name", r.get("stock_name", "")))
+                    if code and nm:
+                        names[code] = nm
+            else:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                items = data.get("watchlist", data) if isinstance(data, dict) else data
+                for item in items:
+                    if isinstance(item, dict):
+                        names[str(item.get("code", ""))[:6]] = item.get("name", "")
+        except Exception:
+            pass
+    return names
+
+
+# ── API ──
+@app.get("/api/status")
+async def api_status():
+    st = _state()
+    if not st:
+        return JSONResponse({"error": "无状态文件, 请先跑一次信号"}, status_code=404)
+    names = _names()
+    import pandas as pd
+    cal = [pd.Timestamp(x) for x in st.get("calendar", [])]
+    ref_date = cal[-1] if cal else None
+    positions = []
+    mv = 0.0
+    for lot in st.get("lots", []):
+        code6 = str(lot["code"])[:6]
+        ref = lot["buy_price"]
+        if ref_date and (KLINE_DIR / f"{code6}.parquet").exists():
+            try:
+                import pandas as pd
+                kl = pd.read_parquet(KLINE_DIR / f"{code6}.parquet")
+                kl["date"] = pd.to_datetime(kl["date"])
+                row = kl[kl["date"] <= ref_date]
+                if len(row):
+                    ref = float(row.iloc[-1]["close"])
+            except Exception:
+                pass
+        val = lot["shares"] * ref
+        mv += val
+        held = None
+        if cal and lot.get("open_signal_date"):
+            try:
+                idx = pd.DatetimeIndex(cal)
+                i1 = int(idx.searchsorted(pd.Timestamp(lot["open_signal_date"]), side="right")) - 1
+                i2 = int(idx.searchsorted(ref_date, side="right")) - 1
+                held = max(0, i2 - i1)
+            except Exception:
+                pass
+        positions.append({
+            "code": code6, "name": names.get(code6, ""),
+            "shares": lot["shares"], "buy_price": round(lot["buy_price"], 3),
+            "last_close": round(ref, 3), "market_value": round(val, 2),
+            "pnl_pct": round((ref / lot["buy_price"] - 1) * 100, 2),
+            "open_date": lot.get("open_date"), "held_days": held,
+        })
+    cash = st.get("cash", 0)
+    equity = cash + mv
+    init_cap = st.get("initial_capital", cash)
+    return {
+        "ref_date": str(ref_date.date()) if ref_date else None,
+        "cash": round(cash, 2), "market_value": round(mv, 2),
+        "equity": round(equity, 2),
+        "initial_capital": init_cap,
+        "total_return_pct": round(equity / init_cap * 100 - 100, 2) if init_cap else None,
+        "positions": positions,
+        "pending": st.get("pending"),
+        "last_signal_date": st.get("last_signal_date"),
+        "last_rebal_signal_date": st.get("last_rebal_signal_date"),
+        "last_synced_at": st.get("last_synced_at"),
+        "running": _running["active"],
+    }
+
+
+@app.get("/api/plan")
+async def api_plan():
+    p = _latest_plan()
+    if not p:
+        return JSONResponse({"error": "尚无计划文件"}, status_code=404)
+    return p
+
+
+@app.post("/api/signal")
+async def api_signal():
+    if _running["active"]:
+        return JSONResponse({"error": "信号生成正在运行中, 请等待"}, status_code=409)
+    _running.update(active=True, log="", started_at=datetime.now().isoformat(),
+                    done_at=None)
+    import threading
+    def _run():
+        try:
+            r = subprocess.run(
+                [PY, SIGNAL_SCRIPT] + SIGNAL_ARGS,
+                capture_output=True, text=True, cwd=str(ROOT), timeout=120,
+            )
+            _running["log"] = r.stdout + r.stderr
+        except Exception as e:
+            _running["log"] = str(e)
+        finally:
+            _running["active"] = False
+            _running["done_at"] = datetime.now().isoformat()
+    threading.Thread(target=_run, daemon=True).start()
+    return {"message": "信号生成已启动, 约30秒完成", "started_at": _running["started_at"]}
+
+
+@app.get("/api/signal-status")
+async def api_signal_status():
+    return {
+        "active": _running["active"],
+        "started_at": _running["started_at"],
+        "done_at": _running["done_at"],
+        "log": _running["log"][-3000:] if _running["log"] else "",
+    }
+
+
+@app.post("/api/sync-template")
+async def api_sync_template():
+    r = subprocess.run(
+        [PY, SIGNAL_SCRIPT] + SIGNAL_ARGS + ["--sync-template"],
+        capture_output=True, text=True, cwd=str(ROOT), timeout=30,
+    )
+    tpl_path = LIVE_DIR / "sync_template.json"
+    if tpl_path.exists():
+        return json.loads(tpl_path.read_text(encoding="utf-8"))
+    return JSONResponse({"error": r.stderr or "导出失败"}, status_code=500)
+
+
+@app.post("/api/sync")
+async def api_sync(req: Request):
+    body = await req.json()
+    tmp = LIVE_DIR / "sync_input.json"
+    tmp.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
+    r = subprocess.run(
+        [PY, SIGNAL_SCRIPT] + SIGNAL_ARGS + ["--sync", str(tmp)],
+        capture_output=True, text=True, cwd=str(ROOT), timeout=30,
+    )
+    if r.returncode != 0:
+        return JSONResponse({"error": r.stderr or r.stdout}, status_code=500)
+    return {"message": "对账完成", "output": r.stdout}
+
+
+@app.get("/api/pipeline")
+async def api_pipeline():
+    """每日重建流水线状态 + 数据新鲜度"""
+    p = LIVE_DIR / "pipeline_status.json"
+    out = {}
+    if p.exists():
+        try:
+            out = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            out = {"error": str(e)}
+    # 训练集实际最新日 (流水线状态之外再独立核对一次)
+    try:
+        import pandas as pd
+        tp = ROOT / "data" / "processed" / "training_data_pit_v24.parquet"
+        if tp.exists():
+            d = pd.read_parquet(tp, columns=["date"])["date"].max()
+            out["train_max_date"] = str(pd.Timestamp(d).date())
+    except Exception:
+        pass
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# 回测页 (隐藏入口 /backtest, 需密码)
+# ═══════════════════════════════════════════════════════════════
+BT_COOKIE = "bt_token"
+BT_TTL = 7 * 24 * 3600     # 登录有效期 7 天
+
+
+def _bt_password():
+    """口令只从环境变量读, 绝不写进仓库; 未设置则整个回测页关闭"""
+    return os.environ.get("QUANT_BT_PASSWORD") or ""
+
+
+def _bt_sign(exp: int) -> str:
+    key = _bt_password().encode()
+    return hmac.new(key, str(exp).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _bt_make_token() -> str:
+    exp = int(time.time()) + BT_TTL
+    return f"{exp}.{_bt_sign(exp)}"
+
+
+def _bt_ok(req: Request) -> bool:
+    pw = _bt_password()
+    if not pw:
+        return False
+    tok = req.cookies.get(BT_COOKIE, "")
+    if "." not in tok:
+        return False
+    exp_s, sig = tok.rsplit(".", 1)
+    try:
+        exp = int(exp_s)
+    except ValueError:
+        return False
+    if exp < time.time():
+        return False
+    return hmac.compare_digest(sig, _bt_sign(exp))
+
+
+def _bt_deny():
+    return JSONResponse({"error": "未授权"}, status_code=401)
+
+
+@app.post("/api/bt/login")
+async def api_bt_login(req: Request):
+    pw = _bt_password()
+    if not pw:
+        return JSONResponse(
+            {"error": "服务器未设置 QUANT_BT_PASSWORD, 回测页已禁用"}, status_code=503)
+    body = await req.json()
+    got = str(body.get("password", ""))
+    # compare_digest 防时序侧信道
+    if not hmac.compare_digest(got, pw):
+        return JSONResponse({"error": "密码错误"}, status_code=403)
+    r = JSONResponse({"message": "ok"})
+    r.set_cookie(BT_COOKIE, _bt_make_token(), max_age=BT_TTL,
+                 httponly=True, samesite="lax", path="/")
+    return r
+
+
+@app.post("/api/bt/logout")
+async def api_bt_logout():
+    r = JSONResponse({"message": "ok"})
+    r.delete_cookie(BT_COOKIE, path="/")
+    return r
+
+
+def _bt_runs():
+    """扫描所有回测结果 json, 按修改时间倒序"""
+    out = []
+    for f in glob.glob(str(PROC_DIR / "wf_daily_*.json")):
+        p = Path(f)
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        s = d.get("summary", {})
+        out.append({
+            "name": p.stem,
+            "mtime": datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds"),
+            "period": d.get("period"),
+            "train_file": d.get("train_file"),
+            "regime_filter": d.get("regime_filter"),
+            "hold_days": d.get("hold_days"),
+            "target_positions": d.get("target_positions"),
+            "features": d.get("features"),
+            "initial_capital": d.get("initial_capital"),
+            "total_return_pct": s.get("total_return_pct"),
+            "annualized_return_pct": s.get("annualized_return_pct"),
+            "sharpe": s.get("sharpe"),
+            "max_dd_pct": s.get("max_dd_pct"),
+            "benchmark_total_pct": s.get("benchmark_total_pct"),
+            "excess_annual_pct": s.get("excess_annual_pct"),
+            "information_ratio": s.get("information_ratio"),
+            "alpha_annual_pct": s.get("alpha_annual_pct"),
+            "ic_mean": s.get("ic_mean"),
+            "ic_tstat": s.get("ic_tstat"),
+            "n_trades": s.get("n_trades"),
+            "cash_days_pct": s.get("cash_days_pct"),
+            "beat_benchmark": s.get("beat_benchmark"),
+            "beat_both_halves": s.get("beat_both_halves"),
+        })
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+
+@app.get("/api/bt/list")
+async def api_bt_list(req: Request):
+    if not _bt_ok(req):
+        return _bt_deny()
+    return _bt_runs()
+
+
+@app.get("/api/bt/detail")
+async def api_bt_detail(req: Request, name: str):
+    if not _bt_ok(req):
+        return _bt_deny()
+    p = PROC_DIR / f"{Path(name).name}.json"       # 防目录穿越
+    if not p.exists():
+        return JSONResponse({"error": "找不到该回测"}, status_code=404)
+    d = json.loads(p.read_text(encoding="utf-8"))
+    daily = d.get("daily", [])
+    cap = d.get("initial_capital") or 1.0
+    curve = [{"d": x.get("date"),
+              "v": round((x.get("portfolio_value") or 0) / cap, 4),
+              "c": int(bool(x.get("in_cash")))} for x in daily]
+
+    # 分年度: 策略 vs 基准(用 daily 里的 bench_ret 若有, 否则跳过)
+    yearly = {}
+    for x in daily:
+        y = str(x.get("date", ""))[:4]
+        if not y:
+            continue
+        a = yearly.setdefault(y, {"year": y, "days": 0, "s": 1.0, "cash": 0})
+        a["days"] += 1
+        a["s"] *= 1 + (x.get("daily_ret") or 0)
+        a["cash"] += int(bool(x.get("in_cash")))
+    for a in yearly.values():
+        a["strategy_pct"] = round((a.pop("s") - 1) * 100, 2)
+
+    return {
+        "name": p.stem,
+        "config": {k: d.get(k) for k in
+                   ("label", "exec_mode", "slippage", "trade_cost", "portfolio_mode",
+                    "hold_days", "tranche_n", "target_positions", "train_file",
+                    "pit_universe", "regime_filter", "regime_ma", "regime_breadth",
+                    "regime_confirm", "feat_select_cutoff", "period", "n_days",
+                    "initial_capital", "features")},
+        "summary": d.get("summary", {}),
+        "stability": d.get("stability", []),
+        "curve": curve,
+        "yearly": sorted(yearly.values(), key=lambda z: z["year"]),
+        "selected_features": d.get("selected_features", []),
+        "trades": d.get("trades", [])[-300:],
+        "n_trades_total": len(d.get("trades", [])),
+    }
+
+
+@app.get("/api/bt/xlsx")
+async def api_bt_xlsx(req: Request, name: str):
+    """按需生成该回测的 Excel 并下载"""
+    if not _bt_ok(req):
+        return _bt_deny()
+    stem = Path(name).name
+    src = PROC_DIR / f"{stem}.json"
+    if not src.exists():
+        return JSONResponse({"error": "找不到该回测"}, status_code=404)
+    out = PROC_DIR / f"bt_{stem}.xlsx"
+    # json 比 xlsx 新时才重新生成, 避免每次点击都重算基准
+    if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+        env = dict(os.environ, PYTHONPATH=str(ROOT))
+        r = subprocess.run(
+            [PY, str(ROOT / "scripts" / "export_backtest_excel.py"),
+             "--pattern", str(src), "--out", str(out)],
+            capture_output=True, text=True, cwd=str(ROOT), timeout=600, env=env)
+        if r.returncode != 0 or not out.exists():
+            return JSONResponse({"error": (r.stderr or r.stdout)[-1500:]}, status_code=500)
+    return FileResponse(str(out), filename=out.name,
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+BACKTEST_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>回测</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;padding:12px;font-size:14px}
+h1{font-size:19px;margin-bottom:12px}
+.card{background:#1c1c1c;border-radius:10px;padding:14px;margin-bottom:12px}
+.card-title{font-size:13px;color:#888;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
+select,input{width:100%;padding:10px;background:#252525;border:1px solid #333;border-radius:6px;color:#e0e0e0;font-size:15px}
+.btn{padding:10px 16px;border:none;border-radius:6px;font-size:14px;cursor:pointer;margin-right:8px;margin-top:8px}
+.btn-primary{background:#1976d2;color:#fff}
+.btn-plain{background:#333;color:#ccc}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:7px 6px;text-align:right;border-bottom:1px solid #262626;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:#888;font-weight:500}
+.green{color:#4caf50}.red{color:#f44336}.gray{color:#888}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:10px}
+.kv{background:#232323;border-radius:8px;padding:10px}
+.kv .k{font-size:11px;color:#888}
+.kv .v{font-size:17px;font-weight:600;margin-top:3px}
+.pill{display:inline-block;background:#252525;border-radius:11px;padding:3px 9px;font-size:12px;color:#bbb;margin:2px 4px 2px 0}
+.badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px}
+.badge-green{background:#1b5e20;color:#a5d6a7}
+.badge-red{background:#b71c1c;color:#ffcdd2}
+.warn{background:#3a2a00;border-left:3px solid #ff9800;padding:10px;border-radius:6px;font-size:13px;color:#ffcc80;margin-bottom:12px}
+.table-wrap{overflow-x:auto}
+.empty{color:#666;text-align:center;padding:14px}
+#login{max-width:330px;margin:56px auto}
+.err{color:#f44336;font-size:13px;margin-top:8px}
+.feat{font-size:12px;color:#aaa;line-height:1.9}
+</style></head><body>
+
+<div id="login" style="display:none">
+  <div class="card">
+    <div class="card-title">回测报表 · 需要密码</div>
+    <input type="password" id="pw" placeholder="密码" onkeydown="if(event.key==='Enter')doLogin()">
+    <button class="btn btn-primary" onclick="doLogin()">进入</button>
+    <div class="err" id="login-err"></div>
+  </div>
+</div>
+
+<div id="main" style="display:none">
+  <h1>回测报表</h1>
+
+  <div class="card">
+    <div class="card-title">选择回测</div>
+    <select id="sel" onchange="loadDetail()"></select>
+    <button class="btn btn-primary" onclick="dl()">下载 Excel</button>
+    <button class="btn btn-plain" onclick="doLogout()">退出</button>
+  </div>
+
+  <div id="body"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+async function jget(u){ const r = await fetch(u); if(r.status===401) throw 'unauth'; return r.json(); }
+
+async function boot(){
+  try{
+    const runs = await jget('/api/bt/list');
+    $('login').style.display='none'; $('main').style.display='';
+    if(!runs.length){ $('body').innerHTML='<div class="card empty">没有回测结果文件</div>'; return; }
+    $('sel').innerHTML = runs.map(r=>{
+      const t = (r.total_return_pct>=0?'+':'')+r.total_return_pct+'%';
+      return `<option value="${r.name}">${r.name}  [${t}, 夏普${r.sharpe}]</option>`;
+    }).join('');
+    loadDetail();
+  }catch(e){
+    $('main').style.display='none'; $('login').style.display='';
+  }
+}
+
+async function doLogin(){
+  $('login-err').textContent='';
+  const r = await fetch('/api/bt/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({password:$('pw').value})});
+  if(r.ok){ $('pw').value=''; boot(); }
+  else { const d = await r.json(); $('login-err').textContent = d.error||'登录失败'; }
+}
+
+async function doLogout(){
+  await fetch('/api/bt/logout',{method:'POST'});
+  location.reload();
+}
+
+function dl(){ window.location = '/api/bt/xlsx?name=' + encodeURIComponent($('sel').value); }
+
+function num(v,d=2,suf=''){ return (v==null||isNaN(v)) ? '--' : (+v).toFixed(d)+suf; }
+function sgn(v,d=1,suf='%'){ if(v==null||isNaN(v))return '<span class="gray">--</span>';
+  const c = v>=0?'green':'red'; return `<span class="${c}">${v>=0?'+':''}${(+v).toFixed(d)}${suf}</span>`; }
+
+// 纯 SVG 折线, 不引外部图表库
+function curveSVG(curve){
+  if(!curve||curve.length<2) return '<div class="empty">无曲线数据</div>';
+  const W=680,H=210,PL=44,PR=10,PT=10,PB=22;
+  const vs=curve.map(p=>p.v), lo=Math.min(...vs,1), hi=Math.max(...vs,1);
+  const pad=(hi-lo)*0.08||0.05, y0=lo-pad, y1=hi+pad;
+  const X=i=>PL+(W-PL-PR)*i/(curve.length-1);
+  const Y=v=>PT+(H-PT-PB)*(1-(v-y0)/(y1-y0));
+  const pts=curve.map((p,i)=>`${X(i).toFixed(1)},${Y(p.v).toFixed(1)}`).join(' ');
+  // 空仓区间画灰底
+  let bands='',st=null;
+  curve.forEach((p,i)=>{
+    if(p.c&&st===null) st=i;
+    if((!p.c||i===curve.length-1)&&st!==null){
+      bands+=`<rect x="${X(st).toFixed(1)}" y="${PT}" width="${Math.max(1,X(i)-X(st)).toFixed(1)}" height="${H-PT-PB}" fill="#ffffff" opacity="0.05"/>`;
+      st=null;
+    }
+  });
+  let grid='';
+  for(let k=0;k<=4;k++){
+    const v=y0+(y1-y0)*k/4, y=Y(v);
+    grid+=`<line x1="${PL}" y1="${y.toFixed(1)}" x2="${W-PR}" y2="${y.toFixed(1)}" stroke="#2a2a2a"/>`
+        +`<text x="${PL-6}" y="${(y+3).toFixed(1)}" fill="#777" font-size="10" text-anchor="end">${v.toFixed(2)}</text>`;
+  }
+  const one=(y0<=1&&1<=y1)?`<line x1="${PL}" y1="${Y(1).toFixed(1)}" x2="${W-PR}" y2="${Y(1).toFixed(1)}" stroke="#666" stroke-dasharray="3,3"/>`:'';
+  const lab=[0,Math.floor(curve.length/2),curve.length-1].map(i=>
+    `<text x="${X(i).toFixed(1)}" y="${H-6}" fill="#777" font-size="10" text-anchor="middle">${curve[i].d}</text>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${grid}${bands}${one}
+    <polyline points="${pts}" fill="none" stroke="#42a5f5" stroke-width="1.6"/>${lab}</svg>
+    <div style="font-size:11px;color:#777;margin-top:4px">灰底=空仓区间 · 虚线=本金线(净值1.0)</div>`;
+}
+
+async function loadDetail(){
+  const name=$('sel').value;
+  $('body').innerHTML='<div class="card empty">加载中...</div>';
+  let d;
+  try{ d = await jget('/api/bt/detail?name='+encodeURIComponent(name)); }
+  catch(e){ location.reload(); return; }
+  const s=d.summary||{}, c=d.config||{};
+
+  const suspicious = (s.excess_annual_pct>30) || (s.sharpe>1.5&&s.information_ratio>1.2);
+  let html='';
+  if(suspicious) html+=`<div class="warn">这份回测超额年化 ${num(s.excess_annual_pct,1)}% / IR ${num(s.information_ratio,2)}，
+    高得不正常。历史上此类结果曾由基本面数据缺陷造成，请先确认数据口径再采信。</div>`;
+
+  html+=`<div class="card"><div class="card-title">核心指标</div><div class="grid">
+    <div class="kv"><div class="k">总收益</div><div class="v">${sgn(s.total_return_pct)}</div></div>
+    <div class="kv"><div class="k">年化</div><div class="v">${sgn(s.annualized_return_pct)}</div></div>
+    <div class="kv"><div class="k">夏普</div><div class="v">${num(s.sharpe)}</div></div>
+    <div class="kv"><div class="k">最大回撤</div><div class="v">${sgn(s.max_dd_pct)}</div></div>
+    <div class="kv"><div class="k">基准总收益</div><div class="v">${sgn(s.benchmark_total_pct)}</div></div>
+    <div class="kv"><div class="k">超额年化</div><div class="v">${sgn(s.excess_annual_pct)}</div></div>
+    <div class="kv"><div class="k">信息比率</div><div class="v">${num(s.information_ratio)}</div></div>
+    <div class="kv"><div class="k">年化alpha</div><div class="v">${sgn(s.alpha_annual_pct)}</div></div>
+    <div class="kv"><div class="k">IC均值</div><div class="v">${num(s.ic_mean,4)}</div></div>
+    <div class="kv"><div class="k">IC t值</div><div class="v">${num(s.ic_tstat)}</div></div>
+    <div class="kv"><div class="k">交易笔数</div><div class="v">${s.n_trades??'--'}</div></div>
+    <div class="kv"><div class="k">空仓占比</div><div class="v">${num(s.cash_days_pct,1,'%')}</div></div>
+  </div>
+  <div style="margin-top:10px">
+    ${s.beat_benchmark?'<span class="badge badge-green">跑赢基准</span>':'<span class="badge badge-red">跑输基准</span>'}
+    ${s.beat_both_halves?'<span class="badge badge-green">两段都跑赢</span>':'<span class="badge badge-red">两段未都跑赢</span>'}
+  </div></div>`;
+
+  html+=`<div class="card"><div class="card-title">净值曲线 (起点 1.0)</div>${curveSVG(d.curve)}</div>`;
+
+  html+=`<div class="card"><div class="card-title">分年度</div><div class="table-wrap"><table>
+    <thead><tr><th>年份</th><th>交易日</th><th>策略</th><th>空仓天数</th></tr></thead><tbody>`
+    + (d.yearly||[]).map(y=>`<tr><td>${y.year}</td><td>${y.days}</td>
+        <td>${sgn(y.strategy_pct)}</td><td>${y.cash}</td></tr>`).join('')
+    + `</tbody></table></div></div>`;
+
+  if(d.stability&&d.stability.length){
+    html+=`<div class="card"><div class="card-title">分段稳健性</div><div class="table-wrap"><table>
+      <thead><tr><th>区间</th><th>策略</th><th>基准</th><th>超额年化</th><th>IR</th></tr></thead><tbody>`
+      + d.stability.map(h=>`<tr><td>${h.period||h.half||''}</td>
+          <td>${sgn(h.strategy_pct??h.strategy)}</td><td>${sgn(h.benchmark_pct??h.benchmark)}</td>
+          <td>${sgn(h.excess_annual_pct)}</td><td>${num(h.information_ratio)}</td></tr>`).join('')
+      + `</tbody></table></div></div>`;
+  }
+
+  html+=`<div class="card"><div class="card-title">配置</div><div>`
+    + Object.entries(c).map(([k,v])=>`<span class="pill">${k}: ${v}</span>`).join('')
+    + `</div></div>`;
+
+  html+=`<div class="card"><div class="card-title">入选特征 (${(d.selected_features||[]).length})</div>
+    <div class="feat">` + (d.selected_features||[]).map(f=>`<span class="pill">${f}</span>`).join('') + `</div></div>`;
+
+  const tr=d.trades||[];
+  html+=`<div class="card"><div class="card-title">交易明细 (共 ${d.n_trades_total} 笔, 显示最近 ${tr.length})</div>
+    <div class="table-wrap"><table><thead><tr>
+    <th>信号日</th><th>成交日</th><th>代码</th><th>方向</th><th>股数</th><th>价格</th><th>金额</th><th>费用</th>
+    </tr></thead><tbody>`
+    + tr.slice().reverse().map(t=>`<tr>
+        <td>${t.signal_date??''}</td><td>${t.date??''}</td><td>${t.code??''}</td>
+        <td>${t.action??''}</td><td>${t.shares??''}</td><td>${num(t.price)}</td>
+        <td>${num(t.gross)}</td><td>${num(t.fee)}</td></tr>`).join('')
+    + `</tbody></table></div></div>`;
+
+  $('body').innerHTML=html;
+}
+
+boot();
+</script></body></html>"""
+
+
+@app.get("/backtest", response_class=HTMLResponse)
+async def page_backtest():
+    """隐藏入口: 首页不链接到这里, 需知道地址且有密码"""
+    return BACKTEST_HTML
+
+
+@app.get("/api/history")
+async def api_history():
+    st = _state()
+    if not st:
+        return JSONResponse({"error": "无状态文件"}, status_code=404)
+    return st.get("history", [])
+
+
+# ── 首页仪表盘 ──
+@app.get("/api/profiles")
+async def api_profiles():
+    """四条并行线的定义 + 各自当前概况"""
+    out = []
+    for p in list_profiles():
+        st = _state_of(p["id"])
+        out.append({**p,
+                    "initialized": st is not None,
+                    "equity": None if st is None else round(
+                        st.get("cash", 0) + sum(l["shares"] * l["buy_price"]
+                                                for l in (st.get("lots") or [])), 2),
+                    "n_positions": None if st is None else len(st.get("lots") or [])})
+    return {"profiles": out, "default": DEFAULT_PROFILE}
+
+
+@app.get("/api/today")
+async def api_today(profile: str = None):
+    """归一化的"明天该做什么" —— 首页用。只读, 不触发模型。"""
+    return build_today(ROOT, profile)
+
+
+@app.get("/api/recommend")
+async def api_recommend(profile: str = None):
+    """每日推荐看板: 模型打分最高的股票 + 该线能否买得起"""
+    return build_recommend(ROOT, profile)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def action_page():
+    """默认页 = 行动清单 (给看的人照着执行)"""
+    return ACTION_HTML
+
+
+@app.get("/pro", response_class=HTMLResponse)
+async def dashboard():
+    """完整仪表盘 (含对账/手工触发信号等运维操作)"""
+    return HTML_PAGE
+
+
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>实盘信号仪表盘</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+         background: #0f1117; color: #e0e0e0; padding: 20px; }
+  .container { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 16px; color: #fff; }
+  .card { background: #1a1d29; border-radius: 12px; padding: 20px; margin-bottom: 16px;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+  .card-title { font-size: 14px; color: #888; margin-bottom: 12px; text-transform: uppercase; }
+  .stat-row { display: flex; gap: 24px; flex-wrap: wrap; }
+  .stat { text-align: left; }
+  .stat .label { font-size: 12px; color: #888; }
+  .stat .value { font-size: 24px; font-weight: 700; color: #fff; margin-top: 2px; }
+  .stat .value.green { color: #4caf50; }
+  .stat .value.red { color: #f44336; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #2a2d39;
+           white-space: nowrap; }
+  th { color: #888; font-weight: 600; font-size: 12px; text-transform: uppercase; }
+  td { color: #ccc; }
+  .pnl-pos { color: #4caf50; }
+  .pnl-neg { color: #f44336; }
+  .btn { display: inline-block; padding: 10px 20px; border: none; border-radius: 8px;
+         font-size: 14px; cursor: pointer; margin-right: 8px; margin-bottom: 8px;
+         transition: opacity 0.2s; }
+  .btn:hover { opacity: 0.85; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary { background: #2962ff; color: #fff; }
+  .btn-warn { background: #ff9800; color: #000; }
+  .btn-danger { background: #f44336; color: #fff; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .badge-blue { background: #1a237e; color: #82b1ff; }
+  .badge-green { background: #1b5e20; color: #69f0ae; }
+  .badge-red { background: #b71c1c; color: #ff8a80; }
+  .badge-gray { background: #333; color: #aaa; }
+  #log { font-family: monospace; font-size: 12px; white-space: pre-wrap;
+         max-height: 300px; overflow-y: auto; background: #0a0b10; padding: 12px;
+         border-radius: 8px; display: none; margin-top: 12px; }
+  .section { margin-bottom: 12px; }
+  .pill { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 12px;
+          background: #2a2d39; margin-right: 6px; }
+  .empty { color: #666; font-style: italic; padding: 12px 0; }
+  .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                   background: rgba(0,0,0,0.7); z-index: 1000; justify-content: center;
+                   align-items: flex-start; padding: 40px 20px; overflow-y: auto; }
+  .modal { background: #1a1d29; border-radius: 12px; padding: 24px; max-width: 600px; width: 100%; }
+  .modal h2 { font-size: 18px; margin-bottom: 16px; color: #fff; }
+  .modal label { display: block; font-size: 13px; color: #888; margin-top: 12px; margin-bottom: 4px; }
+  .modal input { width: 100%; padding: 8px 12px; border: 1px solid #333; border-radius: 6px;
+                 background: #0f1117; color: #fff; font-size: 14px; }
+  .modal .pos-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+  .modal .pos-row input { flex: 1; }
+  .modal .btn-remove { background: #f44336; border: none; color: #fff; border-radius: 6px;
+                       padding: 6px 10px; cursor: pointer; font-size: 12px; }
+  #sync-note { width: 100%; padding: 8px 12px; border: 1px solid #333; border-radius: 6px;
+               background: #0f1117; color: #fff; font-size: 14px; margin-top: 8px; }
+
+  /* ── 手机端 ── */
+  @media (max-width: 640px) {
+    body { padding: 12px; }
+    h1 { font-size: 18px; }
+    .card { padding: 14px; border-radius: 10px; }
+    .stat-row { gap: 14px; }
+    .stat { flex: 1 1 45%; }
+    .stat .value { font-size: 19px; }
+    table { font-size: 13px; }
+    th, td { padding: 7px 9px; }
+    .btn { width: 100%; margin-right: 0; padding: 12px 16px; font-size: 15px; }
+    .modal { padding: 16px; }
+    .modal .pos-row { flex-wrap: wrap; }
+    .modal .pos-row input { flex: 1 1 30%; min-width: 88px; font-size: 13px; }
+    #log { font-size: 11px; max-height: 220px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📊 实盘信号仪表盘</h1>
+
+  <div class="card">
+    <div class="card-title">账户概览</div>
+    <div class="stat-row" id="overview">
+      <div class="stat"><div class="label">总资产</div><div class="value" id="equity">--</div></div>
+      <div class="stat"><div class="label">现金</div><div class="value" id="cash">--</div></div>
+      <div class="stat"><div class="label">持仓市值</div><div class="value" id="mv">--</div></div>
+      <div class="stat"><div class="label">累计收益</div><div class="value" id="ret">--</div></div>
+    </div>
+    <div style="margin-top:8px;font-size:12px;color:#666" id="meta"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">当前持仓</div>
+    <div class="table-wrap">
+    <table id="pos-table">
+      <thead><tr><th>代码</th><th>名称</th><th>股数</th><th>成本</th><th>现价</th>
+                 <th>市值</th><th>浮盈</th><th>持有天数</th></tr></thead>
+      <tbody id="pos-body"></tbody>
+    </table>
+    </div>
+    <div id="pending-info" style="margin-top:12px;font-size:13px;color:#888"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">最新操作计划</div>
+    <div id="plan-info"></div>
+    <div class="table-wrap" style="margin-top:12px">
+    <table id="plan-table">
+      <thead><tr><th>方向</th><th>代码</th><th>名称</th><th>股数</th><th>参考价</th>
+                 <th>预估金额</th><th>pred</th><th>备注</th></tr></thead>
+      <tbody id="plan-body"></tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">数据流水线</div>
+    <div id="pipe-info"><span class="empty">加载中...</span></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">操作</div>
+    <button class="btn btn-primary" id="btn-signal" onclick="runSignal()">🔄 生成今日信号</button>
+    <button class="btn btn-warn" id="btn-sync-tpl" onclick="openSyncModal()">🔄 人工对账</button>
+    <button class="btn btn-danger" onclick="refresh()">刷新</button>
+    <div id="log"></div>
+  </div>
+</div>
+
+<!-- 对账弹窗 -->
+<div class="modal-overlay" id="sync-modal">
+  <div class="modal">
+    <h2>人工对账 (以券商App为准)</h2>
+    <label>可用现金 (元)</label>
+    <input type="number" id="sync-cash" step="0.01">
+    <label>持仓列表</label>
+    <div id="sync-positions"></div>
+    <button class="btn btn-primary" style="margin-top:8px" onclick="addSyncRow()">+ 添加持仓</button>
+    <label>备注</label>
+    <input type="text" id="sync-note" placeholder="可选">
+    <div style="margin-top:16px">
+      <button class="btn btn-primary" onclick="submitSync()">确认对账</button>
+      <button class="btn" style="background:#333;color:#ccc" onclick="closeSyncModal()">取消</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let syncData = null;
+
+async function fetchJSON(url, opts) {
+  const r = await fetch(url, opts);
+  return r.json();
+}
+
+async function refresh() {
+  try {
+    const s = await fetchJSON('/api/status');
+    document.getElementById('equity').textContent = '¥' + (s.equity||0).toLocaleString();
+    document.getElementById('cash').textContent = '¥' + (s.cash||0).toLocaleString();
+    document.getElementById('mv').textContent = '¥' + (s.market_value||0).toLocaleString();
+    const ret = s.total_return_pct;
+    const retEl = document.getElementById('ret');
+    retEl.textContent = (ret>=0?'+':'') + ret + '%';
+    retEl.className = 'value ' + (ret>=0?'green':'red');
+    let meta = '估值基准日: ' + (s.ref_date||'--');
+    if (s.last_signal_date) meta += ' | 上次信号: ' + s.last_signal_date;
+    if (s.last_synced_at) meta += ' | 上次对账: ' + s.last_synced_at;
+    if (s.running) meta += ' | <span class="badge badge-blue">信号生成中...</span>';
+    document.getElementById('meta').innerHTML = meta;
+
+    const tbody = document.getElementById('pos-body');
+    tbody.innerHTML = '';
+    if (!s.positions || !s.positions.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">空仓</td></tr>';
+    } else {
+      for (const p of s.positions) {
+        const cls = p.pnl_pct >= 0 ? 'pnl-pos' : 'pnl-neg';
+        tbody.innerHTML += `<tr>
+          <td>${p.code}</td><td>${p.name}</td><td>${p.shares}</td>
+          <td>${p.buy_price}</td><td>${p.last_close}</td>
+          <td>¥${p.market_value.toLocaleString()}</td>
+          <td class="${cls}">${p.pnl_pct>=0?'+':''}${p.pnl_pct}%</td>
+          <td>${p.held_days!=null?p.held_days+'日':'--'}</td></tr>`;
+      }
+    }
+
+    let pendHtml = '';
+    if (s.pending) {
+      pendHtml = `<span class="badge badge-blue">待执行: ${s.pending.signal_date}</span>`;
+      if (s.pending.is_rebal) pendHtml += ' <span class="badge badge-green">换仓日</span>';
+      if (s.pending.in_cash) pendHtml += ' <span class="badge badge-red">空仓信号</span>';
+    } else {
+      pendHtml = '<span class="badge badge-gray">无待执行计划</span>';
+    }
+    document.getElementById('pending-info').innerHTML = pendHtml;
+
+    document.getElementById('btn-signal').disabled = s.running;
+  } catch(e) {
+    console.error(e);
+  }
+  try {
+    const p = await fetchJSON('/api/plan');
+    renderPlan(p);
+  } catch(e) {
+    document.getElementById('plan-info').innerHTML = '<span class="empty">尚无计划</span>';
+  }
+  try {
+    renderPipeline(await fetchJSON('/api/pipeline'));
+  } catch(e) {
+    document.getElementById('pipe-info').innerHTML = '<span class="empty">无流水线记录</span>';
+  }
+}
+
+function renderPipeline(p) {
+  const el = document.getElementById('pipe-info');
+  if (!p || (!p.started_at && !p.train_max_date)) {
+    el.innerHTML = '<span class="empty">尚未运行过自动重建</span>';
+    return;
+  }
+  let badge;
+  if (p.ok === false) badge = '<span class="badge badge-red">失败</span>';
+  else if (p.skipped_reason) badge = '<span class="badge badge-gray">本次跳过</span>';
+  else if (p.ok) badge = '<span class="badge badge-green">成功</span>';
+  else badge = '<span class="badge badge-blue">运行中</span>';
+
+  let html = `<div style="font-size:14px;margin-bottom:8px">${badge}
+    <span class="pill">训练集数据至: ${p.train_max_date || '--'}</span>
+    <span class="pill">K线至: ${p.kline_max_date || '--'}</span>
+  </div>
+  <div style="font-size:12px;color:#888">上次运行: ${p.started_at || '--'}`;
+  if (p.total_seconds) html += ` · 耗时 ${p.total_seconds}s`;
+  html += '</div>';
+  if (p.skipped_reason)
+    html += `<div style="font-size:12px;color:#888;margin-top:6px">${p.skipped_reason}</div>`;
+  if (p.error)
+    html += `<div style="font-size:12px;color:#f44336;margin-top:6px">错误: ${p.error}</div>`;
+  if (p.stages && Object.keys(p.stages).length) {
+    html += '<div style="margin-top:8px">';
+    for (const [k, v] of Object.entries(p.stages)) {
+      const c = v.ok ? 'badge-green' : 'badge-red';
+      const t = v.skipped ? '跳过' : (v.seconds != null ? v.seconds + 's' : '');
+      html += `<span class="badge ${c}" style="margin-right:6px">${k} ${t}</span>`;
+    }
+    html += '</div>';
+  }
+  el.innerHTML = html;
+}
+
+function renderPlan(p) {
+  let html = `<div style="font-size:14px;margin-bottom:8px">
+    <span class="pill">信号日: ${p.signal_date}</span>
+    <span class="pill">执行: ${p.exec_hint}</span>
+    <span class="pill">总资产: ¥${(p.equity||0).toLocaleString()}</span>
+    <span class="pill">大盘广度: ${((p.breadth||0)*100).toFixed(1)}%</span>
+    <span class="pill">择时: ${p.in_cash?'空仓':'持仓'}</span>
+    <span class="pill">${p.is_rebal?'换仓日':'非换仓日'}</span>
+  </div>`;
+  document.getElementById('plan-info').innerHTML = html;
+  const tbody = document.getElementById('plan-body');
+  tbody.innerHTML = '';
+  for (const s of (p.sell||[])) {
+    tbody.innerHTML += `<tr><td><span class="badge badge-red">卖出</span></td>
+      <td>${s.code}</td><td>${s.name}</td><td>${s.shares}</td>
+      <td>${s.ref_close}</td><td>¥${(s.est_proceeds||0).toLocaleString()}</td>
+      <td>-</td><td>${s.reason||''}</td></tr>`;
+  }
+  for (const b of (p.buy||[])) {
+    tbody.innerHTML += `<tr><td><span class="badge badge-green">买入</span></td>
+      <td>${b.code}</td><td>${b.name}</td><td>${b.shares}</td>
+      <td>${b.ref_close}</td><td>¥${(b.est_cost||0).toLocaleString()}</td>
+      <td>${b.pred?b.pred.toFixed(4):'-'}</td><td>-</td></tr>`;
+  }
+  for (const a of (p.alternates||[])) {
+    tbody.innerHTML += `<tr><td><span class="badge badge-gray">候补</span></td>
+      <td>${a.code}</td><td>${a.name}</td><td>-</td>
+      <td>${a.ref_close}</td><td>-</td>
+      <td>${a.pred?a.pred.toFixed(4):'-'}</td><td>${a.note||''}</td></tr>`;
+  }
+  if (!tbody.innerHTML) tbody.innerHTML = '<tr><td colspan="8" class="empty">无操作</td></tr>';
+}
+
+async function runSignal() {
+  const btn = document.getElementById('btn-signal');
+  btn.disabled = true;
+  const logDiv = document.getElementById('log');
+  logDiv.style.display = 'block';
+  logDiv.textContent = '信号生成中...';
+  try {
+    const r = await fetch('/api/signal', {method: 'POST'});
+    const d = await r.json();
+    if (d.error) { logDiv.textContent = d.error; btn.disabled = false; return; }
+    pollSignal();
+  } catch(e) {
+    logDiv.textContent = '请求失败: ' + e;
+    btn.disabled = false;
+  }
+}
+
+async function pollSignal() {
+  const logDiv = document.getElementById('log');
+  for (let i = 0; i < 60; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const s = await fetchJSON('/api/signal-status');
+    if (s.log) logDiv.textContent = s.log.replace(/\\r/g, '\\n').replace(/\\n{3,}/g, '\\n\\n');
+    if (!s.active) {
+      logDiv.textContent += '\\n\\n✅ 完成于: ' + s.done_at;
+      document.getElementById('btn-signal').disabled = false;
+      refresh();
+      return;
+    }
+  }
+}
+
+async function openSyncModal() {
+  document.getElementById('sync-modal').style.display = 'flex';
+  try {
+    const r = await fetch('/api/sync-template', {method: 'POST'});
+    syncData = await r.json();
+    document.getElementById('sync-cash').value = syncData.cash || 0;
+    const container = document.getElementById('sync-positions');
+    container.innerHTML = '';
+    for (const p of (syncData.positions||[])) {
+      addSyncRow(p);
+    }
+  } catch(e) {
+    addSyncRow();
+  }
+}
+
+function addSyncRow(data) {
+  const container = document.getElementById('sync-positions');
+  const div = document.createElement('div');
+  div.className = 'pos-row';
+  div.innerHTML = `<input type="text" placeholder="代码" value="${(data&&data.code)||''}" class="sync-code">
+    <input type="text" placeholder="名称" value="${(data&&data.name)||''}" class="sync-name">
+    <input type="number" placeholder="股数" value="${(data&&data.shares)||''}" class="sync-shares">
+    <input type="number" step="0.001" placeholder="成本价" value="${(data&&data.buy_price)||''}" class="sync-price">
+    <input type="date" placeholder="买入日" value="${(data&&data.buy_date)||''}" class="sync-date">
+    <button class="btn-remove" onclick="this.parentElement.remove()">删除</button>`;
+  container.appendChild(div);
+}
+
+function closeSyncModal() {
+  document.getElementById('sync-modal').style.display = 'none';
+}
+
+async function submitSync() {
+  // 不能把空输入静默当成 0: 那会把账户现金抹平
+  const cashRaw = document.getElementById('sync-cash').value.trim();
+  const cash = parseFloat(cashRaw);
+  if (cashRaw === '' || !isFinite(cash) || cash < 0) {
+    alert('请填写有效的可用资金 (不能留空或为负)。\n只是想看看的话直接点「取消」即可。');
+    return;   // 保持弹窗打开, 不提交
+  }
+  const rows = document.querySelectorAll('#sync-positions .pos-row');
+  const positions = [];
+  rows.forEach(r => {
+    const code = r.querySelector('.sync-code').value.trim();
+    if (!code) return;
+    positions.push({
+      code: code,
+      name: r.querySelector('.sync-name').value.trim(),
+      shares: parseInt(r.querySelector('.sync-shares').value) || 0,
+      buy_price: parseFloat(r.querySelector('.sync-price').value) || 0,
+      buy_date: r.querySelector('.sync-date').value || '',
+    });
+  });
+  if (cash === 0 && positions.length === 0 &&
+      !confirm('这会把账户清空 (0 现金 + 0 持仓)。确定吗?')) {
+    return;
+  }
+  const note = document.getElementById('sync-note').value;
+  const body = {cash, positions, note};
+  if (cash === 0 && positions.length === 0) body.confirm_empty = true;
+  closeSyncModal();
+  const logDiv = document.getElementById('log');
+  logDiv.style.display = 'block';
+  logDiv.textContent = '对账中...';
+  try {
+    const r = await fetch('/api/sync', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    logDiv.textContent = d.message || d.error || JSON.stringify(d, null, 2);
+    refresh();
+  } catch(e) {
+    logDiv.textContent = '对账失败: ' + e;
+  }
+}
+
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    import uvicorn
+    ap = argparse.ArgumentParser(description="实盘信号 Web 服务器")
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8080)
+    a = ap.parse_args()
+    print(f"启动: http://{a.host}:{a.port}")
+    uvicorn.run(app, host=a.host, port=a.port)

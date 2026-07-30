@@ -18,8 +18,10 @@
 """
 import argparse
 import json
+import signal
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -46,14 +48,43 @@ def sina_symbol(code):
     return "sz" + c
 
 
-def universe_codes():
-    w = json.loads(UNIVERSE.read_text())
+def universe_codes(watchlist_file=None):
+    path = (ROOT / "data" / "universe" / watchlist_file) if watchlist_file else UNIVERSE
+    w = json.loads(path.read_text())
     items = w.get("watchlist", w) if isinstance(w, dict) else w
     return [str(x["code"])[:6] if isinstance(x, dict) else str(x)[:6] for x in items]
 
 
 def all_local_codes():
     return sorted(p.stem for p in KLINE_DIR.glob("*.parquet"))
+
+
+class FetchTimeout(Exception):
+    """单次拉取超时"""
+
+
+@contextmanager
+def hard_timeout(seconds):
+    """给无超时的 akshare 请求加硬墙
+
+    akshare 的新浪/东财接口底层不传 timeout, 被限流时连接会无限挂住,
+    重试逻辑永远等不到异常。用 SIGALRM 强制中断 (仅主线程生效,
+    多进程模式下每个 worker 都是自己的主线程, 所以可靠)。
+    """
+    if seconds <= 0:
+        yield
+        return
+    try:
+        signal.signal(signal.SIGALRM,
+                      lambda *_: (_ for _ in ()).throw(FetchTimeout()))
+    except ValueError:
+        yield          # 不在主线程 (多线程模式), 退化为无保护
+        return
+    signal.alarm(int(seconds))
+    try:
+        yield
+    finally:
+        signal.alarm(0)
 
 
 def _finalize(df):
@@ -93,17 +124,19 @@ def fetch_em(code, end_date):
     return _finalize(df)
 
 
-def fetch_one(code, end_date):
+def fetch_one(code, end_date, timeout=25):
     try:
-        df = fetch_sina(code, end_date)
+        with hard_timeout(timeout):
+            df = fetch_sina(code, end_date)
         if df is not None and len(df):
             return df
     except Exception:
         pass
-    return fetch_em(code, end_date)
+    with hard_timeout(timeout):
+        return fetch_em(code, end_date)
 
 
-def process(code, end_date, dry_run, retries=3):
+def process(code, end_date, dry_run, retries=3, timeout=25):
     out = KLINE_DIR / f"{code}.parquet"
     old_max = None
     if out.exists():
@@ -114,7 +147,7 @@ def process(code, end_date, dry_run, retries=3):
             pass
     for attempt in range(retries):
         try:
-            df = fetch_one(code, end_date)
+            df = fetch_one(code, end_date, timeout)
             if df is None or not len(df):
                 return code, "empty", old_max, None
             new_max = df["date"].max()
@@ -135,29 +168,44 @@ def process(code, end_date, dry_run, retries=3):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scope", choices=["universe", "all"], default="universe")
+    ap.add_argument("--watchlist", default=None,
+                    help="data/universe/ 下的股票池 json (仅 --scope universe 生效)")
     ap.add_argument("--end-date", default=datetime.now().strftime("%Y%m%d"))
     ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--procs", type=int, default=0,
+                    help="多进程并发数 (>0 时用多进程绕开新浪 py_mini_racer 线程不安全)")
+    ap.add_argument("--timeout", type=int, default=25,
+                    help="单只单次拉取硬超时秒数 (0=关闭)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    codes = universe_codes() if a.scope == "universe" else all_local_codes()
+    codes = (universe_codes(a.watchlist) if a.scope == "universe"
+             else all_local_codes())
     if a.limit:
         codes = codes[:a.limit]
     KLINE_DIR.mkdir(parents=True, exist_ok=True)
 
-    if a.workers != 1:
-        print(f"[注意] 新浪源底层 py_mini_racer 非线程安全, 已将 workers 从 {a.workers} 强制改为 1")
-        a.workers = 1
+    if a.procs > 0:
+        mode = f"{a.procs} 进程"
+    else:
+        if a.workers != 1:
+            print(f"[注意] 新浪源底层 py_mini_racer 非线程安全, 已将 workers 从 {a.workers} 强制改为 1"
+                  f" (要并发请用 --procs N)")
+            a.workers = 1
+        mode = f"{a.workers} 线程"
 
     print(f"更新日K线 | scope={a.scope} | {len(codes)} 只 | 截止 {a.end_date} | "
-          f"{a.workers} 线程 | {'DRY-RUN' if a.dry_run else '写入'}")
+          f"{mode} | {'DRY-RUN' if a.dry_run else '写入'}")
     t0 = time.time()
     ok = err = empty = 0
     added_total = 0
     newest = None
-    with ThreadPoolExecutor(max_workers=a.workers) as ex:
-        futs = {ex.submit(process, c, a.end_date, a.dry_run): c for c in codes}
+    Pool = ProcessPoolExecutor if a.procs > 0 else ThreadPoolExecutor
+    n_par = a.procs if a.procs > 0 else a.workers
+    with Pool(max_workers=n_par) as ex:
+        futs = {ex.submit(process, c, a.end_date, a.dry_run, 3, a.timeout): c
+                for c in codes}
         for i, f in enumerate(as_completed(futs), 1):
             code, st, om, nm = f.result()
             if st.startswith("ok"):

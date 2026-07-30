@@ -35,6 +35,17 @@ parser.add_argument("--hold-days", type=int, default=5, help="持有天数(分�
 parser.add_argument("--tranche-n", type=int, default=2, help="每档买入只数; 总仓位=hold_days*tranche_n")
 parser.add_argument("--n-features", type=int, default=80)
 parser.add_argument("--corr-threshold", type=float, default=0.9)
+parser.add_argument("--drop-market-wide", type=float, default=0.0,
+                    help="剔除截面变异比(当日跨股票std / 总体std)低于该阈值的特征。"
+                         "标签是按日期demean的截面收益, 这类特征当日对所有股票同值, "
+                         "单独预测能力恒为0, 在树里只能按'日期'切分=记忆训练区间。"
+                         "建议 0.01; 0 = 关闭(保留旧行为)")
+parser.add_argument("--select-seeds", type=int, default=5,
+                    help="特征筛选时用几个随机种子平均 gain 重要度。"
+                         "1=旧行为(单次拟合, 排名不稳定)")
+parser.add_argument("--select-pool-mult", type=int, default=3,
+                    help="去相关的候选池 = n_features * 该倍数。"
+                         "取1则退化为旧行为(先砍到n_features再去相关, 名额会剩不满)")
 parser.add_argument("--ic-timing", action="store_true", help="开启IC置信度择时(默认关)")
 parser.add_argument("--vol-target", action="store_true", help="开启波动率目标仓位(默认关)")
 parser.add_argument("--objective", type=str, default="l2", choices=["l2", "rank"],
@@ -53,6 +64,11 @@ parser.add_argument("--exec-mode", type=str, default="close",
 parser.add_argument("--slippage", type=float, default=0.0,
                     help="单边滑点(小数), 买入成交价上浮/卖出下浮该比例。"
                          "例: 0.001 = 单边0.1%%(往返0.2%%)。仅影响成交价, 不影响持仓估值")
+parser.add_argument("--trade-cost", type=float, default=0.0006,
+                    help="单边交易费率(小数), 含佣金+过户费+印花税的综合估值。"
+                         "默认 0.0006(万六)。万一口径约 0.0002 (佣金万一+卖出印花税摊平到双边)")
+parser.add_argument("--min-fee", type=float, default=5.0,
+                    help="单笔最低佣金(元)。小资金下这是硬约束: 设 0 即模拟“免五”")
 parser.add_argument("--regime-filter", type=str, default="off",
                     choices=["off", "ma", "breadth", "both", "any"],
                     help="大盘 regime 空仓过滤: ma=大盘跌破MA; breadth=上涨广度低迷; "
@@ -76,6 +92,9 @@ parser.add_argument("--save-preds", type=str, default=None,
 parser.add_argument("--load-preds", type=str, default=None,
                     help="从 pickle 加载预测结果, 跳过训练。仅当只改执行层参数"
                          "(regime/护栏/持仓数/成本) 时可用, 模型相关参数必须与缓存一致")
+parser.add_argument("--features-from", type=str, default=None,
+                    help="直接复用另一份回测 json 里的 selected_features (data/processed/ 下), "
+                         "不现场筛选。用于隔离'数据变了'和'特征集变了'两个变量")
 parser.add_argument("--tag", type=str, default=None)
 args = parser.parse_args()
 
@@ -103,8 +122,8 @@ LOCKED_PARAMS = dict(
     boosting_type="dart",
 )
 
-TRADE_COST = 0.0006
-MIN_FEE = 5.0
+TRADE_COST = args.trade_cost
+MIN_FEE = args.min_fee
 SLIPPAGE = args.slippage
 INIT_CAPITAL = args.initial_capital
 TEST_START, TEST_END = args.test_start, args.test_end
@@ -134,11 +153,14 @@ def apply_pit_universe(df, uni_file):
     u = pd.read_parquet(DATA_DIR / "universe" / uni_file)
     u["effective_date"] = pd.to_datetime(u["effective_date"])
     u["code6"] = u["code"].astype(str).str.zfill(6)
-    eff = np.array(sorted(u["effective_date"].unique()))
+    # 用 DatetimeIndex 而非 np.array(sorted(...)): 后者得到 object 数组,
+    # 与 datetime64[ns] 的 date 列做 searchsorted 会退化成 Timestamp<int 报错
+    # (训练集 parquet 的时间精度 ms/ns 不固定, 这里必须对精度不敏感)
+    eff = pd.DatetimeIndex(sorted(pd.to_datetime(u["effective_date"].unique())))
     members = {d: set(g["code6"]) for d, g in u.groupby("effective_date")}
 
     code6 = df["code"].astype(str).str[:6]
-    period = np.searchsorted(eff, df["date"].values, side="right") - 1
+    period = eff.searchsorted(pd.DatetimeIndex(df["date"]), side="right") - 1
     keep = np.zeros(len(df), dtype=bool)
     for i, d in enumerate(eff):
         m = period == i
@@ -279,13 +301,109 @@ def compute_overnight_features(codes):
     return ovn, feats
 
 
-def select_features(df, all_features, label_col, n_top, corr_thresh, cutoff):
+def drop_market_wide(df, feats, label_col, cutoff, thresh):
+    """剔除对截面标签零信息的市场级特征。
+
+    标签是 y = fwd_ret - 当日截面均值。若某特征在同一天对所有股票取同一个值
+    (商品价格/汇率/国债收益率/PMI/全球指数/全市场事件聚合等), 那么它在截面内
+    没有任何变异, 单独的截面 IC 恒为 0。
+
+    树模型仍可能用它做分裂, 但那种分裂会把当天【所有】股票分到同一侧 ——
+    等价于按日期切分训练集, 是记忆训练区间而非学习选股规律。筛选样本只有
+    约 255 天, 几次这样的分裂就足以过拟合。
+
+    判据 (两条取并集, 任一命中即剔除):
+      A. 截面变异比 = (每日跨股票 std 的均值) / (总体 std)
+      B. 每日独立取值比 = median(当日 nunique / 当日股票数)
+
+    【为何必须有 B】判据 A 不具备股票池规模不变性。市场级序列按各股自己的
+    交易日 as-of 对齐时, 停牌股会拿到上一期的陈旧值, 于是同一天出现少数几个
+    不同取值。池子越大停牌/日历异质性越多, 这种假截面变异越强:
+        cn_pmi 变异比   497只池 = 0.0052 (正确剔除)
+                       2370只池 = 0.0180 (穿破 0.01 阈值, 漏网)
+        同日存在多个 PMI 取值的天数  7.5% -> 52.5%
+    漏网后它在 2370 只池子里 gain 重要度排第 2, 模型学到的是 PMI 公布前后
+    哪些股票停牌, 不是选股 alpha。
+    根因是 PMI 跳变使那 2 个陈旧/新值相距很远, 少量样本即可推高 std。
+    判据 B 只数取值个数不看取值大小, 对此免疫: cn_pmi 在 2337 只股票里每日
+    仅约 2 个不同取值 (独值比 0.00085), 两个池子都远低于阈值。
+    实测两池分离度: 市场级 0.0000~0.0020 vs 个股级 0.0390~1.0000。
+
+    只用 cutoff 之前的数据计算, 与 select_features 口径一致。
+
+    【必须按母特征判定】feature_engine 在单只股票内部对几乎所有列做
+    rolling(5/20).mean()。市场级序列原始值的截面变异比精确为 0, 但因为每只
+    股票停牌日不同, 滚动窗口覆盖的日历不同, 其 _ma5/_ma20 会凭空产生
+    0.001~0.010 的截面变异 —— 这部分变异实测与"近20日缺勤天数"显著相关
+    (a50_futures_chg_21d_ma20: rho=+0.137, t=3.4), 编码的是停牌模式而非
+    个股信息。若只按特征自身的变异比过滤, 会有约 31 个这样的假特征漏网,
+    且它们的 gain 重要度常年排在最前。因此: 母特征是市场级的, 其所有 MA
+    派生一律剔除。
+    """
+    s = df[(df["date"] < pd.Timestamp(cutoff)) & df[label_col].notna()]
+    # 判据A: 截面变异比
+    overall = s[feats].std().replace(0, np.nan)
+    cs = s.groupby("date")[feats].std().mean()
+    ratio = (cs / overall).fillna(0)
+    # 判据B: 每日独立取值比 (对市场级序列的陈旧值跳变免疫)
+    n_per_day = s.groupby("date")["code"].nunique()
+    uniq = s.groupby("date")[feats].nunique().div(n_per_day, axis=0).median().fillna(0)
+
+    def base_of(f):
+        for suf in ("_ma5", "_ma20"):
+            if f.endswith(suf):
+                return f[: -len(suf)]
+        return f
+
+    keep, dropped, by_ma, by_uniq = [], [], 0, 0
+    for f in feats:
+        b = base_of(f)
+        # 母特征在数据里就用母特征判定, 否则退回用自身
+        k = b if (b in ratio.index) else f
+        hit_var, hit_uniq = ratio[k] < thresh, uniq[k] < thresh
+        if hit_var or hit_uniq:
+            dropped.append(f)
+            if not hit_var:
+                by_uniq += 1
+            if b != f and ratio[f] >= thresh and uniq[f] >= thresh:
+                by_ma += 1
+        else:
+            keep.append(f)
+    print(f"  剔除市场级特征(母特征 变异比 或 独值比 < {thresh}): "
+          f"{len(feats)} -> {len(keep)} 个候选, 剔除 {len(dropped)} 个")
+    if by_ma:
+        print(f"    其中 {by_ma} 个是靠停牌日历伪造出截面变异的 MA 派生"
+              f"(自身变异比 >= {thresh}, 但母特征为市场级)")
+    if by_uniq:
+        print(f"    其中 {by_uniq} 个仅被独值比判据捕获"
+              f"(变异比 >= {thresh} 已漏网, 但每日跨股票取值数极少)")
+    if dropped:
+        print(f"    示例: {dropped[:6]}")
+    return keep
+
+
+def select_features(df, all_features, label_col, n_top, corr_thresh, cutoff,
+                    n_seeds=5, pool_mult=3, return_table=False):
     """筛特征只允许用 cutoff 之前的数据。
 
     cutoff = 首个可出信号日。绝不能退化成全样本: 那会把测试期的 fwd 标签
     喂给筛选器, 造成未来泄漏, 且结果对数据尾部极度敏感。
+
+    2026-07 重写, 修了 4 个问题 (原实现使特征集不可复现, 同一份数据两次
+    重建可能得到差异巨大的特征集 -> 回测收益 24.7% vs 171.3%):
+
+    1. 用 gain 而非 split 计数。split 计数是小整数, 排名 70~85 名会全部
+       并列在同一个值上, 截断线切在并列区里, 保留谁纯看排序实现细节。
+    2. 多种子平均。colsample_bytree=0.8 使单次拟合的重要度带随机性,
+       单种子结果不稳定。每个种子内先归一化再平均, 避免量级差异主导。
+    3. 稳定且确定的排序。原 sort_values 默认 kind="quicksort" 非稳定,
+       并列项顺序不确定; 改为 (重要度降, 特征名升) + mergesort。
+    4. 去相关从 n_top*pool_mult 的候选池里填满 n_top 个名额, 而不是先砍到
+       n_top 再去相关(那样最终只剩 57/80, 名额被浪费)。
+       同时只与【已选中】的特征比相关性, 不再连坐。
     """
-    print(f"  特征筛选: {len(all_features)} -> top{n_top} -> 去相关({corr_thresh}) "
+    print(f"  特征筛选: {len(all_features)} 个候选 -> 目标 {n_top} 个 "
+          f"| gain重要度 x {n_seeds} 种子平均 | 去相关阈值 {corr_thresh} "
           f"| 仅用 < {pd.Timestamp(cutoff).date()} 的数据")
     s = df[(df["date"] < pd.Timestamp(cutoff)) & df[label_col].notna()]
     if len(s) < 10000:
@@ -294,21 +412,76 @@ def select_features(df, all_features, label_col, n_top, corr_thresh, cutoff):
             f"       请把 --test-start 往后推, 或补更早的历史数据。\n"
             f"       (绝不退化为全样本筛选 —— 那会造成未来数据泄漏)")
     X = s.groupby("code")[all_features].transform(lambda c: c.ffill().fillna(0))
-    p = dict(LOCKED_PARAMS, n_estimators=50, boosting_type="gbdt")
-    mdl = lgb.LGBMRegressor(**p).fit(X, s[label_col])
-    imp = (pd.DataFrame({"feature": all_features, "importance": mdl.feature_importances_})
-           .sort_values("importance", ascending=False).reset_index(drop=True))
-    top = imp.head(n_top)["feature"].tolist()
-    cm = s[top].corr().abs()
-    selected, dropped = [], set()
-    for f in top:
-        if f in dropped:
+    y = s[label_col]
+
+    # ── 1+2: gain 重要度, 对【日期区块重采样】求平均 ──
+    # 关键: 必须令 colsample_bytree=1.0。它按列索引抽样, 会使重要度依赖
+    # 候选特征的列顺序 —— 修复基本面数据新增 30 列后列序一变, 特征集就洗牌
+    # (实测打乱列序后 Jaccard 仅 68~76%)。关掉后给定数据即完全确定。
+    # 稳健性改由重采样数据获得: 按 5 日区块抽样(尊重 5 日重叠标签的相关结构),
+    # 每次抽 80% 区块, 这样 imp_std 反映的是"换一段样本排名会不会变"。
+    uniq_dates = np.array(sorted(s["date"].unique()))
+    blocks = np.array_split(np.arange(len(uniq_dates)),
+                            max(1, len(uniq_dates) // LABEL_HORIZON))
+    mat = np.zeros((n_seeds, len(all_features)), dtype=float)
+    for i in range(n_seeds):
+        if n_seeds == 1:
+            m = np.ones(len(s), dtype=bool)
+        else:
+            rng = np.random.default_rng(1000 + i)
+            pick = rng.choice(len(blocks), size=max(1, int(len(blocks) * 0.8)),
+                              replace=False)
+            keep = set(uniq_dates[np.concatenate([blocks[b] for b in sorted(pick)])])
+            m = s["date"].isin(keep).values
+        p = dict(LOCKED_PARAMS, n_estimators=50, boosting_type="gbdt",
+                 colsample_bytree=1.0, random_state=42, importance_type="gain")
+        mdl = lgb.LGBMRegressor(**p).fit(X[m], y[m])
+        g = np.asarray(mdl.booster_.feature_importance(importance_type="gain"),
+                       dtype=float)
+        tot = g.sum()
+        mat[i] = g / tot if tot > 0 else 0.0
+    imp_mean, imp_std = mat.mean(axis=0), mat.std(axis=0)
+
+    # ── 3: 确定性排序, 并列时按特征名升序, 保证可复现 ──
+    imp = pd.DataFrame({"feature": all_features,
+                        "importance": imp_mean, "imp_std": imp_std})
+    imp = (imp.sort_values(["importance", "feature"], ascending=[False, True],
+                           kind="mergesort").reset_index(drop=True))
+
+    # 诊断: 0 重要度的特征直接不参选; 并统计截断线附近的并列程度
+    nz = imp[imp["importance"] > 0].reset_index(drop=True)
+    n_zero = len(imp) - len(nz)
+    if len(nz) > n_top:
+        cut_val = nz.loc[n_top - 1, "importance"]
+        n_tied = int((nz["importance"] == cut_val).sum())
+    else:
+        cut_val, n_tied = float("nan"), 0
+    print(f"    重要度: 非零 {len(nz)} 个, 恒为0 {n_zero} 个(已排除)")
+    if n_tied > 1:
+        print(f"    !! 截断线({cut_val:.3g})上有 {n_tied} 个并列特征, "
+              f"排名仍受实现细节影响")
+
+    # ── 4: 从更大候选池里去相关, 填满 n_top 个名额 ──
+    pool = nz["feature"].head(max(n_top * pool_mult, n_top)).tolist()
+    cm = s[pool].corr().abs()
+    selected, n_dropped = [], 0
+    for f in pool:
+        if len(selected) >= n_top:
+            break
+        if any(cm.at[f, g] > corr_thresh for g in selected):
+            n_dropped += 1
             continue
         selected.append(f)
-        for c in cm.index[cm[f] > corr_thresh]:
-            if c != f:
-                dropped.add(c)
-    print(f"    保留 {len(selected)} 个 | top10: {imp.head(10)['feature'].tolist()}")
+    print(f"    候选池 {len(pool)} 个 -> 去相关剔除 {n_dropped} 个 -> "
+          f"选中 {len(selected)} 个")
+    print(f"    top10: {nz.head(10)['feature'].tolist()}")
+    # 重要度排名的可信度: 变异系数越大说明该特征的重要度越不稳定
+    sel_imp = imp.set_index("feature").loc[selected]
+    cv = (sel_imp["imp_std"] / sel_imp["importance"].replace(0, np.nan)).median()
+    print(f"    选中特征重要度的种子间变异系数(中位数): {cv:.2f} "
+          f"({'稳定' if cv < 0.3 else '偏噪声, 建议加大 n_seeds 或减少候选'})")
+    if return_table:
+        return selected, imp
     return selected
 
 
@@ -318,6 +491,8 @@ def select_features(df, all_features, label_col, n_top, corr_thresh, cutoff):
 def load_all_klines():
     cache = {}
     for p in sorted(KLINE_DIR.glob("*.parquet")):
+        if not p.is_file():
+            continue
         kl = pd.read_parquet(p).rename(columns=_COL_MAP)
         kl["date"] = pd.to_datetime(kl["date"])
         cache[p.stem] = kl.sort_values("date").drop_duplicates("date").reset_index(drop=True)
@@ -433,8 +608,28 @@ for _d in dates:
 if FIRST_PRED is None:
     raise SystemExit(f"ERROR: 数据不足, 无法在 {TEST_START} 之后凑出 {MIN_TRAIN_DAYS} 天训练集")
 
-features = select_features(df, all_features, LABEL, args.n_features,
-                           args.corr_threshold, FIRST_PRED)
+FEAT_IMPORTANCE = None
+if args.features_from:
+    _src = DATA_DIR / "processed" / args.features_from
+    if not _src.exists():
+        raise SystemExit(f"ERROR: 找不到特征来源 {_src}")
+    _sel = json.load(open(_src, encoding="utf-8"))["selected_features"]
+    _miss = [f for f in _sel if f not in df.columns]
+    features = [f for f in _sel if f in df.columns]
+    print(f"  特征: 复用 {args.features_from} 的 {len(_sel)} 个, "
+          f"当前数据里可用 {len(features)} 个")
+    if _miss:
+        print(f"    缺失 {len(_miss)} 个: {_miss}")
+else:
+    _cand = all_features
+    if args.drop_market_wide > 0:
+        _cand = drop_market_wide(df, _cand, LABEL, FIRST_PRED,
+                                 args.drop_market_wide)
+    features, _imp_table = select_features(
+        df, _cand, LABEL, args.n_features, args.corr_threshold,
+        FIRST_PRED, n_seeds=args.select_seeds,
+        pool_mult=args.select_pool_mult, return_table=True)
+    FEAT_IMPORTANCE = _imp_table.head(120).to_dict("records")
 style_cols = [c for c in STYLE_CANDIDATES if c in df.columns]
 
 mkt_position = None
@@ -825,6 +1020,10 @@ json.dump({
     "reversal_guard": args.reversal_guard,
     "features": len(features), "selected_features": features,
     "feat_select_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}",
+    "feat_select_seeds": args.select_seeds,
+    "feat_select_pool_mult": args.select_pool_mult,
+    "feat_select_n_target": args.n_features,
+    "feat_importance_top120": FEAT_IMPORTANCE,
     "period": f"{rdf['date'].iloc[0]:%Y-%m-%d} ~ {rdf['date'].iloc[-1]:%Y-%m-%d}",
     "n_days": n, "initial_capital": INIT_CAPITAL, "top_n": TARGET_POSITIONS,
     "summary": {

@@ -20,15 +20,39 @@
 import argparse
 import json
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 KL = ROOT / "data/raw/kline"
 META = ROOT / "data/universe/pit_metadata.parquet"
 OUT = ROOT / "data/universe/universe_pit.parquet"
+
+
+def _load_one(p: Path):
+    """读单只K线, 返回 (code, 日期int64数组, amount数组, mcap数组)
+
+    只回传 numpy 数组: 主循环里用 searchsorted + numpy 聚合, 比 pandas 快两个量级
+    """
+    try:
+        k = pd.read_parquet(p, columns=["date", "amount", "volume",
+                                        "outstanding_share"])
+    except Exception:
+        return None
+    if not len(k):
+        return None
+    k["date"] = pd.to_datetime(k["date"])
+    k = k.sort_values("date")
+    vol = k["volume"].to_numpy(dtype="float64", na_value=np.nan)
+    amt = k["amount"].to_numpy(dtype="float64", na_value=np.nan)
+    osh = k["outstanding_share"].to_numpy(dtype="float64", na_value=np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mcap = np.where(vol > 0, amt / vol, np.nan) * osh
+    return p.stem, k["date"].to_numpy(dtype="datetime64[ns]").astype("int64"), amt, mcap
 
 
 def trading_calendar() -> pd.DatetimeIndex:
@@ -67,7 +91,14 @@ def main():
                     help="流动性下限(元), 低于此日均成交额的剔除")
     ap.add_argument("--start", default="2022-09-01")
     ap.add_argument("--end", default="2026-07-27")
+    ap.add_argument("--out", default=None,
+                   help="输出文件名 (data/universe/ 下), 默认 universe_pit.parquet。"
+                        "做实验时务必指定其它名字 —— 默认文件被 live_signal/daily_rebuild 依赖")
+    ap.add_argument("--jobs", type=int, default=16, help="加载K线的并行进程数")
     a = ap.parse_args()
+
+    out_path = OUT if not a.out else OUT.parent / a.out
+    cfg_path = out_path.with_name(out_path.stem + "_config.json")
 
     meta = pd.read_parquet(META)
     meta["code"] = meta["code"].astype(str).str.zfill(6)
@@ -80,22 +111,18 @@ def main():
           f"{', '.join(str(d.date()) for d in rebs)}")
 
     # 预载 kline: amount 用于流动性, vwap x outstanding_share 用于真实市值
-    print(f"\n加载 kline (amount, volume, outstanding_share) ...")
+    files = sorted(KL.glob("*.parquet"))
+    print(f"\n加载 kline (amount, volume, outstanding_share) | {len(files)} 个文件, {a.jobs} 进程 ...")
     store = {}
-    for p in sorted(KL.glob("*.parquet")):
-        try:
-            k = pd.read_parquet(p, columns=["date", "amount", "volume",
-                                            "outstanding_share"])
-        except Exception:
-            continue
-        if not len(k):
-            continue
-        k["date"] = pd.to_datetime(k["date"])
-        k = k.set_index("date").sort_index()
-        vwap = k["amount"] / k["volume"].replace(0, pd.NA)
-        k["mcap"] = vwap * k["outstanding_share"]
-        store[p.stem] = k[["amount", "mcap"]]
+    with ProcessPoolExecutor(max_workers=a.jobs) as ex:
+        for res in ex.map(_load_one, files, chunksize=32):
+            if res is not None:
+                store[res[0]] = res[1:]
     print(f"  载入 {len(store)} 只")
+
+    # meta 转 records: 避免 iterrows 每行构造 Series
+    mrecs = [(r["code"], r["list_date"], r["delist_date"])
+             for r in meta.to_dict("records")]
 
     recs = []
     for T in rebs:
@@ -103,27 +130,28 @@ def main():
         if len(win) < a.lookback * 0.5:
             continue
         w0 = win[0]
+        min_cover = len(win) * 0.75
+        t_i8, w0_i8 = T.value, w0.value
         cand = []
-        for _, r in meta.iterrows():
-            code = r["code"]
+        for code, ld, dd in mrecs:
             # 条件1: 上市满 N 年
-            ld = r["list_date"]
             if pd.isna(ld) or (T - ld).days < a.min_listed_years * 365.25:
                 continue
             # 条件2: T 时点未退市
-            dd = r["delist_date"]
             if pd.notna(dd) and dd <= T:
                 continue
             s = store.get(code)
             if s is None:
                 continue
-            # 条件3: 窗口内数据覆盖率
-            sub = s[(s.index >= w0) & (s.index < T)]
-            if len(sub) < len(win) * 0.75:
+            # 条件3: 窗口内数据覆盖率 (日期已排序, 用二分定位取代全量布尔扫描)
+            dts, amt, mc = s
+            i0 = np.searchsorted(dts, w0_i8, side="left")
+            i1 = np.searchsorted(dts, t_i8, side="left")
+            if i1 - i0 < min_cover:
                 continue
-            adv = float(sub["amount"].mean())
-            mcap = float(sub["mcap"].median())
-            if adv < a.min_adv or not (mcap > 0):
+            adv = float(np.nanmean(amt[i0:i1]))
+            mcap = float(np.nanmedian(mc[i0:i1]))
+            if not (adv >= a.min_adv) or not (mcap > 0):
                 continue
             cand.append((code, mcap, adv))
         if not cand:
@@ -139,9 +167,9 @@ def main():
     u = pd.concat(recs, ignore_index=True)
     u["has_kline"] = True
     u = u[["effective_date", "code", "mcap", "adv", "rank", "has_kline"]]
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    u.to_parquet(OUT, index=False)
-    print(f"\n已写入 {OUT}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    u.to_parquet(out_path, index=False)
+    print(f"\n已写入 {out_path}")
     print(f"  {len(u):,} 行 | {u['code'].nunique()} 只不重复股票 | "
           f"{u['effective_date'].nunique()} 个生效期")
 
@@ -164,7 +192,7 @@ def main():
     print(f"  -> 这 {len(win_del)-len(have)} 只无法进入回测, 构成残留幸存者偏差")
     print(f"  -> 影响上界: 退市股占同期全市场约 {100*len(win_del)/len(meta):.1f}%")
 
-    (OUT.parent / "universe_pit_config.json").write_text(json.dumps({
+    cfg_path.write_text(json.dumps({
         "top_n": a.top_n, "lookback": a.lookback,
         "min_listed_years": a.min_listed_years, "freq": a.freq,
         "rank_by": a.rank_by, "min_adv": a.min_adv,

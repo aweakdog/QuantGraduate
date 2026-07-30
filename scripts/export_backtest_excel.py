@@ -36,13 +36,28 @@ METRIC_ROWS = [
 ]
 
 
+def _short_label(path):
+    """从文件名里抽一个短标识: wf_daily_<tag>_ts...  -> <tag>"""
+    s = Path(path).stem
+    if s.startswith("wf_daily_"):
+        s = s[len("wf_daily_"):]
+    return s.split("_ts", 1)[0] or Path(path).stem
+
+
 def load_runs(pattern):
     runs = []
     for f in sorted(glob.glob(pattern)):
         d = json.load(open(f, encoding="utf-8"))
-        runs.append((d.get("regime_filter", Path(f).stem), d))
+        runs.append([d.get("regime_filter", Path(f).stem), d, f])
+    # 多个文件的 regime_filter 可能相同(如都是 breadth), 重名会让 Excel
+    # 列头撞车、无法并排对比; 此时改用文件名里的 tag 区分
+    from collections import Counter
+    dup = {k for k, c in Counter(r[0] for r in runs).items() if c > 1}
+    for r in runs:
+        if r[0] in dup:
+            r[0] = _short_label(r[2])
     runs.sort(key=lambda x: ORDER.get(x[0], 9))
-    return runs
+    return [(r[0], r[1]) for r in runs]
 
 
 def benchmark_series(train_file, pit_universe, dates):
@@ -54,11 +69,13 @@ def benchmark_series(train_file, pit_universe, dates):
     if pit_universe:
         u = pd.read_parquet(ROOT / "data/universe" / pit_universe)
         u["effective_date"] = pd.to_datetime(u["effective_date"])
-        eff = np.array(sorted(u["effective_date"].unique()))
+        # 用 DatetimeIndex: np.array(sorted(...)) 得到 object 数组, 与
+        # datetime64[ns] 的 date 列 searchsorted 会报 Timestamp<int
+        eff = pd.DatetimeIndex(sorted(pd.to_datetime(u["effective_date"].unique())))
         members = {d: set(g["code"].astype(str).str.zfill(6))
                    for d, g in u.groupby("effective_date")}
         c6 = df["code"].astype(str).str[:6]
-        per = np.searchsorted(eff, df["date"].values, side="right") - 1
+        per = eff.searchsorted(pd.DatetimeIndex(df["date"]), side="right") - 1
         keep = np.zeros(len(df), bool)
         for i, d in enumerate(eff):
             m = per == i

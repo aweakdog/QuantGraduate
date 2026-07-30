@@ -60,7 +60,7 @@ def benchmark_series(dates, train_file="training_data_v24.parquet", pit_universe
     if pit_universe:
         u = pd.read_parquet(ROOT / "data" / "universe" / pit_universe)
         u["effective_date"] = pd.to_datetime(u["effective_date"])
-        eff = np.array(sorted(u["effective_date"].unique()))
+        eff = pd.DatetimeIndex(sorted(u["effective_date"].unique()))
         members = {d: set(g["code"].astype(str).str.zfill(6))
                    for d, g in u.groupby("effective_date")}
         c6 = df["code"].astype(str).str[:6]
