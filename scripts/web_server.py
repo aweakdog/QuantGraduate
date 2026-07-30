@@ -923,6 +923,46 @@ async def api_cash_flow(req: Request):
     return _cash_op(pid, extra, "出入金")
 
 
+@app.post("/api/profile/drop-lot")
+async def api_drop_lot(req: Request):
+    """删除一笔持仓。
+
+    mode="sold"   : 已在券商卖出, 需带 price -> 现金增加 股数x价格-手续费
+    mode="phantom": 系统记错了从没持有 -> 只删记录, 现金不动
+
+    两种情形现金处理正好相反, 所以必须由前端明确传 mode, 后端不猜。
+    """
+    if not _ops_ok(req):
+        return _ops_deny()
+    body = await req.json()
+    pid = body.get("profile")
+    if pid not in PROFILES:
+        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    code = str(body.get("code") or "").strip()
+    if not code.isdigit() or len(code) > 6:
+        return JSONResponse({"error": "股票代码不对"}, status_code=400)
+    code = code.zfill(6)
+
+    mode = body.get("mode")
+    if mode == "sold":
+        try:
+            price = float(body.get("price"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "请填真实卖出价"}, status_code=400)
+        if price <= 0:
+            return JSONResponse({"error": "卖出价必须为正"}, status_code=400)
+        extra = ["--drop-lot", code, "--sold-at", repr(price)]
+    elif mode == "phantom":
+        extra = ["--drop-lot", code, "--phantom"]
+    else:
+        return JSONResponse(
+            {"error": "必须说明是「已卖出」还是「记错了」"}, status_code=400)
+
+    if body.get("note"):
+        extra += ["--note", str(body["note"])[:100]]
+    return _cash_op(pid, extra, "删除持仓")
+
+
 @app.get("/api/today")
 async def api_today(profile: str = None):
     """归一化的"明天该做什么" —— 首页用。只读, 不触发模型。"""

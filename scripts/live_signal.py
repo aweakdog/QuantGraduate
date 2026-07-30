@@ -128,7 +128,15 @@ ap.add_argument("--set-cash", type=float, default=None,
 ap.add_argument("--cash-flow", type=float, default=None,
                 help="出入金: 正数存入, 负数取出。这是本金变动不是盈亏, "
                      "所以现金和本金同额增减, 收益率保持不变")
-ap.add_argument("--note", default="", help="给 --set-cash / --cash-flow 附一句备注")
+ap.add_argument("--drop-lot", default=None,
+                help="删除一笔持仓 (填6位代码)。必须同时说明现金怎么算: "
+                     "配 --sold-at <成交价> 表示已在券商卖出(现金增加); "
+                     "配 --phantom 表示系统记错了从没持有过(现金不变)")
+ap.add_argument("--sold-at", type=float, default=None,
+                help="配合 --drop-lot: 真实卖出价, 现金按 股数x价格-手续费 增加")
+ap.add_argument("--phantom", action="store_true",
+                help="配合 --drop-lot: 这笔持仓本就不存在(记账错误), 只删记录不动现金")
+ap.add_argument("--note", default="", help="给现金/持仓类操作附一句备注")
 args = ap.parse_args()
 
 DATA_DIR = settings.DATA_DIR
@@ -899,6 +907,91 @@ def do_cash_flow(st, kl, names):
     save_state(st)
 
 
+def do_drop_lot(st, kl, names):
+    """删除一笔持仓。
+
+    有两种完全相反的情形, 现金的处理正好相反, 所以必须由调用方显式指明,
+    绝不猜:
+
+      --sold-at <价>  你已经在券商 App 里卖掉了 —— 钱真的回到账户,
+                      所以 现金 += 股数x价格 - 手续费, 并记一笔卖出流水。
+      --phantom       系统记错了, 你从没持有过这只 —— 纯修账, 现金不动。
+
+    猜错任何一边都会让账目失真: 前者少记钱会让总资产凭空缩水,
+    后者多记钱会让总资产凭空膨胀。
+    """
+    code = str(args.drop_lot).zfill(6)[:6]
+    said_sold = args.sold_at is not None
+    if said_sold and args.phantom:
+        raise SystemExit("ERROR: --sold-at 和 --phantom 不能同时用 —— "
+                         "一个现金增加一个现金不变, 只能选一个")
+    if not said_sold and not args.phantom:
+        raise SystemExit(
+            "ERROR: 删除持仓必须说明现金怎么算, 二选一:\n"
+            "  --sold-at <成交价>  已在券商卖出 -> 现金增加\n"
+            "  --phantom           系统记错了   -> 现金不变")
+    if args.sold_at is not None and args.sold_at <= 0:
+        raise SystemExit(f"ERROR: 卖出价必须为正 (收到 {args.sold_at})")
+
+    hits = [l for l in st["lots"] if str(l["code"])[:6] == code]
+    if not hits:
+        held = ", ".join(sorted(str(l["code"])[:6] for l in st["lots"])) or "(空仓)"
+        raise SystemExit(f"ERROR: 持仓里没有 {code}。当前持仓: {held}")
+    if len(hits) > 1:
+        raise SystemExit(f"ERROR: {code} 有 {len(hits)} 笔记录, 不确定删哪笔。"
+                         f"请用 /pro 的整体对账处理")
+    lot = hits[0]
+    nm = names.get(code, "")
+    before = snapshot(st, kl, names)
+
+    bak = backup_state("droplot")
+    st["lots"] = [l for l in st["lots"] if l is not lot]
+
+    if args.sold_at is not None:
+        px = float(args.sold_at)
+        gross = lot["shares"] * px
+        fee = max(gross * TRADE_COST, MIN_FEE)
+        st["cash"] = float(st["cash"]) + gross - fee
+        kind, detail = "drop_sold", (f"按 {px} 卖出 {lot['shares']} 股, "
+                                     f"净入 ¥{gross - fee:,.2f} (手续费 {fee:,.2f})")
+    else:
+        px, gross, fee = None, 0.0, 0.0
+        kind, detail = "drop_phantom", "记账错误, 只删记录不动现金"
+
+    after = snapshot(st, kl, names)
+    st.setdefault("history", []).append({
+        "type": kind, "at": datetime.now().isoformat(timespec="seconds"),
+        "note": args.note,
+        "lot": {"code": code, "name": nm, "shares": lot["shares"],
+                "buy_price": lot["buy_price"], "open_date": lot.get("open_date")},
+        "sold_at": px, "fee": round(fee, 2) if fee else 0.0,
+        "before": {"cash": before["cash"], "equity": before["equity"]},
+        "after": {"cash": after["cash"], "equity": after["equity"]},
+    })
+
+    W = 68
+    print(f"\n{'='*W}\n  删除持仓 {code} {nm}\n{'='*W}")
+    print(f"  原持仓 : {lot['shares']} 股, 成本 {lot['buy_price']:.3f}, "
+          f"开仓 {lot.get('open_date')}")
+    print(f"  处理   : {detail}")
+    if args.sold_at is not None:
+        pnl = gross - fee - lot["shares"] * lot["buy_price"]
+        print(f"  这笔盈亏: ¥{pnl:+,.2f}")
+    print(f"  现金   : ¥{before['cash']:,.2f}  ->  ¥{after['cash']:,.2f}")
+    print(f"  总资产 : ¥{before['equity']:,.2f}  ->  ¥{after['equity']:,.2f}")
+    print(f"  持仓数 : {len(before['positions'])}  ->  {len(after['positions'])}")
+    if args.phantom:
+        print("  注: 总资产下降是因为删掉了一笔本不该存在的持仓, 账目现在更接近真实")
+    if st.get("pending"):
+        print(f"  注: 挂单计划({st['pending']['signal_date']})里若含这只股, "
+              f"结算时会自动跳过(它已不在持仓里), 不会重复卖出")
+    if args.note:
+        print(f"  备注   : {args.note}")
+    if bak:
+        print(f"  已备份 : {bak.name}")
+    save_state(st)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════════════
@@ -925,6 +1018,9 @@ if args.set_cash is not None:
     sys.exit(0)
 if args.cash_flow is not None:
     do_cash_flow(state, kl, names)
+    sys.exit(0)
+if args.drop_lot:
+    do_drop_lot(state, kl, names)
     sys.exit(0)
 
 print(f"加载 {TRAIN_PATH.name} ...")

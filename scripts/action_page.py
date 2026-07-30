@@ -190,7 +190,48 @@ def build_today(root: Path, pid=None):
     fresh = _freshness(root, state, plan)
     sell = list((plan or {}).get("sell") or [])
     buy = list((plan or {}).get("buy") or [])
-    hold = list((plan or {}).get("hold") or [])
+
+    # 持仓必须以 state.lots 为准, 不能用 plan.hold ——
+    # plan 是出信号那一刻的快照, 而删除持仓/对账只改 state。若用 plan,
+    # 状态里存在但计划里没有的持仓就不会显示, 用户也就没法删它。
+    # 计划里的同一只股票只用来补展示字段(名称/参考价/盈亏/已持天数)。
+    plan_hold = {str(h.get("code"))[:6]: h for h in ((plan or {}).get("hold") or [])}
+    # 名称在多处出现, 都拿来当字典用, 尽量别让界面上只剩一串代码
+    name_src = {}
+    for grp in ("hold", "sell", "buy", "alternates", "recommend"):
+        for r in ((plan or {}).get(grp) or []):
+            c6 = str(r.get("code"))[:6]
+            if r.get("name") and c6 not in name_src:
+                name_src[c6] = r["name"]
+
+    cal = [str(pd.Timestamp(d).date()) for d in (state.get("calendar") or [])]
+
+    def _held_days(lot):
+        """已持有的换仓周期数; 日历缺失或对不上时返回 None 而不是编一个数"""
+        osd = lot.get("open_signal_date")
+        sig = (plan or {}).get("signal_date")
+        if not osd or not sig or osd not in cal or sig not in cal:
+            return None
+        return cal.index(sig) - cal.index(osd)
+
+    hold = []
+    for lot in (state.get("lots") or []):
+        c6 = str(lot.get("code"))[:6]
+        ph = plan_hold.get(c6) or {}
+        ref = ph.get("ref_close") or lot.get("buy_price")
+        bp = lot.get("buy_price") or 0
+        # 没有当日行情时不谎报 0%, 显示 "--" 更诚实
+        pnl = ph.get("pnl_pct")
+        if pnl is None and ph.get("ref_close") and bp:
+            pnl = round(ph["ref_close"] / bp * 100 - 100, 2)
+        hold.append({
+            "code": c6,
+            "name": ph.get("name") or name_src.get(c6, ""),
+            "shares": lot.get("shares") or 0,
+            "ref_close": ref,
+            "pnl_pct": pnl,
+            "held_days": ph.get("held_days", _held_days(lot)),
+        })
     in_cash = bool((plan or {}).get("in_cash"))
     is_rebal = bool((plan or {}).get("is_rebal"))
 
@@ -215,16 +256,11 @@ def build_today(root: Path, pid=None):
 
     nxt_date, nxt_left = _next_rebal(state, plan)
     # 现金必须取 state 而不是 plan —— plan 是出信号那一刻的快照, 之后的
-    # 现金校准/出入金只写 state, 用 plan 的话页面会一直显示旧数字, 而这正是
-    # 「防止偏差」功能最不能出的错。持仓市值仍按计划里的参考价估, 但股数以
-    # state 的实际批次为准。
+    # 现金校准/出入金/删除持仓只写 state, 用 plan 的话页面会一直显示旧数字,
+    # 而这正是「防止偏差」这类功能最不能出的错。
+    # hold 上面已按 state.lots 构建, 市值直接用它算即可。
     cash = float(state.get("cash") or 0)
-    hold_by_code = {str(h.get("code"))[:6]: h for h in hold}
-    mv = 0.0
-    for lot in (state.get("lots") or []):
-        c6 = str(lot.get("code"))[:6]
-        ref = (hold_by_code.get(c6) or {}).get("ref_close") or lot.get("buy_price") or 0
-        mv += (lot.get("shares") or 0) * ref
+    mv = sum((h["shares"] or 0) * (h["ref_close"] or 0) for h in hold)
     equity = cash + mv
     init_cap = state.get("initial_capital") or 0
 
@@ -366,6 +402,17 @@ ACTION_HTML = """<!DOCTYPE html>
   .modal .hint{font-size:12px;color:#6f7889;margin-top:8px;line-height:1.6}
   .modal .cur{background:#0b0d12;border-radius:8px;padding:9px 11px;margin-bottom:10px;
               font-size:12px;color:#8a93a6;line-height:1.7}
+  /* 二选一的选项卡: 两种删除语义现金处理相反, 必须让用户显式选 */
+  .opt{background:#0b0d12;border:1px solid #262c38;border-radius:9px;
+       padding:10px 11px;margin-bottom:8px;cursor:pointer;transition:.15s}
+  .opt.on{border-color:#2563eb;background:#161c2b}
+  .opt .ot{font-size:14px;font-weight:600;color:#e8eaed}
+  .opt .od{font-size:12px;color:#8a93a6;line-height:1.6;margin-top:3px}
+  /* 持仓行上的删除入口 */
+  .del{flex:0 0 auto;width:28px;height:28px;border-radius:7px;background:#1e222b;
+       color:#8a93a6;font-size:13px;display:flex;align-items:center;
+       justify-content:center;cursor:pointer;margin-left:8px;transition:.15s}
+  .del:active{background:#4a1d1d;color:#fca5a5}
   .mbtns{display:flex;gap:8px;margin-top:14px}
   .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);
          background:#1e222b;border:1px solid #2a3040;color:#e8eaed;font-size:13px;
@@ -520,10 +567,13 @@ function holdRow(r){
   const cls = p == null ? '' : (p >= 0 ? 'pos' : 'neg');
   const sign = p == null ? '' : (p >= 0 ? '+' : '');
   return `<div class="hold-row">
-    <div><div class="nm">${r.name||r.code} <span style="color:#6f7889;font-size:12px">${r.code}</span></div>
-         <div class="meta">${r.shares} 股 · 已持 ${r.held_days==null?'--':r.held_days} 日</div></div>
+    <div style="flex:1;min-width:0">
+      <div class="nm">${esc(r.name||r.code)} <span style="color:#6f7889;font-size:12px">${r.code}</span></div>
+      <div class="meta">${r.shares} 股 · 已持 ${r.held_days==null?'--':r.held_days} 日</div></div>
     <div class="${cls}" style="text-align:right;font-weight:600">${sign}${p==null?'--':p+'%'}
          <div class="meta">${money(r.amount)}</div></div>
+    <div class="del" title="删除这笔持仓"
+         onclick="askDrop('${r.code}','${esc(r.name||'')}',${r.shares},${r.ref_price||0})">✕</div>
   </div>`;
 }
 
@@ -733,6 +783,76 @@ async function doCashFlow(){
     await api('/api/profile/cash-flow', {profile: PID, amount: v, note: '网页出入金'});
     closeModal();
     toast((v > 0 ? '已存入 ' : '已取出 ') + money(Math.abs(v)), 4000);
+    load();
+  } catch(err){
+    if (e) e.textContent = err.message; else toast(err.message, 6000);
+  }
+}
+
+// ── 删除持仓 ──
+// 两种情形现金处理完全相反, 所以让用户显式选, 不替他猜:
+//   已卖出   -> 钱回到账户了, 现金增加
+//   记错了   -> 本就没这笔, 现金不动
+let DROP = {};
+
+function askDrop(code, name, shares, refPx){
+  DROP = {code, name, shares, refPx};
+  $('#modal').innerHTML = `
+    <div class="mask" onclick="if(event.target===this)closeModal()">
+      <div class="modal">
+        <h3>删除持仓 · ${esc(name||code)}</h3>
+        <div class="cur">${esc(name||'')} ${code}<br>
+          ${shares} 股 · 最近参考价 ${refPx || '--'}</div>
+        <p>为什么要删？这决定<b>现金怎么算</b>，两种情况正好相反：</p>
+        <div class="opt" id="opt-sold" onclick="pickDrop('sold')">
+          <div class="ot">我已经卖了</div>
+          <div class="od">在券商 App 里手动卖掉了。钱回到账户，所以
+            <b style="color:#86efac">现金增加</b>，并记一笔卖出流水。</div>
+        </div>
+        <div class="opt" id="opt-phantom" onclick="pickDrop('phantom')">
+          <div class="ot">系统记错了</div>
+          <div class="od">我从没持有过这只。纯修账，
+            <b style="color:#fcd34d">现金不变</b>，总资产会相应下降。</div>
+        </div>
+        <div id="droppx" style="display:none;margin-top:10px">
+          <input type="number" id="dpx" step="0.001" min="0" inputmode="decimal"
+                 value="${refPx || ''}" placeholder="真实卖出价">
+          <div class="hint">填券商成交价。手续费按 万6、最低 5 元 估算。</div>
+        </div>
+        <div class="err" id="dperr"></div>
+        <div class="mbtns">
+          <div class="btn" onclick="closeModal()">取消</div>
+          <div class="btn btn-pri" id="dpok" aria-disabled="true"
+               onclick="doDrop()">确认删除</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function pickDrop(mode){
+  DROP.mode = mode;
+  $('#opt-sold').classList.toggle('on', mode === 'sold');
+  $('#opt-phantom').classList.toggle('on', mode === 'phantom');
+  $('#droppx').style.display = mode === 'sold' ? 'block' : 'none';
+  $('#dpok').setAttribute('aria-disabled', 'false');
+  if (mode === 'sold') setTimeout(() => { const i = $('#dpx'); if (i){ i.focus(); i.select(); } }, 50);
+}
+
+async function doDrop(){
+  const e = $('#dperr');
+  if (!DROP.mode){ if (e) e.textContent = '请先选一种情况'; return; }
+  const body = {profile: PID, code: DROP.code, mode: DROP.mode, note: '网页删除持仓'};
+  if (DROP.mode === 'sold'){
+    const px = parseFloat(($('#dpx') || {}).value);
+    if (!(px > 0)){ if (e) e.textContent = '请填真实卖出价'; return; }
+    body.price = px;
+  }
+  try {
+    await api('/api/profile/drop-lot', body);
+    closeModal();
+    toast(DROP.mode === 'sold'
+      ? `已按卖出记账，${DROP.name||DROP.code} 移出持仓`
+      : `已删除记错的持仓 ${DROP.name||DROP.code}（现金未变）`, 5000);
     load();
   } catch(err){
     if (e) e.textContent = err.message; else toast(err.message, 6000);
