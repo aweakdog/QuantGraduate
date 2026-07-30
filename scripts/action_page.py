@@ -275,6 +275,10 @@ def build_today(root: Path, pid=None):
             "amount": round(sh * px, 0) if px else None,
             "pnl_pct": r.get("pnl_pct"),
             "held_days": r.get("held_days"),
+            # 卖出预估到账金额(已扣手续费)。换仓日的买入靠这笔钱,
+            # 所以界面上要把这个链条显示出来
+            "est_proceeds": r.get("est_proceeds"),
+            "est_cost": r.get("est_cost"),
             "side": side,
         }
 
@@ -298,6 +302,12 @@ def build_today(root: Path, pid=None):
         "exec_when": EXEC_WHEN.get(cfg.get("exec_mode", "t1close"), "下一个交易日尾盘"),
         "is_rebal": is_rebal,
         "in_cash": in_cash,
+        # 换仓日的资金链: 现有现金 + 卖出所得 = 买入可用。
+        # A股卖出资金当天可用, 所以先卖后买在现实里成立; 但卖不掉(停牌/
+        # 跌停)或只成交一部分时, 钱就不够买全部, 所以这两个数字必须告知用户。
+        "cash_after_sell": (plan or {}).get("cash_after_sell"),
+        "est_sell_proceeds": round(sum((r.get("est_proceeds") or 0) for r in sell), 2),
+        "est_buy_cost": round(sum((r.get("est_cost") or 0) for r in buy), 2),
         "sell": [_fmt_row(r, "sell") for r in sell],
         "buy": [_fmt_row(r, "buy") for r in buy],
         "hold": [_fmt_row(r, "hold") for r in hold],
@@ -398,6 +408,13 @@ ACTION_HTML = """<!DOCTYPE html>
   .tipbox b{color:#c9cdd6}
   .tipbox.warn-tip{border:1px solid #7c5310}
   .tipbox.warn-tip b{color:#fcd34d}
+  /* 换仓日资金链: 买入靠卖出所得, 必须显示够不够 */
+  .money{background:#0b0d12;border-radius:9px;padding:10px 12px;margin-top:11px;
+         font-size:12px;color:#8a93a6;line-height:1.8}
+  .money b{color:#c9cdd6}
+  .money .mnote{color:#6f7889}
+  .money .mok{color:#86efac;font-weight:600}
+  .money .mbad{color:#fca5a5;font-weight:600}
 
   /* 弹窗 */
   .mask{position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;
@@ -579,13 +596,56 @@ function opRow(r, side, mode){
     </div>
     <div class="fillbox" id="fb_${id}" style="display:${on?'flex':'none'}">
       <span class="fl">实际</span>
-      <input type="number" id="fs_${id}" value="${r.shares}" step="100" min="0" inputmode="numeric">
+      <input type="number" id="fs_${id}" value="${r.shares}" step="100" min="0"
+             inputmode="numeric" oninput="refreshMoney()">
       <span class="unit">股</span>
       <input type="number" id="fp_${id}" value="${r.ref_price==null?'':r.ref_price}"
-             step="0.001" min="0" inputmode="decimal">
+             step="0.001" min="0" inputmode="decimal" oninput="refreshMoney()">
       <span class="unit">元</span>
     </div>
   </div>`;
+}
+
+// 换仓日的资金链: 买入靠的是卖出所得。
+// 只读模式按计划的预估值显示; 实盘确认模式按"打勾的行 + 你填的数字"实时算,
+// 这样卖不掉或只成交一部分时, 立刻能看出钱够不够买。
+let LASTD = null;
+
+function moneyChain(d){
+  const cash = (d.account || {}).cash || 0;
+  if (!d.can_confirm){
+    const got = d.est_sell_proceeds || 0, need = d.est_buy_cost || 0;
+    const avail = cash + got;
+    return `按计划预估：现金 <b>${money(cash)}</b> + 卖出所得 <b>${money(got)}</b>
+      = 可用 <b>${money(avail)}</b>，买入需要 <b>${money(need)}</b>。<br>
+      <span class="mnote">卖出资金当天可用，所以先卖后买没问题。
+      但若有股票<b>停牌或跌停卖不掉</b>，钱就不够买全部 —— 那时少买一只即可，
+      系统会按实际成交记账。</span>`;
+  }
+  // 实盘确认: 只算打勾的
+  const done = getDone();
+  let got = 0, need = 0, nS = 0, nB = 0;
+  for (const r of (LASTD ? [].concat(LASTD.sell, LASTD.buy) : [])){
+    const id = r.side + '_' + r.code;
+    if (!done.includes(id)) continue;
+    const sh = parseFloat(($('#fs_' + id) || {}).value) || 0;
+    const px = parseFloat(($('#fp_' + id) || {}).value) || 0;
+    const amt = sh * px;
+    if (r.side === 'sell'){ got += amt; nS++; } else { need += amt; nB++; }
+  }
+  const avail = cash + got;
+  const short = need - avail;
+  return `已打勾：卖出 ${nS} 笔得 <b>${money(got)}</b>，买入 ${nB} 笔需 <b>${money(need)}</b><br>
+    现金 <b>${money(cash)}</b> + 卖出所得 = 可用 <b>${money(avail)}</b>
+    ${short > 0.5
+      ? `<br><span class="mbad">还差 ${money(short)} —— 买入报多了或卖出漏勾了，
+         提交会被拒绝</span>`
+      : `<br><span class="mok">资金够，可以提交</span>`}`;
+}
+
+function refreshMoney(){
+  const box = $('#moneybox');
+  if (box && LASTD) box.innerHTML = moneyChain(LASTD);
 }
 
 // 打勾 = 这笔真的成交了, 会记入系统; 不打勾 = 没成交, 不动账
@@ -596,6 +656,7 @@ function tickRow(id){
   const row = $('#row_' + id), fb = $('#fb_' + id);
   if (row) row.classList.toggle('done', i < 0);
   if (fb) fb.style.display = i < 0 ? 'flex' : 'none';
+  refreshMoney();
 }
 
 function holdRow(r){
@@ -1044,6 +1105,7 @@ async function loadAct(){
   catch(e){ $('#app').innerHTML = '<div class="warn">无法连接服务器</div>'; return; }
 
   PID = d.profile; PROFS = d.profiles || PROFS; renderProfs(PID);
+  LASTD = d;                     // 资金链重算要用到当前计划与账户
   DAY = d.signal_date || 'na';
   $('#sigdate').textContent = d.signal_date ? ('信号日 ' + d.signal_date) : '';
   $('#gen').textContent = d.plan_generated_at ? ('计划生成于 ' + d.plan_generated_at.replace('T',' ')) : '';
@@ -1100,6 +1162,12 @@ async function loadAct(){
 
     h += d.sell.map(r => opRow(r,'sell',mode)).join('');
     h += d.buy.map(r => opRow(r,'buy',mode)).join('');
+
+    // 换仓日的买入是靠卖出所得来的, 把这个资金链摆明。
+    // A股卖出资金当天可用, 所以现实里成立; 但卖不掉或只成交一部分时钱就不够。
+    if (d.sell.length && d.buy.length){
+      h += `<div class="money" id="moneybox">${moneyChain(d)}</div>`;
+    }
 
     if (mode === 'confirm'){
       h += `<div class="mbtns">

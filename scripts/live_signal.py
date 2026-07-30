@@ -507,6 +507,12 @@ def settle(st, pending, exec_date, kl, names, cal):
         manual = json.loads(Path(args.confirm).read_text(encoding="utf-8"))
 
     if manual is not None:
+        # 强制先卖后买, 不管上报顺序如何。
+        # 换仓日通常是"卖掉到期的, 用卖出所得买新的" —— A股卖出资金当天可用,
+        # 所以这在现实里成立。但若先扣买入款, 中途现金会假性为负;
+        # 更要紧的是下面那道现金检查会误判。排序后语义与实际执行顺序一致。
+        manual = sorted(manual, key=lambda f: 0 if f.get("action") == "sell" else 1)
+        cash_before_manual = float(st["cash"])
         for f in manual:
             code = str(f["code"])[:6]
             px, sh = float(f["price"]), int(f["shares"])
@@ -548,6 +554,21 @@ def settle(st, pending, exec_date, kl, names, cal):
                 fills.append({"code": code, "action": "buy", "shares": sh, "price": px,
                               "fee": round(fee, 2), "net": round(-(gross + fee), 2),
                               "source": "manual"})
+
+        # 现金变负说明上报的成交自相矛盾 —— 真实账户不可能用没有的钱买入。
+        # 最常见的原因是"买入勾了、卖出忘了勾": 那笔卖出的钱没进账,
+        # 却把买入的钱扣了。此时必须拦住, 否则账目从此带着一个负现金往下走。
+        if st["cash"] < -0.01:
+            buys = sum(-f["net"] for f in fills if f["action"] == "buy")
+            sells = sum(f["net"] for f in fills if f["action"] == "sell")
+            raise SystemExit(
+                f"ERROR: 按上报的成交算下来现金会变成 ¥{st['cash']:,.2f} (负数), 已拒绝。\n"
+                f"  原有现金 ¥{cash_before_manual:,.2f} + 卖出所得 ¥{sells:,.2f} "
+                f"- 买入支出 ¥{buys:,.2f}\n"
+                "  常见原因: 买入报了、卖出漏报了。换仓日是靠卖出所得来买的,\n"
+                "  所以卖出那几笔也要一起确认。\n"
+                "  若确认买卖都没漏报, 说明系统记的现金本身偏低, 请先用「校准现金」\n"
+                "  改成券商App里的真实数字, 再来确认成交。")
         return fills
 
     # ── 1. 卖出 ──
