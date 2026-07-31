@@ -565,6 +565,11 @@ async def api_status():
     equity = cash + mv
     init_cap = st.get("initial_capital", cash)
     return {
+        # /pro 只看默认那一条线, 把它回给前端明写在页上 ——
+        # 否则容易把这一条的数字当成四条线的全部。
+        "profile": DEFAULT_PROFILE,
+        "profile_name": display_name(DEFAULT_PROFILE),
+        "hold_days": (st.get("config") or {}).get("hold_days"),
         "ref_date": str(ref_date.date()) if ref_date else None,
         "cash": round(cash, 2), "market_value": round(mv, 2),
         "equity": round(equity, 2),
@@ -590,7 +595,11 @@ async def api_plan():
 
 
 @app.post("/api/signal")
-async def api_signal():
+async def api_signal(req: Request):
+    # 跑信号会写 state (结算挂单、生成新计划), 属于改账 —— 与首页那批
+    # /api/profile/* 一样得过 ops 口令。之前这里没校验, 等于"能看就能改"。
+    if not _ops_ok(req):
+        return _ops_deny()
     if _running["active"]:
         return JSONResponse({"error": "信号生成正在运行中, 请等待"}, status_code=409)
     _running.update(active=True, log="", started_at=datetime.now().isoformat(),
@@ -622,8 +631,14 @@ async def api_signal_status():
     }
 
 
+# 人工对账: 网页入口已下掉 —— 它一把覆盖整个账户状态, 而首页的
+# 确认成交/现金校准/删持仓/重置 四个操作语义各自明确且都有备份与
+# history 记录, 已完全取代它。接口保留作为应急通道(一次性批量改写),
+# 但必须要 ops 口令 —— 它是所有接口里破坏力最大的一个。
 @app.post("/api/sync-template")
-async def api_sync_template():
+async def api_sync_template(req: Request):
+    if not _ops_ok(req):
+        return _ops_deny()
     r = subprocess.run(
         [PY, SIGNAL_SCRIPT] + SIGNAL_ARGS + ["--sync-template"],
         capture_output=True, text=True, cwd=str(ROOT), timeout=30,
@@ -636,6 +651,8 @@ async def api_sync_template():
 
 @app.post("/api/sync")
 async def api_sync(req: Request):
+    if not _ops_ok(req):
+        return _ops_deny()
     body = await req.json()
     tmp = LIVE_DIR / "sync_input.json"
     tmp.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1405,12 +1422,6 @@ HTML_PAGE = """<!DOCTYPE html>
   .modal label { display: block; font-size: 13px; color: #888; margin-top: 12px; margin-bottom: 4px; }
   .modal input { width: 100%; padding: 8px 12px; border: 1px solid #333; border-radius: 6px;
                  background: #0f1117; color: #fff; font-size: 14px; }
-  .modal .pos-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
-  .modal .pos-row input { flex: 1; }
-  .modal .btn-remove { background: #f44336; border: none; color: #fff; border-radius: 6px;
-                       padding: 6px 10px; cursor: pointer; font-size: 12px; }
-  #sync-note { width: 100%; padding: 8px 12px; border: 1px solid #333; border-radius: 6px;
-               background: #0f1117; color: #fff; font-size: 14px; margin-top: 8px; }
 
   /* ── 手机端 ── */
   @media (max-width: 640px) {
@@ -1424,15 +1435,22 @@ HTML_PAGE = """<!DOCTYPE html>
     th, td { padding: 7px 9px; }
     .btn { width: 100%; margin-right: 0; padding: 12px 16px; font-size: 15px; }
     .modal { padding: 16px; }
-    .modal .pos-row { flex-wrap: wrap; }
-    .modal .pos-row input { flex: 1 1 30%; min-width: 88px; font-size: 13px; }
     #log { font-size: 11px; max-height: 220px; }
   }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>📊 实盘信号仪表盘</h1>
+  <h1>📊 运维面板</h1>
+  <!-- 这个页只读默认那一条线的状态文件, 必须说清楚: 否则容易
+       把这一条的数字当成四条线的全部。 -->
+  <div style="background:#1f2430;border-left:3px solid #2962ff;border-radius:8px;
+              padding:11px 13px;margin-bottom:16px;font-size:13px;line-height:1.8;color:#9aa3b4">
+    本页只显示 <b id="which-profile" style="color:#dbe3f4">默认条线</b> 一条，
+    专供看流水线状态与访问日志。<br>
+    四条线的持仓、操作清单与所有改账功能在
+    <a href="/" style="color:#82b1ff">首页</a>。
+  </div>
 
   <div class="card">
     <div class="card-title">账户概览</div>
@@ -1477,10 +1495,13 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="card">
     <div class="card-title">操作</div>
     <button class="btn btn-primary" id="btn-signal" onclick="runSignal()">🔄 生成今日信号</button>
-    <button class="btn btn-warn" id="btn-sync-tpl" onclick="openSyncModal()">🔄 人工对账</button>
     <button class="btn" style="background:#37415a;color:#dbe3f4"
             onclick="toggleAccess()">👁 访问日志</button>
     <button class="btn btn-danger" onclick="refresh()">刷新</button>
+    <div style="font-size:12px;color:#666;margin-top:6px;line-height:1.8">
+      改账操作(确认成交 / 现金校准 / 存取现金 / 删持仓 / 重置)在
+      <a href="/" style="color:#82b1ff">首页</a>，那里四条线都能操作且语义更明确。
+    </div>
     <div id="log"></div>
   </div>
 
@@ -1490,31 +1511,79 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- 对账弹窗 -->
-<div class="modal-overlay" id="sync-modal">
-  <div class="modal">
-    <h2>人工对账 (以券商App为准)</h2>
-    <label>可用现金 (元)</label>
-    <input type="number" id="sync-cash" step="0.01">
-    <label>持仓列表</label>
-    <div id="sync-positions"></div>
-    <button class="btn btn-primary" style="margin-top:8px" onclick="addSyncRow()">+ 添加持仓</button>
-    <label>备注</label>
-    <input type="text" id="sync-note" placeholder="可选">
-    <div style="margin-top:16px">
-      <button class="btn btn-primary" onclick="submitSync()">确认对账</button>
-      <button class="btn" style="background:#333;color:#ccc" onclick="closeSyncModal()">取消</button>
+<!-- 改账口令弹窗 -->
+<div class="modal-overlay" id="ops-modal">
+  <div class="modal" style="max-width:340px">
+    <h2>需要改账口令</h2>
+    <div style="font-size:13px;color:#888;line-height:1.7">
+      生成信号会结算挂单并改写账目，所以要口令。一次输入 12 小时内有效。
+    </div>
+    <label>口令</label>
+    <input type="password" id="ops-pw" onkeydown="if(event.key==='Enter')opsSubmit()">
+    <div id="ops-err" style="color:#f44336;font-size:12px;margin-top:8px;min-height:16px"></div>
+    <div style="margin-top:14px">
+      <button class="btn btn-primary" onclick="opsSubmit()">确定</button>
+      <button class="btn" style="background:#333;color:#ccc" onclick="opsCancel()">取消</button>
     </div>
   </div>
 </div>
 
 <script>
 const API = '';
-let syncData = null;
 
 async function fetchJSON(url, opts) {
   const r = await fetch(url, opts);
   return r.json();
+}
+
+// ── 改账口令 ──
+// 这个页上的写操作(生成信号)之前没校验口令, 等于"能看就能改"。
+// 现在与首页一致: 401 弹口令框, 输对后自动重试原操作。
+let _opsResolve = null, _opsReject = null;
+
+function askOps(){
+  return new Promise((res, rej) => {
+    _opsResolve = res; _opsReject = rej;
+    document.getElementById('ops-err').textContent = '';
+    document.getElementById('ops-pw').value = '';
+    document.getElementById('ops-modal').style.display = 'flex';
+    setTimeout(() => document.getElementById('ops-pw').focus(), 50);
+  });
+}
+
+function opsCancel(){
+  document.getElementById('ops-modal').style.display = 'none';
+  if (_opsReject) _opsReject(new Error('已取消'));
+  _opsResolve = _opsReject = null;
+}
+
+async function opsSubmit(){
+  const pw = document.getElementById('ops-pw').value || '';
+  const r = await fetch('/api/ops/login', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pw})});
+  if (r.ok){
+    document.getElementById('ops-modal').style.display = 'none';
+    if (_opsResolve) _opsResolve();
+    _opsResolve = _opsReject = null;
+    return;
+  }
+  const d = await r.json().catch(()=>({}));
+  document.getElementById('ops-err').textContent = d.error || '口令错误';
+  document.getElementById('ops-pw').value = '';
+  document.getElementById('ops-pw').focus();
+}
+
+// 需要改账权限的请求都走这里
+async function opsFetch(url, opts){
+  let r = await fetch(url, opts);
+  if (r.status === 401){
+    const d = await r.json().catch(()=>({}));
+    if (d.need_password){
+      await askOps();                    // 取消会 reject, 直接冒泡出去
+      r = await fetch(url, opts);
+    }
+  }
+  return r;
 }
 
 async function refresh() {
@@ -1527,6 +1596,10 @@ async function refresh() {
     const retEl = document.getElementById('ret');
     retEl.textContent = (ret>=0?'+':'') + ret + '%';
     retEl.className = 'value ' + (ret>=0?'red':'green');   // A股: 红涨绿跌
+    // 把条线名字填进页顶提示, 避免把这一条的数字当成四条线的全部
+    if (s.profile_name)
+      document.getElementById('which-profile').textContent =
+        s.profile_name + ' (' + s.profile + ')';
     let meta = '估值基准日: ' + (s.ref_date||'--');
     if (s.last_signal_date) meta += ' | 上次信号: ' + s.last_signal_date;
     if (s.last_synced_at) meta += ' | 上次对账: ' + s.last_synced_at;
@@ -1545,7 +1618,7 @@ async function refresh() {
           <td>${p.buy_price}</td><td>${p.last_close}</td>
           <td>¥${p.market_value.toLocaleString()}</td>
           <td class="${cls}">${p.pnl_pct>=0?'+':''}${p.pnl_pct}%</td>
-          <td>${p.held_days!=null?p.held_days+'日':'--'}</td></tr>`;
+          <td>${daysCell(p, s.hold_days)}</td></tr>`;
       }
     }
 
@@ -1644,19 +1717,40 @@ function renderPlan(p) {
   if (!tbody.innerHTML) tbody.innerHTML = '<tr><td colspan="8" class="empty">无操作</td></tr>';
 }
 
+// 持有天数单元格。与首页同口径: 两个数字回答不同问题, 所以都要给。
+//   tenure_days -> 这笔一共拿了多久 (真实时长, 只增不减)
+//   held_days   -> 什么时候会动它 (到期时钟, 续持归零)
+// 之前这里只显示时钟, 于是续持过的仓看起来像刚买的(显示 0 日)。
+function daysCell(p, holdDays){
+  const t = p.tenure_days, c = p.held_days;
+  if (t == null && c == null) return '--';
+  const shown = (t != null ? t : c);
+  let s = shown + '日';
+  if (p.n_rolled) s += ` <span class="badge badge-blue">续持${p.n_rolled}次</span>`;
+  if (holdDays != null && c != null){
+    const left = holdDays - c;
+    s += left <= 0 ? ' <span class="badge badge-red">已到期</span>'
+                   : ` <span style="color:#666;font-size:12px">还剩${left}日</span>`;
+  }
+  return s;
+}
+
 async function runSignal() {
   const btn = document.getElementById('btn-signal');
-  btn.disabled = true;
   const logDiv = document.getElementById('log');
   logDiv.style.display = 'block';
   logDiv.textContent = '信号生成中...';
+  btn.disabled = true;
   try {
-    const r = await fetch('/api/signal', {method: 'POST'});
-    const d = await r.json();
-    if (d.error) { logDiv.textContent = d.error; btn.disabled = false; return; }
+    const r = await opsFetch('/api/signal', {method: 'POST'});
+    const d = await r.json().catch(()=>({}));
+    if (!r.ok || d.error) {
+      logDiv.textContent = d.error || ('失败 HTTP ' + r.status);
+      btn.disabled = false; return;
+    }
     pollSignal();
   } catch(e) {
-    logDiv.textContent = '请求失败: ' + e;
+    logDiv.textContent = e.message === '已取消' ? '已取消' : ('请求失败: ' + e);
     btn.disabled = false;
   }
 }
@@ -1676,83 +1770,8 @@ async function pollSignal() {
   }
 }
 
-async function openSyncModal() {
-  document.getElementById('sync-modal').style.display = 'flex';
-  try {
-    const r = await fetch('/api/sync-template', {method: 'POST'});
-    syncData = await r.json();
-    document.getElementById('sync-cash').value = syncData.cash || 0;
-    const container = document.getElementById('sync-positions');
-    container.innerHTML = '';
-    for (const p of (syncData.positions||[])) {
-      addSyncRow(p);
-    }
-  } catch(e) {
-    addSyncRow();
-  }
-}
-
-function addSyncRow(data) {
-  const container = document.getElementById('sync-positions');
-  const div = document.createElement('div');
-  div.className = 'pos-row';
-  div.innerHTML = `<input type="text" placeholder="代码" value="${(data&&data.code)||''}" class="sync-code">
-    <input type="text" placeholder="名称" value="${(data&&data.name)||''}" class="sync-name">
-    <input type="number" placeholder="股数" value="${(data&&data.shares)||''}" class="sync-shares">
-    <input type="number" step="0.001" placeholder="成本价" value="${(data&&data.buy_price)||''}" class="sync-price">
-    <input type="date" placeholder="买入日" value="${(data&&data.buy_date)||''}" class="sync-date">
-    <button class="btn-remove" onclick="this.parentElement.remove()">删除</button>`;
-  container.appendChild(div);
-}
-
-function closeSyncModal() {
-  document.getElementById('sync-modal').style.display = 'none';
-}
-
-async function submitSync() {
-  // 不能把空输入静默当成 0: 那会把账户现金抹平
-  const cashRaw = document.getElementById('sync-cash').value.trim();
-  const cash = parseFloat(cashRaw);
-  if (cashRaw === '' || !isFinite(cash) || cash < 0) {
-    alert('请填写有效的可用资金 (不能留空或为负)。\n只是想看看的话直接点「取消」即可。');
-    return;   // 保持弹窗打开, 不提交
-  }
-  const rows = document.querySelectorAll('#sync-positions .pos-row');
-  const positions = [];
-  rows.forEach(r => {
-    const code = r.querySelector('.sync-code').value.trim();
-    if (!code) return;
-    positions.push({
-      code: code,
-      name: r.querySelector('.sync-name').value.trim(),
-      shares: parseInt(r.querySelector('.sync-shares').value) || 0,
-      buy_price: parseFloat(r.querySelector('.sync-price').value) || 0,
-      buy_date: r.querySelector('.sync-date').value || '',
-    });
-  });
-  if (cash === 0 && positions.length === 0 &&
-      !confirm('这会把账户清空 (0 现金 + 0 持仓)。确定吗?')) {
-    return;
-  }
-  const note = document.getElementById('sync-note').value;
-  const body = {cash, positions, note};
-  if (cash === 0 && positions.length === 0) body.confirm_empty = true;
-  closeSyncModal();
-  const logDiv = document.getElementById('log');
-  logDiv.style.display = 'block';
-  logDiv.textContent = '对账中...';
-  try {
-    const r = await fetch('/api/sync', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
-    const d = await r.json();
-    logDiv.textContent = d.message || d.error || JSON.stringify(d, null, 2);
-    refresh();
-  } catch(e) {
-    logDiv.textContent = '对账失败: ' + e;
-  }
-}
+// 此处原有约 60 行对账表单代码, 已随入口一并下掉。缘由见 web_server.py 里
+// api_sync 上方的注释。
 
 // ── 访问日志 ──
 // 用改账口令保护: 日志里有 IP 和归属地, 比持仓更该少露。
