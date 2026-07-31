@@ -3,6 +3,29 @@
 > 多因子选股 + 供应链事件驱动 + XGBoost ML 评分  
 > 覆盖 A 股全市场，因子维度 301+，每日自动打分排名
 
+## 实盘系统（当前在跑的东西）
+
+本 README 以下部分描述的是研究用的因子/策略体系（`pipeline/`、`strategies/`）。
+**每天真正在服务器上自动运行、并有真人跟单的是另一套** —— LightGBM 走进式
+选股（`scripts/wf_v35_breadth_alpha.py` 回测 + `scripts/live_signal.py` 实盘），
+六条并行线跑在 `eez041.ece.ust.hk:8080` 的看板上。
+
+| 文档 | 内容 |
+|---|---|
+| **[docs/实盘运行手册.md](docs/实盘运行手册.md)** | **日常运维入口**：六条线是什么、每天自动干什么、三种改账操作的区别、关键不变量、出问题怎么查 |
+| [docs/credentials.md](docs/credentials.md) | 账号密码与环境变量 |
+| [docs/v35_findings.md](docs/v35_findings.md) | v35 回测结论、被证伪的假设 |
+| [docs/findings_2026-07-29_capital_constraint.md](docs/findings_2026-07-29_capital_constraint.md) | **方法论最重要的一篇**：为什么不能用总收益评价策略（t≈1，没有统计功效）；本金而非模型是瓶颈 |
+| [docs/findings_2026-07-31_roll_and_capital.md](docs/findings_2026-07-31_roll_and_capital.md) | 续持验证；2万本金结果不可用于决策；一处旧判断的更正 |
+| [docs/plan_2026-07-29_factor_research.md](docs/plan_2026-07-29_factor_research.md) | 因子研究计划 |
+
+两条最容易踩的坑：
+
+- **评价策略要看 IC 及其 t 值，不要看总收益。** 只持 3~5 只时总收益的 t 值仅约 1，
+  统计上无法与 0 区分，也无法互相区分。
+- **单一本金档位上的最优配置可能是运气。** 跨本金交叉验证过才算数
+  （见 `findings_2026-07-31` §2 的反例）。
+
 ## 目录结构
 
 ```
