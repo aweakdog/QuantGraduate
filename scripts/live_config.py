@@ -125,6 +125,9 @@ def state_file(pid):
 # 就会和收盘后的定时任务撞车、造成账目错位。所以单独一个小文件。
 SETTINGS_PATH = Path(__file__).resolve().parents[1] / "data" / "live" / "profile_settings.json"
 
+# 四条线共用的预测缓存 (见 signal_args)。删掉它只会导致下次重训一遍, 无副作用。
+PREDS_CACHE_PATH = Path(__file__).resolve().parents[1] / "data" / "live" / "preds_cache.json"
+
 # auto=True  : 按 T+1 真实行情自动记账 (纸面跟踪, 默认)
 # auto=False : 实盘模式 —— 不自动记账, 等你填真实成交价才入账。
 #              这条线会停在"待确认成交"状态, 不会自动往前推进。
@@ -208,6 +211,11 @@ def signal_args(pid, include_features=True):
     # 此参数不在 FINGERPRINT_KEYS 里, 所以来回切换不会弄坏已有持仓。
     if not is_auto(pid):
         out += ["--require-confirm"]
+    # 四条线的模型完全一样(只有建仓环节按 tranche-n 不同), 各训一遍是 4 倍
+    # CPU 白烧。共用一个预测缓存: 当天第一条线训练并写入, 其余直接读。
+    # 缓存键含信号日与全部训练输入, 任一项变化都会自动重训, 不会读到过期预测。
+    # 同样不在 FINGERPRINT_KEYS 里, 加它不影响已有持仓。
+    out += ["--preds-cache", str(PREDS_CACHE_PATH)]
     if include_features and FEATURES_FROM:
         out += ["--features-from", FEATURES_FROM]
     return out

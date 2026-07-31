@@ -56,6 +56,9 @@ parser.add_argument("--portfolio-mode", type=str, default="staggered",
                     choices=["staggered", "periodic"],
                     help="staggered=每日开一档共HOLD_DAYS档(适合大资金); "
                          "periodic=每HOLD_DAYS天整体换仓, 仅持TRANCHE_N只(适合小资金)")
+parser.add_argument("--no-roll", action="store_true",
+                    help="关掉续持: 到期一律卖掉再买回, 即使它仍在目标名单里。"
+                         "默认开启续持(省一次往返成本)。此开关仅用于 A/B 对照")
 parser.add_argument("--exec-mode", type=str, default="close",
                     choices=["close", "t1open", "t1close"],
                     help="close=T日收盘信号T日收盘成交(未来函数, 不可实盘); "
@@ -129,6 +132,7 @@ INIT_CAPITAL = args.initial_capital
 TEST_START, TEST_END = args.test_start, args.test_end
 HOLD_DAYS, TRANCHE_N = args.hold_days, args.tranche_n
 PERIODIC = args.portfolio_mode == "periodic"
+NO_ROLL = args.no_roll
 TARGET_POSITIONS = TRANCHE_N if PERIODIC else HOLD_DAYS * TRANCHE_N
 MIN_TRAIN_DAYS = 250
 
@@ -784,6 +788,8 @@ rej = {"buy_halt": 0, "buy_limit_up": 0, "buy_lot_too_big": 0,
        "buy_no_cash": 0, "sell_halt": 0, "sell_limit_down": 0}
 ic_hist, in_cash, ic_cash = [], False, False
 n_cash_days = 0
+# 续持次数: 到期但仍在目标名单里, 省下一次往返成本
+n_rolled = 0
 
 for i, (dp, exec_date) in enumerate(sched):
     d, dstr = exec_date, str(pd.Timestamp(exec_date).date())
@@ -808,13 +814,42 @@ for i, (dp, exec_date) in enumerate(sched):
         v = float(mkt_position.loc[dp["date"]])
         pos_size = 1.0 if np.isnan(v) else v
 
+    # is_rebal 要在卖出之前就知道 —— 因为“该不该续持”取决于本次是否换仓
+    is_rebal = (not PERIODIC) or (i % HOLD_DAYS == 0) or (was_in_cash and not in_cash)
+
+    # 换仓日的目标组合: ranked 里前 TRANCHE_N 个未被持禁的。
+    # 已持仓且仍在目标里的, 到期也不卖 —— 卖了再买回要付一次往返
+    # (佣金+滑点)*2, 白付这笔钱却回到同样的持仓。
+    # 空仓信号(in_cash)时不适用: 那是要清光。
+    # 分档轮动模式(非 PERIODIC)不适用: 各档到期时点不同, 续持会模糊档位。
+    roll_set = set()
+    if NO_ROLL:
+        pass                  # --no-roll: 退回旧行为(到期一律卖掉再买回), 仅供 A/B
+    elif PERIODIC and is_rebal and not in_cash:
+        _blocked = dp.get("blocked") or set()
+        for code in dp["ranked"]:
+            if len(roll_set) >= TRANCHE_N:
+                break
+            if code in _blocked:
+                continue
+            roll_set.add(code)
+
     # ── 1. 卖出到期批次 (持满 HOLD_DAYS) ──
     sell_fee = 0.0
     keep = []
+    rolled_lots = []          # 本轮续持的, 稍后要把权重配平回等权
     for lot in lots:
         matured = (i - lot["open_idx"]) >= HOLD_DAYS
         if not (matured or in_cash):
             keep.append(lot)
+            continue
+        if matured and not in_cash and lot["code"] in roll_set:
+            # 续持: 重置到期时钟, 成本价不动(没发生交易)
+            lot["open_idx"] = i
+            lot["rolled"] = lot.get("rolled", 0) + 1
+            keep.append(lot)
+            rolled_lots.append(lot)
+            n_rolled += 1
             continue
         px = get_px(klines, lot["code"], d, EXEC_FIELD)
         _, limit_down = _limit_state(klines, lot["code"], d, EXEC_FIELD)
@@ -835,18 +870,71 @@ for i, (dp, exec_date) in enumerate(sched):
     lots = keep
 
     # ── 2. 开新批次: 用 1/HOLD_DAYS 的权益买 TRANCHE_N 只 ──
+    # (is_rebal 已在上面算过; 空仓转回场当天允许立即建仓)
     buy_fee = 0.0
-    # 空仓转回场当天允许立即建仓, 不必等下一个换仓周期
-    is_rebal = (not PERIODIC) or (i % HOLD_DAYS == 0) or (was_in_cash and not in_cash)
     if not in_cash and is_rebal:
         equity = cash + sum(l["shares"] * (get_px(klines, l["code"], d, EXEC_FIELD) or l["buy_price"])
                             for l in lots)
+
+        # 续持仓配平: 续持省下了往返成本, 但如果就这么放着, 它的权重会随
+        # 涨跌漂移, 等权再平衡(高抛低吸)这个收益来源就没了。所以只交易
+        # 差额把它拉回目标市值: 既保住等权纪律, 又避开整笔进出。
+        # 不设容忍带 —— 100股的整手粒度已经天然把琐碎调整挡掉了,
+        # 再加阀值就多一个可拟合的参数。
+        target_val = equity * pos_size / TRANCHE_N
+        for lot in rolled_lots:
+            rpx = get_px(klines, lot["code"], d, EXEC_FIELD)
+            if rpx is None:
+                continue
+            limit_up_r, limit_down_r = _limit_state(klines, lot["code"], d, EXEC_FIELD)
+            delta_val = target_val - lot["shares"] * rpx
+            if delta_val < 0:                       # 超配 -> 减仓
+                if limit_down_r:
+                    continue                        # 跌停卖不掉
+                spx = fill_px(rpx, "sell")
+                sh = int(-delta_val / (spx * 100)) * 100
+                sh = min(sh, lot["shares"] - 100)   # 至少留一手, 否则就不是续持了
+                if sh <= 0:
+                    continue
+                gross = sh * spx
+                fee = max(gross * TRADE_COST, MIN_FEE)
+                cash += gross - fee
+                sell_fee += fee
+                lot["shares"] -= sh
+                trade_log.append({"date": dstr, "signal_date": sig_str, "code": lot["code"],
+                                  "action": "sell", "shares": sh, "price": spx,
+                                  "gross": gross, "fee": fee, "net": gross - fee,
+                                  "reason": "roll_trim"})
+            elif delta_val > 0:                     # 欠配 -> 加仓
+                if limit_up_r:
+                    continue                        # 涨停买不进
+                bpx = fill_px(rpx, "buy")
+                sh = int(delta_val / (bpx * 100)) * 100
+                if sh <= 0:
+                    continue
+                gross = sh * bpx
+                fee = max(gross * TRADE_COST, MIN_FEE)
+                if gross + fee > cash:
+                    continue
+                cash -= gross + fee
+                buy_fee += fee
+                # 加仓后成本价按股数加权平均, 否则盈亏会算错
+                tot = lot["shares"] + sh
+                lot["buy_price"] = (lot["buy_price"] * lot["shares"] + bpx * sh) / tot
+                lot["shares"] = tot
+                trade_log.append({"date": dstr, "signal_date": sig_str, "code": lot["code"],
+                                  "action": "buy", "shares": sh, "price": bpx,
+                                  "gross": gross, "fee": fee, "net": -(gross + fee),
+                                  "reason": "roll_topup"})
+
         denom = 1 if PERIODIC else HOLD_DAYS
         tranche_budget = min(equity * pos_size / denom, cash)
         remaining = tranche_budget
         held = {l["code"] for l in lots}
         blocked = dp.get("blocked") or set()
-        bought = 0
+        # 从已持仓数起算, 否则续持的那几只不计数, 总持仓会超过 TRANCHE_N。
+        # (旧逻辑下卖单被拒(停牌/跌停)时也有同样的超配问题)
+        bought = len(lots)
         for code in dp["ranked"]:
             if bought >= TRANCHE_N:
                 break
@@ -966,6 +1054,7 @@ print(f"    买入被拒   : 停牌 {rej['buy_halt']} | 涨停 {rej['buy_limit_u
 print(f"    卖出被拒   : 停牌 {rej['sell_halt']} | 跌停 {rej['sell_limit_down']}")
 print(f"  空仓天数         : {n_cash_days} ({100*n_cash_days/n if n else 0:.1f}%)")
 print(f"  交易笔数         : {len(trade_log)}")
+print(f"  续持次数         : {n_rolled} (到期但仍在目标里, 省下往返成本)")
 print(f"  ─────────────── 收益 ───────────────")
 print(f"  期末净值         : ¥{final_value:,.0f} (起始 ¥{INIT_CAPITAL:,.0f})")
 print(f"  总收益           : {total_ret:+.1f}%   年化 {ann*100:+.1f}%")
@@ -1043,6 +1132,7 @@ json.dump({
         "rejected_buy": rejected_buy, "rejected_sell": rejected_sell,
         "reject_breakdown": rej,
         "n_trades": len(trade_log),
+        "n_rolled": n_rolled,
         "cash_days": n_cash_days,
         "cash_days_pct": round(100 * n_cash_days / n, 1) if n else 0.0,
         "beat_benchmark": bool(excess.mean() > 0),

@@ -150,8 +150,10 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="即使K线日期没前进也强制重建")
     ap.add_argument("--procs", type=int, default=10, help="K线并发进程数")
-    ap.add_argument("--feat-procs", type=int, default=24,
-                    help="特征构建并行进程数 (pandas 有 GIL 瓶颈, 必须用进程不能用线程)")
+    ap.add_argument("--feat-procs", type=int, default=8,
+                    help="特征构建并行进程数 (pandas 有 GIL 瓶颈, 必须用进程不能用线程)。"
+                         "默认从 24 降为 8: 这是共用服务器, 而整条管线的长杆是网络"
+                         "(K线下载 ≈25分钟), 特征构建快上几十秒对完成时间几乎无影响")
     ap.add_argument("--dry-run", action="store_true", help="只检查不落盘")
     a = ap.parse_args()
 

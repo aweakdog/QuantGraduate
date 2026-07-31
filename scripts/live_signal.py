@@ -42,6 +42,7 @@
   python scripts/live_signal.py --sync my_sync.json      # 改好数字后回填
 """
 import argparse
+import hashlib
 import json
 import sys
 import warnings
@@ -115,6 +116,10 @@ ap.add_argument("--allow-stale", action="store_true", help="训练集比K线旧�
 ap.add_argument("--as-of", default=None,
                 help="假装数据只到该日期 (回放/补跑/自测用), 不使用之后的任何数据")
 ap.add_argument("--alternates", type=int, default=8, help="额外输出几只候补股")
+ap.add_argument("--preds-cache", default=None,
+                help="预测结果缓存路径。四条线的模型完全相同(特征/标签/训练集/超参都不"
+                     "依赖 tranche_n 与本金), 各训一遍是 4 倍浪费。指定同一个缓存文件, "
+                     "则当天第一条线训练并写入, 其余直接读取。输入指纹不符会自动重训")
 ap.add_argument("--status", action="store_true",
                 help="只打印当前持仓/现金/待执行计划, 不跑模型 (秒级)")
 ap.add_argument("--sync", default=None,
@@ -571,12 +576,41 @@ def settle(st, pending, exec_date, kl, names, cal):
                 "  改成券商App里的真实数字, 再来确认成交。")
         return fills
 
+    # ── 0. 目标组合 ──
+    # 到期但仍在目标名单里的就续持, 不卖了再买回 —— 一次往返要付
+    # (佣金+滑点)*2, 白付这笔钱却回到同样的持仓。与回测 roll_set 一致。
+    roll_set = set()
+    if PERIODIC and pending["is_rebal"] and not in_cash:
+        _blocked = set(pending.get("blocked", []))
+        for code in pending["ranked"]:
+            if len(roll_set) >= TRANCHE_N:
+                break
+            c6 = str(code)[:6]
+            if c6 in _blocked:
+                continue
+            roll_set.add(c6)
+
     # ── 1. 卖出 ──
     keep, rejected = [], []
+    n_rolled = 0
     for lot in st["lots"]:
         matured = held_days(cal, lot, sig_date) >= HOLD_DAYS
         if not (matured or in_cash):
             keep.append(lot)
+            continue
+        if matured and not in_cash and str(lot["code"])[:6] in roll_set:
+            # 续持: 重置到期时钟(下个换仓周期再评估), 成本价与开仓日不动。
+            # first_open_signal_date 留住真实起始日, 好让页面显示真实持有时长。
+            lot.setdefault("first_open_signal_date", lot["open_signal_date"])
+            lot["open_signal_date"] = sig_date
+            lot["rolled"] = lot.get("rolled", 0) + 1
+            keep.append(lot)
+            n_rolled += 1
+            fills.append({"code": str(lot["code"])[:6],
+                          "name": names.get(str(lot["code"])[:6], ""),
+                          "action": "roll", "shares": lot["shares"],
+                          "price": round(lot["buy_price"], 3), "fee": 0.0, "net": 0.0,
+                          "reason": "still_ranked", "source": "auto"})
             continue
         px = kl.px(lot["code"], exec_date, EXEC_FIELD)
         _, limit_down = kl.limit_state(lot["code"], exec_date, EXEC_FIELD)
@@ -604,7 +638,8 @@ def settle(st, pending, exec_date, kl, names, cal):
         remaining = min(equity / denom, st["cash"])
         held = {str(l["code"])[:6] for l in st["lots"]}
         blocked = set(pending.get("blocked", []))
-        bought = 0
+        # 从已持仓数起算, 否则续持的(以及卖单被拒仍持有的)不计数, 会超过 TRANCHE_N
+        bought = len(st["lots"])
         for code in pending["ranked"]:
             if bought >= TRANCHE_N:
                 break
@@ -1193,16 +1228,57 @@ cutoff = all_dates[seq - LABEL_HORIZON]
 train_df = df[(df["date"] < cutoff) & df[LABEL].notna()]
 if train_df["date"].nunique() < MIN_TRAIN_DAYS:
     raise SystemExit(f"ERROR: 训练集只有 {train_df['date'].nunique()} 天, 少于 {MIN_TRAIN_DAYS}")
-print(f"\n[训练] 样本 < {pd.Timestamp(cutoff).date()} | "
-      f"{train_df['date'].nunique()} 天 {len(train_df):,} 行 {len(features)} 特征")
-X = train_df.groupby("code")[features].transform(lambda c: c.ffill().fillna(0))
-model = lgb.LGBMRegressor(**LOCKED_PARAMS).fit(X, train_df[LABEL])
+# 四条线的模型完全相同 —— 特征、标签、训练集、超参都不依赖 tranche_n 与本金,
+# 只有建仓环节不同。各训一遍就是 4 倍 CPU 白烧。缓存键取"能影响预测的一切",
+# 任何一项变了都会重训, 所以不存在读到过期预测的风险。
+_cache_key = None
+if args.preds_cache:
+    _cache_key = hashlib.sha1(json.dumps({
+        "signal_date": str(SIGNAL_DATE), "cutoff": str(cutoff),
+        "train_file": args.train_file, "pit_universe": args.pit_universe,
+        "label": LABEL, "features": list(features),
+        "params": {k: str(v) for k, v in sorted(LOCKED_PARAMS.items())},
+        "rows": int(len(train_df)),
+    }, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
+# tm 在缓存命中时也要用(下面算 blocked 靠它), 所以放在分支外
 tm = df["date"] == SIGNAL_DATE
-Xt = df.loc[tm, features].fillna(0)
-preds = model.predict(Xt)
-ranked = (pd.DataFrame({"code": df.loc[tm, "code"].astype(str).str[:6].values, "pred": preds})
-          .sort_values("pred", ascending=False).reset_index(drop=True))
+
+ranked = None
+if _cache_key:
+    _cp = Path(args.preds_cache)
+    if _cp.exists():
+        try:
+            _c = json.loads(_cp.read_text(encoding="utf-8"))
+            if _c.get("key") == _cache_key:
+                ranked = pd.DataFrame({"code": _c["codes"], "pred": _c["preds"]})
+                print(f"\n[训练] 命中预测缓存 (同日同输入, 由 {_c.get('by','?')} 生成), "
+                      f"跳过训练")
+        except Exception as e:
+            print(f"[训练] 预测缓存读取失败, 改为重新训练: {e}")
+
+if ranked is None:
+    print(f"\n[训练] 样本 < {pd.Timestamp(cutoff).date()} | "
+          f"{train_df['date'].nunique()} 天 {len(train_df):,} 行 {len(features)} 特征")
+    X = train_df.groupby("code")[features].transform(lambda c: c.ffill().fillna(0))
+    model = lgb.LGBMRegressor(**LOCKED_PARAMS).fit(X, train_df[LABEL])
+
+    Xt = df.loc[tm, features].fillna(0)
+    preds = model.predict(Xt)
+    ranked = (pd.DataFrame({"code": df.loc[tm, "code"].astype(str).str[:6].values, "pred": preds})
+              .sort_values("pred", ascending=False).reset_index(drop=True))
+    if _cache_key and not args.dry_run:
+        try:
+            Path(args.preds_cache).write_text(json.dumps({
+                "key": _cache_key, "signal_date": str(SIGNAL_DATE),
+                "by": STATE_PATH.stem, "at": datetime.now().isoformat(timespec="seconds"),
+                "codes": list(ranked["code"]), "preds": [float(x) for x in ranked["pred"]],
+            }, ensure_ascii=False), encoding="utf-8")
+            print(f"[训练] 预测已缓存, 同日其余条线可直接复用")
+        except Exception as e:
+            print(f"[训练] 预测缓存写入失败(不影响本次运行): {e}")
+
+ranked = ranked.sort_values("pred", ascending=False).reset_index(drop=True)
 pred_map = dict(zip(ranked["code"], ranked["pred"]))
 
 blocked = set()
@@ -1222,6 +1298,31 @@ mkt_c = float(_r["mkt_close"].iloc[0]) if len(_r) else float("nan")
 mkt_ma = float(_r[f"mkt_ma{args.regime_ma}"].iloc[0]) if len(_r) else float("nan")
 
 # ── 生成计划 ──
+# 换仓日判定 (periodic): 距上次换仓满 HOLD_DAYS 个交易日; 另外两种自愈情形 ——
+#   a) 到期后已无保留仓 (漏跑/对账导致错过周期点时, 不致于长期空着)
+#   b) 大盘刚由弱转强, 当天立即回场 (与回测一致)
+# 必须先算 is_rebal, 因为"到期的该不该续持"取决于本次是否换仓。
+_last_rebal = state.get("last_rebal_signal_date")
+_n_matured = sum(1 for l in state["lots"]
+                 if held_days(all_dates, l, SIGNAL_DATE) >= HOLD_DAYS)
+is_rebal = ((not PERIODIC)
+            or _last_rebal is None
+            or (seq - cal_pos(all_dates, _last_rebal)) >= HOLD_DAYS
+            or (was_in_cash and not in_cash)
+            or (_n_matured == len(state["lots"]) and not in_cash))
+
+# 目标组合: ranked 里前 TRANCHE_N 个未被持禁的。已持仓且仍在目标里的,
+# 到期也不卖 —— 卖了再买回要付一次往返 (佣金+滑点)*2, 白付这笔钱
+# 却回到同样的持仓。与回测 wf_v35 的 roll_set 逻辑一致。
+roll_set = set()
+if PERIODIC and is_rebal and not in_cash:
+    for code in ranked["code"]:
+        if len(roll_set) >= TRANCHE_N:
+            break
+        if code in blocked:
+            continue
+        roll_set.add(code)
+
 sell_plan, keep_plan = [], []
 for lot in state["lots"]:
     _held = held_days(all_dates, lot, SIGNAL_DATE)
@@ -1232,22 +1333,18 @@ for lot in state["lots"]:
            "ref_close": round(ref, 3), "open_date": lot.get("open_date"),
            "held_days": _held,
            "pnl_pct": round((ref / lot["buy_price"] - 1) * 100, 2)}
-    if matured or in_cash:
+    rolled = matured and not in_cash and str(lot["code"])[:6] in roll_set
+    if rolled:
+        # 续持: 不产生交易, 也不让用户做任何操作
+        row["rolled"] = True
+        row["reason"] = "到期但仍在前列, 续持不动"
+        keep_plan.append(row)
+    elif matured or in_cash:
         row["reason"] = "持满到期" if matured else "大盘转弱清仓"
         row["est_proceeds"] = round(lot["shares"] * fill_px(ref, "sell") * (1 - TRADE_COST), 2)
         sell_plan.append(row)
     else:
         keep_plan.append(row)
-
-# 换仓日判定 (periodic): 距上次换仓满 HOLD_DAYS 个交易日; 另外两种自愈情形 ——
-#   a) 卖完后已空仓 (漏跑/对账导致错过周期点时, 不至于长期空着)
-#   b) 大盘刚由弱转强, 当天立即回场 (与回测一致)
-_last_rebal = state.get("last_rebal_signal_date")
-is_rebal = ((not PERIODIC)
-            or _last_rebal is None
-            or (seq - cal_pos(all_dates, _last_rebal)) >= HOLD_DAYS
-            or (was_in_cash and not in_cash)
-            or (not keep_plan and not in_cash))
 
 cash_after_sell = state["cash"] + sum(r["est_proceeds"] for r in sell_plan)
 buy_plan, alt_plan = [], []
@@ -1256,7 +1353,8 @@ if not in_cash and is_rebal:
     denom = 1 if PERIODIC else HOLD_DAYS
     remaining = min(equity / denom, cash_after_sell)
     held = {str(r["code"])[:6] for r in keep_plan}
-    bought = 0
+    # 从已持仓数起算: 续持的那几只已经占着仓位, 不从 0 起算会超配
+    bought = len(keep_plan)
     for code in ranked["code"]:
         if bought >= TRANCHE_N and len(alt_plan) >= args.alternates:
             break

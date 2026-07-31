@@ -570,6 +570,20 @@ const doneKey = () => 'done_' + PID + '_' + DAY;
 const getDone = () => { try { return JSON.parse(localStorage.getItem(doneKey())||'[]'); } catch(e){ return []; } };
 const setDone = a => localStorage.setItem(doneKey(), JSON.stringify(a));
 
+// 手填的实际股数/成交价也要持久化。它们存在 DOM 里, 而定时刷新会
+// 重建 DOM —— 不存的话你填到一半被刷新一下就回到计划默认值了。
+const fillKey = () => 'fills_' + PID + '_' + DAY;
+const getFills = () => { try { return JSON.parse(localStorage.getItem(fillKey())||'{}'); } catch(e){ return {}; } };
+const setFills = o => localStorage.setItem(fillKey(), JSON.stringify(o));
+function saveFill(id){
+  const s = $('#fs_' + id), p = $('#fp_' + id);
+  if (!s || !p) return;
+  const o = getFills();
+  o[id] = {shares: s.value, price: p.value};
+  setFills(o);
+  refreshMoney();
+}
+
 const money = v => v == null ? '--' : '¥' + Number(v).toLocaleString('zh-CN',{maximumFractionDigits:0});
 
 // 操作行有三种形态, 取决于记账方式:
@@ -592,17 +606,21 @@ function opRow(r, side, mode){
   }
 
   const on = getDone().includes(id);
+  // 优先用你上次填的值, 没填过才用计划默认值
+  const sv = getFills()[id] || {};
+  const vS = sv.shares != null ? sv.shares : r.shares;
+  const vP = sv.price != null ? sv.price : (r.ref_price == null ? '' : r.ref_price);
   return `<div class="op ${side} ${on?'done':''}" id="row_${id}">
     <div class="rowtop" onclick="tickRow('${id}')">
       <div class="tick">✓</div>${head}
     </div>
     <div class="fillbox" id="fb_${id}" style="display:${on?'flex':'none'}">
       <span class="fl">实际</span>
-      <input type="number" id="fs_${id}" value="${r.shares}" step="100" min="0"
-             inputmode="numeric" oninput="refreshMoney()">
+      <input type="number" id="fs_${id}" value="${vS}" step="100" min="0"
+             inputmode="numeric" oninput="saveFill('${id}')">
       <span class="unit">股</span>
-      <input type="number" id="fp_${id}" value="${r.ref_price==null?'':r.ref_price}"
-             step="0.001" min="0" inputmode="decimal" oninput="refreshMoney()">
+      <input type="number" id="fp_${id}" value="${vP}"
+             step="0.001" min="0" inputmode="decimal" oninput="saveFill('${id}')">
       <span class="unit">元</span>
     </div>
   </div>`;
@@ -1048,7 +1066,7 @@ async function submitTicked(none){
   }
   try {
     const d = await api('/api/profile/confirm', {profile: PID, fills});
-    setDone([]);                                 // 已入账, 勾清掉免得下轮串
+    setDone([]); setFills({});                   // 已入账, 清掉免得下轮串
     toast(d.note, 6000);
     pollRun();
   } catch(e){ toast('提交失败: ' + e.message, 8000); }
@@ -1234,10 +1252,14 @@ async function loadAct(){
 function load(){ return VIEW === 'rec' ? loadRec() : loadAct(); }
 
 setView(VIEW);
-// 定时刷新会重建 DOM, 正在填成交价或开着弹窗时刷新会把输入洗掉
+// 定时刷新会重建 DOM。填的值虽然已经落到 localStorage 不会丢, 但刷新会
+// 把光标和未提交的编辑现场打断, 所以正在确认成交时干脆不刷。
 setInterval(() => {
   if ($('#modal').innerHTML) return;
   if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+  // 实盘确认中且已经动过手(有打勾或填过值): 等你提交完再说
+  if (LASTD && LASTD.can_confirm &&
+      (getDone().length || Object.keys(getFills()).length)) return;
   load();
 }, 60000);
 </script>
