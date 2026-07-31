@@ -33,8 +33,9 @@ from fastapi.middleware.cors import CORSMiddleware
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from action_page import (ACTION_HTML, build_recommend, build_today,  # noqa: E402
                          list_profiles)
-from live_config import (DEFAULT_PROFILE, PROFILES, is_auto, set_auto,  # noqa: E402
-                         set_name, signal_args, state_file)
+from live_config import (DEFAULT_PROFILE, PROFILES, display_name,  # noqa: E402
+                         is_auto, is_locked, set_auto, set_name,
+                         signal_args, state_file)
 
 # ── 路径 ──
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +93,23 @@ def _ops_deny():
             {"error": "服务器未设置 QUANT_OPS_PASSWORD, 所有改账操作已禁用",
              "need_password": False}, status_code=503)
     return JSONResponse({"error": "需要密码", "need_password": True}, status_code=401)
+
+
+def _check_profile(pid, write=True):
+    """校验条线 id; write=True 时还要拦住基准线。
+
+    返回 None 表示通过, 否则返回该直接回给前端的错误响应。
+    基准线的意义就是"没人动过", 所以拦在后端而不是只靠前端隐藏按钮 ——
+    前端藏起来的按钮, 用 curl 一样能打到接口。
+    """
+    if pid not in PROFILES:
+        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    if write and is_locked(pid):
+        return JSONResponse(
+            {"error": f"{display_name(pid)} 是基准线, 不接受任何修改。"
+                      f"它的作用是提供一条没人动过的参照, 用来衡量人为干预的代价。",
+             "locked": True}, status_code=403)
+    return None
 
 
 @app.post("/api/ops/login")
@@ -777,8 +795,8 @@ async def api_rename(req: Request):
         return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
-    if pid not in PROFILES:
-        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    if (bad := _check_profile(pid)) is not None:
+        return bad
     try:
         name = set_name(pid, body.get("name"))
     except ValueError as e:
@@ -800,8 +818,8 @@ async def api_auto(req: Request):
         return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
-    if pid not in PROFILES:
-        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    if (bad := _check_profile(pid)) is not None:
+        return bad
     auto = bool(body.get("auto"))
     set_auto(pid, auto)
     st = _state_of(pid) or {}
@@ -823,8 +841,8 @@ async def api_confirm(req: Request):
         return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
-    if pid not in PROFILES:
-        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    if (bad := _check_profile(pid)) is not None:
+        return bad
     if _running["active"]:
         return JSONResponse({"error": "已有任务在跑, 请稍候"}, status_code=409)
 
@@ -886,8 +904,8 @@ async def api_set_cash(req: Request):
         return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
-    if pid not in PROFILES:
-        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    if (bad := _check_profile(pid)) is not None:
+        return bad
     try:
         cash = float(body.get("cash"))
     except (TypeError, ValueError):
@@ -911,8 +929,8 @@ async def api_cash_flow(req: Request):
         return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
-    if pid not in PROFILES:
-        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    if (bad := _check_profile(pid)) is not None:
+        return bad
     try:
         amt = float(body.get("amount"))
     except (TypeError, ValueError):
@@ -938,8 +956,8 @@ async def api_drop_lot(req: Request):
         return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
-    if pid not in PROFILES:
-        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    if (bad := _check_profile(pid)) is not None:
+        return bad
     code = str(body.get("code") or "").strip()
     if not code.isdigit() or len(code) > 6:
         return JSONResponse({"error": "股票代码不对"}, status_code=400)

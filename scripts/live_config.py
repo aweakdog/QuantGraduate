@@ -101,7 +101,34 @@ PROFILES = {
         "tranche-n": 3,
         "desc": "回测指标最优 (IR 1.37, 回撤 -28.6%), 但仅 3 只, 个股集中度高。",
     },
+    # ── 不可更改的基准线 ───────────────────────────
+    # 上面四条是给真人用的, 会被改名、手工记账、校准现金、删持仓 ——
+    # 跑上一段时间后就无法分辨"赚亏是策略本身的还是人为干预的"。
+    # 这两条锁死: 只能纯纸面自动记账, 任何写操作都被拒, 作为参照组。
+    # 参数故意和 稳妥5万/激进5万 逐字一致, 否则就不是对照而是另两条策略。
+    "base5w_steady": {
+        "name": "基准·稳妥5万",
+        "capital": 50000.0,
+        "tranche-n": 5,
+        "locked": True,
+        "desc": "与「稳妥 5万」参数完全相同的参照组。永久纸面自动记账, "
+                "不可改名/不可改记账方式/不可校准现金/不可删持仓。"
+                "用它减去真实账户, 差额就是人为干预的代价。",
+    },
+    "base5w_aggr": {
+        "name": "基准·激进5万",
+        "capital": 50000.0,
+        "tranche-n": 3,
+        "locked": True,
+        "desc": "与「激进 5万」参数完全相同的参照组。永久纸面自动记账, "
+                "不可改名/不可改记账方式/不可校准现金/不可删持仓。"
+                "用它减去真实账户, 差额就是人为干预的代价。",
+    },
 }
+
+# 锁死的条线: 不得改名、不得切记账方式、不得现金校准/出入金/删持仓/
+# 手工确认成交。这是唯一判定入口, 前端隐控件、后端拒请求都读它。
+LOCKED = tuple(pid for pid, p in PROFILES.items() if p.get("locked"))
 
 # 默认展示哪条线
 DEFAULT_PROFILE = "steady5w"
@@ -163,12 +190,26 @@ def setting(pid):
     return {**DEFAULT_SETTING, **load_settings().get(pid, {})}
 
 
+def is_locked(pid):
+    """基准线: 不接受任何人为修改"""
+    return bool(PROFILES.get(pid, {}).get("locked"))
+
+
 def display_name(pid):
-    """用户改过就用用户的, 否则用代码里的默认名"""
+    """用户改过就用用户的, 否则用代码里的默认名。
+
+    基准线一律用代码名 —— 即使设置文件被手改过也不认, 否则参照组被改名后
+    就认不出来了。
+    """
+    if is_locked(pid):
+        return PROFILES[pid]["name"]
     return setting(pid)["name"] or PROFILES[pid]["name"]
 
 
 def is_auto(pid):
+    """基准线永远自动记账 —— 它存在的意义就是纯纸面跟踪策略本身"""
+    if is_locked(pid):
+        return True
     return setting(pid)["auto"]
 
 
@@ -176,6 +217,8 @@ def set_name(pid, name):
     """name 传 None 或空串 = 恢复默认名"""
     if pid not in PROFILES:
         raise KeyError(pid)
+    if is_locked(pid):
+        raise PermissionError(f"{PROFILES[pid]['name']} 是基准线, 不可改名")
     name = (name or "").strip()
     if len(name) > NAME_MAX:
         raise ValueError(f"名字最长 {NAME_MAX} 个字")
@@ -188,6 +231,8 @@ def set_name(pid, name):
 def set_auto(pid, auto):
     if pid not in PROFILES:
         raise KeyError(pid)
+    if is_locked(pid):
+        raise PermissionError(f"{PROFILES[pid]['name']} 是基准线, 记账方式锁定为纸面自动")
     s = load_settings()
     s.setdefault(pid, dict(DEFAULT_SETTING))["auto"] = bool(auto)
     save_settings(s)

@@ -20,7 +20,7 @@ from pathlib import Path
 import pandas as pd
 
 from live_config import (DEFAULT_PROFILE, PROFILES, display_name, is_auto,
-                         state_file)
+                         is_locked, state_file)
 
 # 尾盘集合竞价前的下单窗口; t1open 则是次日开盘
 EXEC_WHEN = {
@@ -105,7 +105,7 @@ def list_profiles():
     """给前端做切换用的简表"""
     return [{"id": k, "name": display_name(k), "default_name": v["name"],
              "capital": v["capital"], "positions": v["tranche-n"],
-             "desc": v["desc"], "auto": is_auto(k)}
+             "desc": v["desc"], "auto": is_auto(k), "locked": is_locked(k)}
             for k, v in PROFILES.items()]
 
 
@@ -437,6 +437,11 @@ ACTION_HTML = """<!DOCTYPE html>
   .opt.on{border-color:#2563eb;background:#161c2b}
   .opt .ot{font-size:14px;font-weight:600;color:#e8eaed}
   .opt .od{font-size:12px;color:#8a93a6;line-height:1.6;margin-top:3px}
+  /* 基准线的说明框 (占住原本按钮组的位置) */
+  .lockbox{background:#0b0d12;border:1px solid #262c38;border-radius:9px;
+           padding:10px 12px;font-size:12px;color:#8a93a6;line-height:1.7}
+  .lockbox b{color:#c9cdd6}
+  .mode-lock{background:#3b2f14;color:#e0a83a}
   /* 持仓行上的删除入口 */
   .del{flex:0 0 auto;width:28px;height:28px;border-radius:7px;background:#1e222b;
        color:#8a93a6;font-size:13px;display:flex;align-items:center;
@@ -689,8 +694,8 @@ function holdRow(r){
       <div class="meta">${r.shares} 股 · 已持 ${r.held_days==null?'--':r.held_days} 日</div></div>
     <div class="${cls}" style="text-align:right;font-weight:600">${sign}${p==null?'--':p+'%'}
          <div class="meta">${money(r.amount)}</div></div>
-    <div class="del" title="删除这笔持仓"
-         onclick="askDrop('${r.code}','${esc(r.name||'')}',${r.shares},${r.ref_price||0})">✕</div>
+    ${curProf().locked ? '' : `<div class="del" title="删除这笔持仓"
+         onclick="askDrop('${r.code}','${esc(r.name||'')}',${r.shares},${r.ref_price||0})">✕</div>`}
   </div>`;
 }
 
@@ -791,8 +796,8 @@ const curProf = () => PROFS.find(p => p.id === PID) || {};
 function renderProfs(active){
   $('#profs').innerHTML = PROFS.map(p => `
     <div class="prof ${p.id===active?'on':''}" onclick="setPid('${p.id}')">
-      <div class="pn">${esc(p.name)}<span class="mode ${p.auto?'mode-auto':'mode-man'}">${
-        p.auto?'纸面':'实盘'}</span></div>
+      <div class="pn">${esc(p.name)}<span class="mode ${p.locked?'mode-lock':(p.auto?'mode-auto':'mode-man')}">${
+        p.locked?'基准':(p.auto?'纸面':'实盘')}</span></div>
       <div class="pm">${p.positions} 只 · 每只 ${money(
         (p.equity != null ? p.equity : p.capital) / p.positions)}</div>
     </div>`).join('');
@@ -805,6 +810,18 @@ let ACCT = {};
 function renderActs(){
   const p = curProf();
   if (!p.id){ $('#acts').innerHTML = ''; return; }
+  // 基准线: 一个写操作按钮都不给。后端同样会拒, 这里只是别让人白点。
+  if (p.locked){
+    $('#acts').innerHTML = `
+      <div class="lockbox">
+        <b>基准线 · 不可更改</b><br>
+        永久纸面自动记账。不能改名、不能切记账方式、不能校准现金、
+        不能存取现金、不能删持仓。<br>
+        它的用处是给你一条<b>没人动过</b>的参照 ——
+        真实账户减去它，差额就是人为干预的代价。
+      </div>`;
+    return;
+  }
   $('#acts').innerHTML = `
     <div class="btn" onclick="askRename()">重命名</div>
     ${p.auto
