@@ -496,8 +496,27 @@ def cal_pos(cal, d):
 
 
 def held_days(cal, lot, signal_date):
-    """已持有的换仓周期数 = 信号日 与 开仓信号日 之间的交易日跑动次数"""
+    """到期时钟: 距下次该评估还有多久, 用来判定是否持满 HOLD_DAYS。
+
+    注意续持会把它归零 (见 settle 里的 roll 分支) —— 这正是它该有的行为,
+    续持就是重新起算一个换仓周期。要显示"这笔一共拿了多久"请用 tenure_days。
+    """
     return cal_pos(cal, signal_date) - cal_pos(cal, lot["open_signal_date"])
+
+
+def tenure_days(cal, lot, signal_date):
+    """真实持有时长: 从最初开仓那天算起, 续持不清零。
+
+    与 held_days 回答的是不同问题, 两个都要有:
+      held_days   -> "什么时候会动它"  (到期时钟, 续持归零)
+      tenure_days -> "这笔一共拿了多久" (真实时长, 只增不减)
+    只显示前者会让人以为刚买的; 只显示后者则看不出哪天该操作。
+
+    老持仓没有 first_open_signal_date 字段(续持功能上线前建的), 此时
+    两者本就相等, 退回 open_signal_date 即为正确答案。
+    """
+    first = lot.get("first_open_signal_date") or lot["open_signal_date"]
+    return cal_pos(cal, signal_date) - cal_pos(cal, first)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1332,6 +1351,11 @@ for lot in state["lots"]:
            "shares": lot["shares"], "buy_price": round(lot["buy_price"], 3),
            "ref_close": round(ref, 3), "open_date": lot.get("open_date"),
            "held_days": _held,
+           # 真实持有时长与累计续持次数: 续持会把 held_days 归零, 光看它
+           # 会以为是刚买的。两个都给前端, 各自回答不同的问题。
+           "tenure_days": tenure_days(all_dates, lot, SIGNAL_DATE),
+           "n_rolled": int(lot.get("rolled", 0)),
+           "first_open_date": lot.get("first_open_signal_date") or lot.get("open_signal_date"),
            "pnl_pct": round((ref / lot["buy_price"] - 1) * 100, 2)}
     rolled = matured and not in_cash and str(lot["code"])[:6] in roll_set
     if rolled:
