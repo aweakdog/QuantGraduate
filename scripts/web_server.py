@@ -13,6 +13,7 @@
   python scripts/web_server.py --host 0.0.0.0 --port 8080
 """
 import argparse
+import asyncio
 import base64
 import glob
 import hashlib
@@ -32,6 +33,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import access_log  # noqa: E402
 from action_page import (ACTION_HTML, _exec_window, build_recommend,  # noqa: E402
                          build_today, list_profiles)
 from live_config import (DEFAULT_PROFILE, PROFILES, capital_of,  # noqa: E402
@@ -51,6 +53,265 @@ app = FastAPI(title="实盘信号")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+
+# ══════════════════════════════════════════════════════════════
+# 全站只读鉴权
+# ══════════════════════════════════════════════════════════════
+# 起因: 这个站 uvicorn 直接监听 0.0.0.0:8080, 实测从非校园网 IP 能直连,
+# 而在此之前只有"改账"要密码, "看"是完全开放的 —— 网址一旦传出去,
+# 任何人都能看到全部持仓、资金和收益率。
+#
+# 三道口令各管一段, 互不通用 (签名密钥掺入不同的用途字符串):
+#   QUANT_VIEW_PASSWORD  能不能打开这个站            30 天
+#   QUANT_OPS_PASSWORD   能不能改账                  12 小时
+#   QUANT_BT_PASSWORD    能不能看回测页              7 天
+# 能看不等于能改, 所以即使登录了, 改账仍要单独输 ops 口令。
+VIEW_COOKIE = "view_token"
+VIEW_TTL = 30 * 24 * 3600
+
+# 这些路径不需要登录。必须严格控制在"登录本身所需"和"不含任何数据"的范围内。
+VIEW_PUBLIC = ("/login", "/api/view/login", "/api/view/status", "/favicon.ico")
+
+# 防爆破。当前口令是 6 位纯数字(共 100 万种), 字典跑得动, 所以限得比
+# 一般情况紧: 5 次/30 分钟使单 IP 每天最多试 240 次, 穷举完要十年量级。
+# 计数只在内存里, 重启即清 —— 对付脚本足够, 也不致于把自己永久锁死。
+LOGIN_MAX_FAILS = 5
+LOGIN_WINDOW = 30 * 60
+LOGIN_FAIL_DELAY = 0.7       # 每次失败故意拖一下, 拖死高频脚本
+LOGIN_HINT_AFTER = 3         # 错这么多次后告知还剩几次, 免得自己被锁了还不知道为何
+_login_fails = {}
+
+
+def _view_password():
+    return os.environ.get("QUANT_VIEW_PASSWORD") or ""
+
+
+def _view_sign(exp: int) -> str:
+    key = ("view:" + _view_password()).encode()
+    return hmac.new(key, str(exp).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _view_ok(req: Request) -> bool:
+    if not _view_password():
+        return False
+    tok = req.cookies.get(VIEW_COOKIE, "")
+    if "." not in tok:
+        return False
+    exp_s, sig = tok.rsplit(".", 1)
+    try:
+        exp = int(exp_s)
+    except ValueError:
+        return False
+    if exp < time.time():
+        return False
+    return hmac.compare_digest(sig, _view_sign(exp))
+
+
+def _client_ip(req: Request) -> str:
+    """真实来源只认 TCP 对端。
+
+    前面没有可信代理, 所以 X-Forwarded-For 是访客自己就能伪造的, 绝不能
+    用它当来源 —— 否则日志里的 IP 全都可以被随意编造, 这个功能也就没用了。
+    """
+    return req.client.host if req.client else ""
+
+
+def _login_blocked(ip):
+    rec = _login_fails.get(ip)
+    if not rec:
+        return False
+    n, first = rec
+    if time.time() - first > LOGIN_WINDOW:
+        _login_fails.pop(ip, None)
+        return False
+    return n >= LOGIN_MAX_FAILS
+
+
+def _login_fail(ip):
+    n, first = _login_fails.get(ip, (0, time.time()))
+    if time.time() - first > LOGIN_WINDOW:
+        n, first = 0, time.time()
+    _login_fails[ip] = (n + 1, first)
+
+
+@app.middleware("http")
+async def _view_gate(request: Request, call_next):
+    """未登录一律拦住, 并记录每次访问。
+
+    未登录时直接返回登录页(带 401)而不是 302 跳转 —— 跳转在 fetch 里会变成
+    "拿到一坨 HTML"这种难查的现象, 也容易和前端路由绕成循环。
+    """
+    path = request.url.path
+    authed = _view_ok(request)
+    public = path in VIEW_PUBLIC
+    try:
+        if public or authed:
+            resp = await call_next(request)
+        elif not _view_password():
+            # 未配置口令 -> 关站, 而不是放行。与改账口令同一个取舍:
+            # 宁可用不了, 不可裸奔。
+            resp = HTMLResponse(NO_PASSWORD_HTML, status_code=503)
+        elif path.startswith("/api/"):
+            resp = JSONResponse({"error": "需要登录", "need_login": True},
+                                status_code=401)
+        else:
+            resp = HTMLResponse(LOGIN_HTML, status_code=401)
+    finally:
+        pass
+    access_log.record(_client_ip(request), request.method, path,
+                      getattr(resp, "status_code", 0),
+                      request.headers.get("user-agent", ""), authed,
+                      request.headers.get("x-forwarded-for", ""))
+    return resp
+
+
+@app.post("/api/view/login")
+async def api_view_login(req: Request):
+    pw = _view_password()
+    ip = _client_ip(req)
+    if not pw:
+        return JSONResponse({"error": "服务器未设置 QUANT_VIEW_PASSWORD"},
+                            status_code=503)
+    if _login_blocked(ip):
+        return JSONResponse(
+            {"error": f"尝试过多, 请 {LOGIN_WINDOW // 60} 分钟后再试"},
+            status_code=429)
+    body = await req.json()
+    got = str(body.get("password", ""))
+    if not hmac.compare_digest(got, pw):
+        _login_fail(ip)
+        await asyncio.sleep(LOGIN_FAIL_DELAY)
+        n = _login_fails.get(ip, (0, 0))[0]
+        left = LOGIN_MAX_FAILS - n
+        msg = "口令错误"
+        if 0 < left <= LOGIN_MAX_FAILS - LOGIN_HINT_AFTER:
+            msg += f", 还可试 {left} 次"
+        return JSONResponse({"error": msg}, status_code=403)
+    _login_fails.pop(ip, None)
+    exp = int(time.time()) + VIEW_TTL
+    r = JSONResponse({"ok": True})
+    r.set_cookie(VIEW_COOKIE, f"{exp}.{_view_sign(exp)}", max_age=VIEW_TTL,
+                 httponly=True, samesite="lax", path="/")
+    return r
+
+
+@app.post("/api/view/logout")
+async def api_view_logout():
+    r = JSONResponse({"ok": True})
+    r.delete_cookie(VIEW_COOKIE, path="/")
+    return r
+
+
+@app.get("/api/view/status")
+async def api_view_status(req: Request):
+    return {"authed": _view_ok(req), "configured": bool(_view_password())}
+
+
+LOGIN_HTML = """<!DOCTYPE html><html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录</title><style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0b0d10;color:#e6e8eb;min-height:100vh;display:flex;
+     align-items:center;justify-content:center;padding:20px;
+     font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+.box{background:#14171e;border-radius:16px;padding:30px 24px;width:100%;max-width:360px}
+h1{font-size:19px;margin-bottom:6px}
+.sub{font-size:13px;color:#8a93a6;line-height:1.7;margin-bottom:20px}
+input{width:100%;background:#0f1216;border:1px solid #2a2f3a;color:#e6e8eb;
+      border-radius:10px;padding:13px 14px;font-size:17px;outline:none}
+input:focus{border-color:#2563eb}
+.btn{width:100%;margin-top:12px;background:#2563eb;color:#fff;border:none;
+     border-radius:10px;padding:13px;font-size:16px;font-weight:600;cursor:pointer}
+.btn:disabled{opacity:.5}
+.err{color:#fca5a5;font-size:13px;margin-top:12px;min-height:18px}
+</style></head><body>
+<div class="box">
+  <h1>实盘看板</h1>
+  <div class="sub">这个站会显示真实持仓与资金，需要口令才能查看。</div>
+  <input id="pw" type="password" placeholder="查看口令" autocomplete="current-password">
+  <button class="btn" id="go" onclick="go()">进入</button>
+  <div class="err" id="err"></div>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+$('#pw').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+$('#pw').focus();
+async function go(){
+  const pw = $('#pw').value;
+  if (!pw) return;
+  $('#go').disabled = true; $('#err').textContent = '';
+  try {
+    const r = await fetch('/api/view/login', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pw})});
+    const d = await r.json().catch(()=>({}));
+    if (r.ok) { location.replace('/'); return; }
+    $('#err').textContent = d.error || ('登录失败 (' + r.status + ')');
+  } catch(e) {
+    $('#err').textContent = '无法连接服务器';
+  }
+  $('#go').disabled = false;
+}
+</script></body></html>"""
+
+
+# 未配置口令时显示这个, 而不是放行。说清怎么修, 免得只看到一个 503 干瞪眼。
+NO_PASSWORD_HTML = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>未配置口令</title>
+<style>body{background:#0b0d10;color:#e6e8eb;font-family:-apple-system,"PingFang SC",sans-serif;
+padding:30px;line-height:1.9;font-size:14px}code{background:#1c2029;padding:2px 6px;
+border-radius:4px;color:#fcd34d}h1{font-size:18px;margin-bottom:14px}
+.w{max-width:620px;margin:0 auto}pre{background:#14171e;padding:14px;border-radius:10px;
+overflow-x:auto;font-size:13px;color:#c9cdd6}</style></head><body><div class="w">
+<h1>服务器未设置 QUANT_VIEW_PASSWORD</h1>
+<p>这个站会显示真实持仓与资金，所以没有口令时<b>整站关闭</b>，而不是放开访问。</p>
+<pre>ssh eez041.ece.ust.hk
+echo 'QUANT_VIEW_PASSWORD=想用的口令' &gt;&gt; ~/.config/quant-web.env
+systemctl --user restart quant-web.service</pre>
+</div></body></html>"""
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def page_login():
+    return LOGIN_HTML
+
+
+# ══════════════════════════════════════════════════════════════
+# 访问日志查询 (用改账口令保护)
+# ══════════════════════════════════════════════════════════════
+# 放在 ops 口令后面而不是仅靠"已登录": 访问日志里有 IP 和归属地,
+# 属于比持仓更该少露的东西。
+
+
+@app.get("/api/access/summary")
+async def api_access_summary(req: Request, days: int = 30, geo: int = 1):
+    if not _ops_ok(req):
+        return _ops_deny()
+    days = max(1, min(int(days or 30), 90))
+    s = access_log.summary(days)
+    first = access_log.first_seen_map()
+    ips = [ip for ip, _ in s["top_ips"]]
+    # geo=0 供离线/不想外发 IP 时使用
+    g = access_log.resolve_geo(ips) if geo else {}
+    s["ips"] = [{"ip": ip, "hits": n, "first_seen": first.get(ip),
+                 "where": (g.get(ip) or {}).get("where", "未解析"),
+                 "isp": (g.get(ip) or {}).get("isp", ""),
+                 "private": access_log.is_private(ip)}
+                for ip, n in s["top_ips"]]
+    s.pop("top_ips", None)
+    return s
+
+
+@app.get("/api/access/events")
+async def api_access_events(req: Request, limit: int = 200, pages: int = 0,
+                            geo: int = 1):
+    if not _ops_ok(req):
+        return _ops_deny()
+    limit = max(1, min(int(limit or 200), 1000))
+    rows = access_log.read_events(limit=limit, only_pages=bool(pages))
+    g = access_log.resolve_geo([r.get("ip") for r in rows]) if geo else {}
+    for r in rows:
+        r["where"] = (g.get(r.get("ip")) or {}).get("where", "未解析")
+    return {"events": rows, "dedupe_seconds": access_log.DEDUPE_SECONDS}
 
 # ══════════════════════════════════════════════════════════════
 # 写操作鉴权
@@ -1217,8 +1478,15 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="card-title">操作</div>
     <button class="btn btn-primary" id="btn-signal" onclick="runSignal()">🔄 生成今日信号</button>
     <button class="btn btn-warn" id="btn-sync-tpl" onclick="openSyncModal()">🔄 人工对账</button>
+    <button class="btn" style="background:#37415a;color:#dbe3f4"
+            onclick="toggleAccess()">👁 访问日志</button>
     <button class="btn btn-danger" onclick="refresh()">刷新</button>
     <div id="log"></div>
+  </div>
+
+  <div class="card" id="access-card" style="display:none">
+    <div class="card-title">访问日志</div>
+    <div id="access-body"><span class="empty">加载中...</span></div>
   </div>
 </div>
 
@@ -1484,6 +1752,146 @@ async function submitSync() {
   } catch(e) {
     logDiv.textContent = '对账失败: ' + e;
   }
+}
+
+// ── 访问日志 ──
+// 用改账口令保护: 日志里有 IP 和归属地, 比持仓更该少露。
+let ACC = {open:false, days:30, pages:1, geo:1};
+
+function toggleAccess(){
+  ACC.open = !ACC.open;
+  document.getElementById('access-card').style.display = ACC.open ? 'block' : 'none';
+  if (ACC.open) loadAccess();
+}
+
+const aesc = s => String(s==null?'':s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function loadAccess(){
+  const el = document.getElementById('access-body');
+  el.innerHTML = '<span class="empty">加载中...</span>';
+  try {
+    const q = '?days=' + ACC.days + '&geo=' + ACC.geo;
+    const [rs, re] = await Promise.all([
+      fetch('/api/access/summary' + q),
+      fetch('/api/access/events?limit=200&pages=' + ACC.pages + '&geo=' + ACC.geo),
+    ]);
+    if (rs.status === 401 || re.status === 401){ accessPasswordBox(); return; }
+    const s = await rs.json(), e = await re.json();
+    if (s.error){ el.innerHTML = '<span class="empty">' + aesc(s.error) + '</span>'; return; }
+    renderAccess(s, e);
+  } catch(err){
+    el.innerHTML = '<span class="empty">加载失败: ' + aesc(err.message) + '</span>';
+  }
+}
+
+function accessPasswordBox(){
+  document.getElementById('access-body').innerHTML =
+    '<div style="font-size:13px;color:#888;margin-bottom:8px">' +
+    '访问日志含 IP 与归属地, 需要改账口令。</div>' +
+    '<input type="password" id="acc-pw" placeholder="改账口令" ' +
+    'style="width:200px;padding:8px 12px;border:1px solid #333;border-radius:6px;' +
+    'background:#0f1117;color:#fff;font-size:14px" ' +
+    'onkeydown="if(event.key===&quot;Enter&quot;)accessLogin()">' +
+    '<button class="btn btn-primary" style="margin-left:8px" onclick="accessLogin()">确定</button>' +
+    '<div id="acc-err" style="color:#f44336;font-size:12px;margin-top:8px"></div>';
+  setTimeout(() => { const i = document.getElementById('acc-pw'); if (i) i.focus(); }, 50);
+}
+
+async function accessLogin(){
+  const pw = (document.getElementById('acc-pw')||{}).value || '';
+  const r = await fetch('/api/ops/login', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pw})});
+  if (r.ok){ loadAccess(); return; }
+  const d = await r.json().catch(()=>({}));
+  const e = document.getElementById('acc-err');
+  if (e) e.textContent = d.error || '口令错误';
+}
+
+function renderAccess(s, ev){
+  let h = '<div class="stat-row" style="margin-bottom:14px">' +
+    stat('总访问', s.total) + stat('今日', s.today) +
+    stat('独立 IP', s.unique_ips) + stat('其中外部', s.unique_external_ips) + '</div>';
+
+  // 口令是 6 位数字, 这个数字是发现"有人在猜"的唯一途径, 所以非 0 就报警
+  if (s.failed_logins){
+    h += '<div style="background:#3b1518;border:1px solid #5b1f24;border-radius:8px;' +
+      'padding:11px 13px;margin-bottom:12px;font-size:13px;color:#fca5a5">' +
+      '口令尝试失败 <b>' + s.failed_logins + '</b> 次';
+    const fi = (s.failed_login_ips||[]).filter(x => x[1] >= 3);
+    if (fi.length) h += ' · 可疑 IP: ' +
+      fi.map(x => aesc(x[0]) + '(' + x[1] + '次)').join(', ');
+    h += '<div style="color:#8a93a6;margin-top:5px;font-size:12px">' +
+      '当前口令为 6 位纯数字。若这个数字持续上涨且不是你自己输错, ' +
+      '建议换长口令。</div></div>';
+  }
+
+  h += '<div style="font-size:12px;color:#666;margin-bottom:12px">' +
+    '统计窗口 ' + s.window_days + ' 天' +
+    (s.first_day ? ' · 最早记录 ' + s.first_day : '') +
+    ' · 计数精确, 下方事件流同 IP 同路径 ' +
+    Math.round((ev.dedupe_seconds||300)/60) + ' 分钟内合并为一条</div>';
+
+  h += '<div style="margin-bottom:10px">' +
+    btnSm('近30天', ACC.days===30, 'ACC.days=30;loadAccess()') +
+    btnSm('近7天', ACC.days===7, 'ACC.days=7;loadAccess()') +
+    btnSm('只看页面', ACC.pages===1, 'ACC.pages=1;loadAccess()') +
+    btnSm('含接口', ACC.pages===0, 'ACC.pages=0;loadAccess()') +
+    btnSm(ACC.geo ? '归属地:开' : '归属地:关', false,
+          'ACC.geo=' + (ACC.geo?0:1) + ';loadAccess()') +
+    '</div>';
+
+  h += '<div style="font-size:13px;color:#888;margin:14px 0 6px">按 IP 汇总</div>' +
+       '<div class="table-wrap"><table><thead><tr><th>IP</th><th>次数</th>' +
+       '<th>首次出现</th><th>归属地</th><th>网络</th></tr></thead><tbody>';
+  for (const r of (s.ips||[])){
+    const tag = r.private ? ' <span class="badge badge-gray">内网</span>' : '';
+    h += '<tr><td>' + aesc(r.ip) + tag + '</td><td>' + r.hits + '</td><td>' +
+         aesc(r.first_seen||'--') + '</td><td>' + aesc(r.where) + '</td><td>' +
+         aesc(r.isp||'') + '</td></tr>';
+  }
+  if (!(s.ips||[]).length) h += '<tr><td colspan="5" class="empty">暂无记录</td></tr>';
+  h += '</tbody></table></div>';
+
+  h += '<div style="font-size:13px;color:#888;margin:16px 0 6px">最近访问</div>' +
+       '<div class="table-wrap"><table><thead><tr><th>时间</th><th>IP</th>' +
+       '<th>归属地</th><th>路径</th><th>状态</th><th>已登录</th>' +
+       '<th>设备</th></tr></thead><tbody>';
+  for (const r of (ev.events||[])){
+    const sc = r.s >= 400 ? ' class="pnl-neg"' : '';
+    const xf = r.xff ? ' <span class="badge badge-red" title="无可信代理, 此头可伪造">XFF</span>' : '';
+    h += '<tr><td>' + aesc((r.t||'').replace('T',' ')) + '</td><td>' + aesc(r.ip) + xf +
+         '</td><td>' + aesc(r.where||'') + '</td><td>' + aesc(r.m + ' ' + r.p) +
+         '</td><td' + sc + '>' + r.s + '</td><td>' + (r.au ? '是' : '<b>否</b>') +
+         '</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">' +
+         aesc(shortUA(r.ua)) + '</td></tr>';
+  }
+  if (!(ev.events||[]).length) h += '<tr><td colspan="7" class="empty">暂无记录</td></tr>';
+  h += '</tbody></table></div>';
+
+  document.getElementById('access-body').innerHTML = h;
+}
+
+function stat(label, v){
+  return '<div class="stat"><div class="label">' + label + '</div>' +
+         '<div class="value">' + (v==null?'--':v) + '</div></div>';
+}
+
+function btnSm(label, on, action){
+  return '<span onclick="' + action + '" style="display:inline-block;cursor:pointer;' +
+    'padding:4px 11px;border-radius:12px;font-size:12px;margin-right:6px;' +
+    'background:' + (on ? '#2962ff' : '#2a2d39') + ';color:' + (on ? '#fff' : '#aaa') +
+    '">' + label + '</span>';
+}
+
+// UA 完整字串太长, 表格里只需认出是什么东西在访问
+function shortUA(ua){
+  if (!ua) return '';
+  const pairs = [['iPhone','iPhone'],['iPad','iPad'],['Android','Android'],
+                 ['Macintosh','Mac'],['Windows','Windows'],['Linux','Linux'],
+                 ['curl','curl'],['python','脚本'],['bot','爬虫'],['Bot','爬虫']];
+  for (const [k, v] of pairs) if (ua.indexOf(k) >= 0) return v;
+  return ua.slice(0, 30);
 }
 
 refresh();
