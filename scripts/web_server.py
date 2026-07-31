@@ -32,8 +32,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from action_page import (ACTION_HTML, build_recommend, build_today,  # noqa: E402
-                         list_profiles)
+from action_page import (ACTION_HTML, _exec_window, build_recommend,  # noqa: E402
+                         build_today, list_profiles)
 from live_config import (DEFAULT_PROFILE, PROFILES, capital_of,  # noqa: E402
                          display_name, init_args, is_auto, is_locked,
                          set_auto, set_capital, set_name, signal_args,
@@ -323,7 +323,9 @@ async def api_plan():
     p = _latest_plan()
     if not p:
         return JSONResponse({"error": "尚无计划文件"}, status_code=404)
-    return p
+    # 计划里的 exec_hint 是生成那一刻写下的"下一交易日尾盘", 第二天看就变成
+    # 误导。这里按"现在"重算一份, 与首页同一个函数, 两个页面不会口径不一。
+    return {**p, "exec_window": _exec_window(p.get("config") or {}, p)}
 
 
 @app.post("/api/signal")
@@ -1344,7 +1346,7 @@ function renderPipeline(p) {
 function renderPlan(p) {
   let html = `<div style="font-size:14px;margin-bottom:8px">
     <span class="pill">信号日: ${p.signal_date}</span>
-    <span class="pill">执行: ${p.exec_hint}</span>
+    <span class="pill">执行: ${(p.exec_window && p.exec_window.when_text) || p.exec_hint}</span>
     <span class="pill">总资产: ¥${(p.equity||0).toLocaleString()}</span>
     <span class="pill">大盘广度: ${((p.breadth||0)*100).toFixed(1)}%</span>
     <span class="pill">择时: ${p.in_cash?'空仓':'持仓'}</span>

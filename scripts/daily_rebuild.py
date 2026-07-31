@@ -39,6 +39,7 @@ STATUS_PATH = LIVE / "pipeline_status.json"
 # live_signal 的参数统一从 live_config 取 —— 禁止在此处硬编码。
 # 一旦这里和网页/命令行用的参数不一致, live_signal 的指纹校验会直接报错退出,
 # 而它发生在收盘后无人值守的时段, 不容易发现。
+import trading_calendar  # noqa: E402
 from live_config import PROFILES, signal_args  # noqa: E402
 
 status = {"started_at": None, "finished_at": None, "ok": False,
@@ -184,6 +185,20 @@ def main():
     k_max = kline_max_date()
     status["kline_max_date"] = str(pd.Timestamp(k_max).date()) if k_max is not None else None
     log(f"K线最新交易日: {status['kline_max_date']}")
+
+    # ── 1.5 交易日历缓存 ──
+    # 网页要靠它算"这份计划该今天还是明天执行"。放在非交易日提前退出之前,
+    # 这样即使当天不开市也会把日历补上。整块 try 兜住: 日历抓不到只是页面
+    # 少显示一个具体日期, 绝不能因此让当晚的信号出不来。
+    try:
+        ok_cal = trading_calendar.ensure_fresh()
+        _cal_days, _cal_meta = trading_calendar.load()
+        stage("trading_calendar", ok=bool(ok_cal),
+              covers_to=(_cal_meta or {}).get("last"),
+              fetched_at=(_cal_meta or {}).get("fetched_at"))
+    except Exception as e:
+        log(f"WARN 交易日历环节异常(不影响出信号): {e}")
+        stage("trading_calendar", ok=False, error=str(e)[:300])
 
     # ── 2. 非交易日/数据未更新 -> 干净退出 ──
     if (not a.force and before_train is not None and k_max is not None

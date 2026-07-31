@@ -19,14 +19,94 @@ from pathlib import Path
 
 import pandas as pd
 
+import trading_calendar
 from live_config import (DEFAULT_PROFILE, PROFILES, capital_of, display_name,
                          is_auto, is_locked, state_file)
 
-# 尾盘集合竞价前的下单窗口; t1open 则是次日开盘
-EXEC_WHEN = {
-    "t1close": "下一个交易日 14:50–15:00 (尾盘)",
-    "t1open":  "下一个交易日 09:30 (开盘)",
+# 各 exec_mode 的下单窗口 (北京时间的时:分)。
+#   t1close -> 尾盘集合竞价前那十分钟
+#   t1open  -> 开盘
+# 只描述"几点", 不含"哪天" —— 哪天必须靠交易日历现算, 见 _exec_window。
+EXEC_SLOT = {
+    "t1close": {"start": (14, 50), "end": (15, 0), "label": "14:50–15:00 (尾盘)"},
+    "t1open":  {"start": (9, 30), "end": (9, 35), "label": "09:30 (开盘)"},
 }
+
+WEEKDAY_CN = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def _exec_window(cfg, plan, now=None):
+    """算出这份计划到底哪天执行、现在处于窗口的哪个阶段。
+
+    原来这里写死"下一个交易日", 于是第二天早上打开页面, 明明该今天下单,
+    页面还在说"明天" —— 甚至周五出的信号执行日是下周一, "明天"是双重错误。
+
+    执行日 = 信号日之后的第一个交易日。未来交易日只能查官方日历:
+    按"周一到周五"推会在长假前后说早好几天 (2026 国庆有 5 个工作日不开市)。
+
+    日历缺失时不猜日期, 退回"下一个交易日"这种含糊但不会错的说法。
+    宁可说得含糊, 也不能把日期说错 —— 用户是照着这行字去下单的。
+    """
+    now = now or datetime.now()
+    mode = cfg.get("exec_mode") or "t1close"
+    slot = EXEC_SLOT.get(mode) or EXEC_SLOT["t1close"]
+    sig = (plan or {}).get("signal_date")
+
+    days, _meta = trading_calendar.load()
+    exec_d = trading_calendar.next_trading_day(sig, days) if sig else None
+
+    out = {
+        "exec_mode": mode,
+        "slot_label": slot["label"],
+        "exec_date": str(exec_d) if exec_d else None,
+        "rel": "unknown",          # today / tomorrow / future / passed / unknown
+        "phase": "unknown",        # before / open / after / unknown
+        "day_text": "下一个交易日",  # "今天" / "明天" / "8月3日(周一)" / 兜底
+        # when_text 是给人照着做的那一行, 所以必须自带日期语境
+        "when_text": f"下一个交易日 {slot['label']}",
+        "note": "",
+    }
+    if exec_d is None:
+        # 日历不可用: 保持原来的含糊说法, 但明确告诉用户为什么没有具体日期
+        out["note"] = "交易日历缓存不可用, 无法确定具体执行日"
+        return out
+
+    today = now.date()
+    delta = (exec_d - today).days
+    if delta == 0:
+        out["rel"], out["day_text"] = "today", "今天"
+    elif delta == 1:
+        out["rel"], out["day_text"] = "tomorrow", "明天"
+    elif delta > 1:
+        out["rel"] = "future"
+        out["day_text"] = f"{exec_d.month}月{exec_d.day}日({WEEKDAY_CN[exec_d.weekday()]})"
+    else:
+        out["rel"] = "passed"
+        out["day_text"] = f"{exec_d.month}月{exec_d.day}日({WEEKDAY_CN[exec_d.weekday()]})"
+
+    out["when_text"] = f"{out['day_text']} {slot['label']}"
+
+    # 窗口阶段只在"执行日就是今天"时才有意义; 其他日子谈几点没用
+    if out["rel"] == "today":
+        cur = (now.hour, now.minute)
+        if cur < slot["start"]:
+            out["phase"] = "before"
+            mins = ((slot["start"][0] * 60 + slot["start"][1])
+                    - (now.hour * 60 + now.minute))
+            out["note"] = (f"还有 {mins // 60} 小时 {mins % 60} 分钟"
+                           if mins >= 60 else f"还有 {mins} 分钟")
+        elif cur < slot["end"]:
+            out["phase"] = "open"
+            out["note"] = "下单窗口就是现在"
+        else:
+            out["phase"] = "after"
+            out["note"] = "今天的下单窗口已过"
+    elif out["rel"] == "passed":
+        out["phase"] = "after"
+        out["note"] = f"执行日 {exec_d} 已过去"
+    else:
+        out["phase"] = "before"
+    return out
 
 
 def _load_json(p: Path):
@@ -138,6 +218,7 @@ def build_recommend(root: Path, pid=None):
 
     held = {str(h.get("code"))[:6] for h in ((plan or {}).get("hold") or [])}
     buying = {str(b.get("code"))[:6] for b in ((plan or {}).get("buy") or [])}
+    _rec_win = _exec_window((plan or {}).get("config") or {}, plan)
 
     rows = []
     for r in rec:
@@ -162,8 +243,8 @@ def build_recommend(root: Path, pid=None):
         "auto": is_auto(pid),
         "profiles": list_profiles(),
         "signal_date": (plan or {}).get("signal_date"),
-        "exec_when": EXEC_WHEN.get(((plan or {}).get("config") or {}).get("exec_mode", "t1close"),
-                                   "下一个交易日尾盘"),
+        "exec_when": _rec_win["when_text"],
+        "exec_day_text": _rec_win["day_text"],
         "per_slot_budget": round(budget, 0) if budget else None,
         "positions": n,
         "items": rows,
@@ -190,6 +271,8 @@ def build_today(root: Path, pid=None):
 
     cfg = state.get("config") or {}
     fresh = _freshness(root, state, plan)
+    # 执行日与窗口阶段按"现在"实时算, 不能沿用计划里写死的"下一交易日"
+    win = _exec_window(cfg, plan)
     sell = list((plan or {}).get("sell") or [])
     buy = list((plan or {}).get("buy") or [])
 
@@ -278,7 +361,8 @@ def build_today(root: Path, pid=None):
         subline = f"卖出 {len(sell)} 只, 买入 {len(buy)} 只"
     else:
         action = "none"
-        headline = "明天不用操作"
+        # 不能写死"明天" —— 第二天打开页面时那个"明天"已经是今天了
+        headline = f"{win['day_text']}不用操作"
         subline = f"继续持有 {len(hold)} 只, 到期自动提示卖出" if hold else "当前空仓, 等待下个换仓日"
 
     nxt_date, nxt_left = _next_rebal(state, plan)
@@ -328,7 +412,9 @@ def build_today(root: Path, pid=None):
         "headline": headline,
         "subline": subline,
         "signal_date": (plan or {}).get("signal_date"),
-        "exec_when": EXEC_WHEN.get(cfg.get("exec_mode", "t1close"), "下一个交易日尾盘"),
+        # exec_when 保留成字符串供旧前端用; exec_window 是结构化的全部信息
+        "exec_when": win["when_text"],
+        "exec_window": win,
         "is_rebal": is_rebal,
         "in_cash": in_cash,
         # 换仓日的资金链: 现有现金 + 卖出所得 = 买入可用。
@@ -516,6 +602,12 @@ ACTION_HTML = """<!DOCTYPE html>
   .banner .sl{font-size:14px;margin-top:6px;opacity:.85}
   .banner .when{font-size:13px;margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,.18)}
   .banner .when b{font-weight:600}
+  /* 下单窗口就是现在 / 已错过, 两种都不能让人一眼滑过去。
+     在彩色横幅上用底色而不是改字色 —— 横幅本身就是蓝/橙渐变, 改字色根本看不出来 */
+  .banner .when-now{background:rgba(252,211,77,.22);border-radius:8px;
+                    padding:10px 10px 8px;margin-top:12px;font-weight:600}
+  .banner .when-past{background:rgba(0,0,0,.28);border-radius:8px;
+                     padding:10px 10px 8px;margin-top:12px}
   .b-none{background:linear-gradient(135deg,#14532d,#1a7a43);color:#eafff2}
   .b-trade{background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#eef4ff}
   .b-cash{background:linear-gradient(135deg,#7c2d12,#ea580c);color:#fff5ec}
@@ -545,6 +637,7 @@ ACTION_HTML = """<!DOCTYPE html>
   .op.sell .line1 .tag{background:#7f1d1d;color:#fecaca}
   .op.buy .line1 .tag{background:#14532d;color:#bbf7d0}
   .op .line2{font-size:13px;color:#8a93a6;margin-top:3px}
+  .op .when{font-size:13px;color:#8a93a6;margin-top:8px}
   .op .amt{font-size:15px;font-weight:600;color:#c9cdd6;flex:0 0 auto;text-align:right}
 
   .hold-row{display:flex;justify-content:space-between;align-items:center;
@@ -752,7 +845,9 @@ function holdRow(r){
 function recRow(r){
   const chips = []
   if (r.held)   chips.push('<span class="chip chip-hold">持有中</span>');
-  if (r.buying) chips.push('<span class="chip chip-buy">明天买</span>');
+  // 不写死"明天买": 第二天看就错了。用后端算好的相对说法
+  if (r.buying) chips.push('<span class="chip chip-buy">' +
+    ((LASTD && LASTD.exec_day_text) ? esc(LASTD.exec_day_text) + '买' : '计划买入') + '</span>');
   if (!r.affordable) chips.push('<span class="chip chip-no">买不起一手</span>');
   if (r.blocked) chips.push('<span class="chip chip-blk">急涨回避</span>');
   return `<div class="rec ${r.rank<=3?'top3':''}">
@@ -1240,6 +1335,7 @@ async function loadRec(){
   catch(e){ $('#app').innerHTML = '<div class="warn">无法连接服务器</div>'; return; }
 
   PID = d.profile; PROFS = d.profiles || PROFS; renderProfs(PID);
+  LASTD = d;                     // recRow 要用 exec_day_text 拼"X日买"标签
   $('#sigdate').textContent = d.signal_date ? ('信号日 ' + d.signal_date) : '';
   $('#gen').textContent = '';
 
@@ -1253,7 +1349,7 @@ async function loadRec(){
 
   h += `<div class="card"><h2>怎么看这个榜</h2>
     <div style="font-size:13px;color:#8a93a6;line-height:1.9">
-      这是模型对未来 5 日涨幅的预测排序，<b style="color:#c9cdd6">不等于明天要买的清单</b>。<br>
+      这是模型对未来 5 日涨幅的预测排序，<b style="color:#c9cdd6">不等于要买的清单</b>。<br>
       实际买入只发生在换仓日，且只买前 ${d.positions} 名里买得起的。<br>
       当前每只预算 <b style="color:#c9cdd6">${money(d.per_slot_budget)}</b>，
       标了“买不起一手”的股票 100 股就超过这个预算，会被自动跳过。
@@ -1296,9 +1392,14 @@ async function loadAct(){
   h += `<div class="banner ${bcls}">
       <div class="hl">${d.headline}</div>
       <div class="sl">${d.subline||''}</div>`;
-  if (d.action === 'trade' || d.action === 'cash')
-    h += `<div class="when">执行时间 <b>${d.exec_when}</b></div>`;
-  else if (d.action === 'none' && d.next_rebal && d.next_rebal.trading_days_left != null)
+  if (d.action === 'trade' || d.action === 'cash'){
+    // 窗口阶段决定语气: 就是现在 -> 催你下单; 已过 -> 必须警示,
+    // 否则晚上看到"执行时间 今天 14:50"会以为还能下单
+    const w = d.exec_window || {};
+    const cls = w.phase === 'open' ? ' when-now' : (w.phase === 'after' ? ' when-past' : '');
+    h += `<div class="when${cls}">执行时间 <b>${d.exec_when}</b>` +
+         (w.note ? ` · ${w.note}` : '') + `</div>`;
+  } else if (d.action === 'none' && d.next_rebal && d.next_rebal.trading_days_left != null)
     h += `<div class="when">下次换仓 <b>${d.next_rebal.date || ('还有 ' + d.next_rebal.trading_days_left + ' 个交易日')}</b></div>`;
   h += `</div>`;
 
@@ -1317,8 +1418,15 @@ async function loadAct(){
         这条线是<b>实盘模式</b>：<b>打勾的才会记入系统</b>，没打勾的就当没成交。<br>
         勾上后可以改成真实股数和成交价 —— <b>只成交了一部分就改股数</b>。</div>`;
     } else if (!d.auto){
-      h += `<div class="tipbox">实盘模式：${d.exec_when}下单后，
-        <b>执行日当晚数据更新完</b>再回来打勾确认。现在还没到时候，先照着做即可。</div>`;
+      // 同样一句提示, 在窗口已过时意思完全不同: 不是"还没到时候",
+      // 而是"今天已经该下完了, 等晚上回来确认"
+      const w = d.exec_window || {};
+      h += w.phase === 'after'
+        ? `<div class="tipbox warn-tip">实盘模式：<b>${w.note||'下单窗口已过'}</b>。
+            若已照上面下单，等<b>今晚数据更新完</b>再回来打勾确认；
+            若没下单，到时选「一笔都没成交」即可。</div>`
+        : `<div class="tipbox">实盘模式：${d.exec_when}下单后，
+            <b>执行日当晚数据更新完</b>再回来打勾确认。现在还没到时候，先照着做即可。</div>`;
     } else {
       h += `<div class="tipbox">纸面模式：系统会<b>按行情自动记账</b>，不用打勾。<br>
         想按你的真实成交来记账，就点上面的「取消自动操作」。</div>`;
