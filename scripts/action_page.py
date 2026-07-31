@@ -19,8 +19,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from live_config import (DEFAULT_PROFILE, PROFILES, display_name, is_auto,
-                         is_locked, state_file)
+from live_config import (DEFAULT_PROFILE, PROFILES, capital_of, display_name,
+                         is_auto, is_locked, state_file)
 
 # 尾盘集合竞价前的下单窗口; t1open 则是次日开盘
 EXEC_WHEN = {
@@ -104,7 +104,9 @@ def _freshness(root: Path, state, plan):
 def list_profiles():
     """给前端做切换用的简表"""
     return [{"id": k, "name": display_name(k), "default_name": v["name"],
-             "capital": v["capital"], "positions": v["tranche-n"],
+             # capital 用生效值而不是代码默认值 —— 网页上重置时可能改过
+             "capital": capital_of(k), "default_capital": v["capital"],
+             "positions": v["tranche-n"],
              "desc": v["desc"], "auto": is_auto(k), "locked": is_locked(k)}
             for k, v in PROFILES.items()]
 
@@ -130,7 +132,7 @@ def build_recommend(root: Path, pid=None):
     equity = float(st.get("cash") or 0) + sum(
         (l.get("shares") or 0) * (l.get("buy_price") or 0) for l in (st.get("lots") or []))
     if equity <= 0:
-        equity = (plan or {}).get("equity") or prof["capital"]
+        equity = (plan or {}).get("equity") or capital_of(pid)
     n = prof["tranche-n"]
     budget = equity / n if n else None
 
@@ -206,13 +208,32 @@ def build_today(root: Path, pid=None):
 
     cal = [str(pd.Timestamp(d).date()) for d in (state.get("calendar") or [])]
 
-    def _held_days(lot):
-        """已持有的换仓周期数; 日历缺失或对不上时返回 None 而不是编一个数"""
-        osd = lot.get("open_signal_date")
+    def _days_since(lot, key):
+        """从 lot[key] 那天到信号日走了多少个交易日。
+
+        持有时长一律按交易日而不是自然日 —— 标签 fwd_5d_ret 就是在只含
+        交易日的面板上上移 5 行算的, 持有期必须与标签 horizon 同口径。
+        日历缺失或对不上时返回 None 而不是编一个数。
+        """
+        d = lot.get(key)
         sig = (plan or {}).get("signal_date")
-        if not osd or not sig or osd not in cal or sig not in cal:
+        if not d or not sig or d not in cal or sig not in cal:
             return None
-        return cal.index(sig) - cal.index(osd)
+        return cal.index(sig) - cal.index(d)
+
+    def _held_days(lot):
+        """到期时钟: 还有几天该评估它 (续持会归零)"""
+        return _days_since(lot, "open_signal_date")
+
+    def _tenure_days(lot):
+        """真实持有时长: 从最初开仓那天算起, 续持不清零。
+
+        没有 first_open_signal_date 的是续持功能上线前建的仓, 此时
+        两者本就相等, 退回 open_signal_date 即为正确答案。
+        """
+        if lot.get("first_open_signal_date"):
+            return _days_since(lot, "first_open_signal_date")
+        return _days_since(lot, "open_signal_date")
 
     hold = []
     for lot in (state.get("lots") or []):
@@ -230,7 +251,13 @@ def build_today(root: Path, pid=None):
             "shares": lot.get("shares") or 0,
             "ref_close": ref,
             "pnl_pct": pnl,
+            # 两个天数回答不同问题, 所以都给:
+            #   held_days   -> 什么时候会动它 (到期时钟, 续持归零)
+            #   tenure_days -> 这笔一共拿了多久 (只增不减)
+            # 只显示前者会让续持过的仓看起来像刚买的。
             "held_days": ph.get("held_days", _held_days(lot)),
+            "tenure_days": ph.get("tenure_days", _tenure_days(lot)),
+            "n_rolled": ph.get("n_rolled", int(lot.get("rolled") or 0)),
         })
     in_cash = bool((plan or {}).get("in_cash"))
     is_rebal = bool((plan or {}).get("is_rebal"))
@@ -275,6 +302,8 @@ def build_today(root: Path, pid=None):
             "amount": round(sh * px, 0) if px else None,
             "pnl_pct": r.get("pnl_pct"),
             "held_days": r.get("held_days"),
+            "tenure_days": r.get("tenure_days"),
+            "n_rolled": r.get("n_rolled"),
             # 卖出预估到账金额(已扣手续费)。换仓日的买入靠这笔钱,
             # 所以界面上要把这个链条显示出来
             "est_proceeds": r.get("est_proceeds"),
@@ -437,6 +466,10 @@ ACTION_HTML = """<!DOCTYPE html>
   .opt.on{border-color:#2563eb;background:#161c2b}
   .opt .ot{font-size:14px;font-weight:600;color:#e8eaed}
   .opt .od{font-size:12px;color:#8a93a6;line-height:1.6;margin-top:3px}
+  /* 改账里最重的操作(清零重建)用警示色, 与其他按钮拉开距离 */
+  .btn-danger{background:#3b1518;border-color:#5b1f24;color:#fca5a5}
+  .btn-danger:active{background:#5b1f24}
+  .modal label.fl{display:block;font-size:12px;color:#8a93a6;margin:10px 0 5px}
   /* 基准线的说明框 (占住原本按钮组的位置) */
   .lockbox{background:#0b0d12;border:1px solid #262c38;border-radius:9px;
            padding:10px 12px;font-size:12px;color:#8a93a6;line-height:1.7}
@@ -684,6 +717,23 @@ function tickRow(id){
   refreshMoney();
 }
 
+// 持仓行的天数: 主显示真实持有时长(只增不减), 另外给出到期倒计时。
+// 只显示到期时钟会让续持过的仓看起来像刚买的(续持会把它归零);
+// 只显示真实时长则看不出哪天该操作。所以两个都要。天数一律是交易日。
+function holdMeta(r){
+  const parts = [r.shares + ' 股'];
+  const t = r.tenure_days != null ? r.tenure_days : r.held_days;
+  parts.push('已持 ' + (t == null ? '--' : t) + ' 日');
+  if (r.n_rolled) parts.push('续持 ' + r.n_rolled + ' 次');
+  // 到期倒计时: hold_days 未知或天数缺失时干脆不显示, 不编数字
+  const H = ((LASTD || {}).strategy || {}).hold_days;
+  if (H && r.held_days != null){
+    const left = H - r.held_days;
+    parts.push(left <= 0 ? '已到期' : '还剩 ' + left + ' 日到期');
+  }
+  return parts.join(' · ');
+}
+
 function holdRow(r){
   const p = r.pnl_pct;
   const cls = p == null ? '' : (p >= 0 ? 'pos' : 'neg');
@@ -691,7 +741,7 @@ function holdRow(r){
   return `<div class="hold-row">
     <div style="flex:1;min-width:0">
       <div class="nm">${esc(r.name||r.code)} <span style="color:#6f7889;font-size:12px">${r.code}</span></div>
-      <div class="meta">${r.shares} 股 · 已持 ${r.held_days==null?'--':r.held_days} 日</div></div>
+      <div class="meta">${holdMeta(r)}</div></div>
     <div class="${cls}" style="text-align:right;font-weight:600">${sign}${p==null?'--':p+'%'}
          <div class="meta">${money(r.amount)}</div></div>
     ${curProf().locked ? '' : `<div class="del" title="删除这笔持仓"
@@ -828,7 +878,8 @@ function renderActs(){
       ? `<div class="btn btn-off" onclick="askAuto(false)">取消自动操作</div>`
       : `<div class="btn btn-on"  onclick="askAuto(true)">开启自动操作</div>`}
     <div class="btn" onclick="askSetCash()">校准现金</div>
-    <div class="btn" onclick="askCashFlow()">存取现金</div>`;
+    <div class="btn" onclick="askCashFlow()">存取现金</div>
+    <div class="btn btn-danger" onclick="askReset()">从头再来</div>`;
 }
 
 function acctBox(){
@@ -993,6 +1044,82 @@ async function doDrop(){
   }
 }
 
+// ── 从头再来 ──
+// 改账操作里最重的一个: 等于把这条线的历史业绩清零。所以
+//   1. 先把"将要失去什么"摊开给人看 (总资产/盈亏/持仓/成交笔数)
+//   2. 必须勾选确认才能点确定, 防误触
+//   3. 本金和重置放在同一个动作里 —— 本金只在重置时作为起始现金生效,
+//      单独改它不会有任何效果, 分成两个按钮只会让人以为改了其实没改
+function askReset(){
+  const p = curProf();
+  const pnl = ACCT.total_pnl, pct = ACCT.total_return_pct;
+  const cls = pnl == null ? '' : (pnl >= 0 ? 'pos' : 'neg');
+  $('#modal').innerHTML = `
+    <div class="mask" onclick="if(event.target===this)closeModal()">
+      <div class="modal">
+        <h3>从头再来 · ${esc(p.name)}</h3>
+        <div class="cur">
+          即将<b style="color:#fca5a5">清零</b>以下记录：<br>
+          持仓 <b style="color:#c9cdd6">${ACCT.positions ? ACCT.positions.length : 0} 只</b> ·
+          总资产 <b style="color:#c9cdd6">${money(ACCT.equity)}</b><br>
+          累计盈亏 <b class="${cls}">${pnl == null ? '--' : (pnl >= 0 ? '+' : '') + money(pnl)}</b>
+          ${pct == null ? '' : `(${pct >= 0 ? '+' : ''}${pct}%)`}
+        </div>
+        <p>持仓与历史成交全部清空，现金回到本金，然后<b>立刻重新建仓</b>。<br>
+           旧账会归档到 <code>data/live/archive/</code>，不是直接删掉。</p>
+        <label class="fl">本金</label>
+        <input type="number" id="rscap" step="1000" min="5000" inputmode="numeric"
+               value="${p.capital}">
+        <div class="hint">不改就保持 ${money(p.capital)}。每只预算 = 本金 ÷ ${p.positions} 只。
+          <span id="rsbud"></span></div>
+        <div class="opt" id="rsack" onclick="ackReset()" style="margin-top:12px">
+          <div class="ot">我知道这会清零历史业绩</div>
+          <div class="od">这条线过去的成交记录与收益都不再计入。基准线不受影响，
+            仍按原本金继续跑。</div>
+        </div>
+        <div class="err" id="rserr"></div>
+        <div class="mbtns">
+          <div class="btn" onclick="closeModal()">取消</div>
+          <div class="btn btn-danger" id="rsok" aria-disabled="true"
+               onclick="doReset()">清零并重新建仓</div>
+        </div>
+      </div>
+    </div>`;
+  const upd = () => {
+    const v = parseFloat(($('#rscap') || {}).value);
+    const b = $('#rsbud');
+    if (b) b.textContent = (v > 0 && p.positions)
+      ? `按现在填的值是每只 ${money(v / p.positions)}。` : '';
+  };
+  const i = $('#rscap');
+  if (i){ i.oninput = upd; }
+  upd();
+}
+
+function ackReset(){
+  const box = $('#rsack');
+  if (box) box.classList.add('on');
+  const ok = $('#rsok');
+  if (ok) ok.setAttribute('aria-disabled', 'false');
+}
+
+async function doReset(){
+  const e = $('#rserr');
+  if ($('#rsok').getAttribute('aria-disabled') !== 'false'){
+    if (e) e.textContent = '请先勾选上面那行确认'; return;
+  }
+  const v = parseFloat(($('#rscap') || {}).value);
+  if (!(v >= 5000)){ if (e) e.textContent = '本金至少 5,000'; return; }
+  try {
+    const d = await api('/api/profile/reset', {profile: PID, capital: v});
+    closeModal();
+    toast(`已清零，正在按本金 ${money(d.capital)} 重新建仓…`, 6000);
+    pollRun('已重新建仓，新计划已生成');
+  } catch(err){
+    if (e) e.textContent = err.message; else toast(err.message, 6000);
+  }
+}
+
 function askRename(){
   const p = curProf();
   $('#modal').innerHTML = `
@@ -1089,21 +1216,21 @@ async function submitTicked(none){
   } catch(e){ toast('提交失败: ' + e.message, 8000); }
 }
 
-// 结算要跑一遍模型, 轮询到跑完再刷新页面
-async function pollRun(){
+// 结算/重置都要跑一遍模型, 轮询到跑完再刷新页面
+async function pollRun(okMsg){
   for (let i = 0; i < 90; i++){
     await new Promise(r => setTimeout(r, 2000));
     let s;
     try { s = await (await fetch('/api/signal-status')).json(); } catch(e){ continue; }
     if (!s.active){
       const log = s.log || '';
-      if (/ERROR|Traceback/.test(log)) toast('结算报错, 详情见运维仪表盘', 6000);
-      else toast('已结算并生成新计划', 4000);
+      if (/ERROR|Traceback/.test(log)) toast('后台任务报错, 详情见运维仪表盘', 6000);
+      else toast(okMsg || '已结算并生成新计划', 4000);
       load();
       return;
     }
   }
-  toast('结算耗时偏长, 请稍后刷新');
+  toast('耗时偏长, 请稍后刷新');
 }
 
 async function loadRec(){

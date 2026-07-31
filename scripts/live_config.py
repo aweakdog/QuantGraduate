@@ -158,9 +158,15 @@ PREDS_CACHE_PATH = Path(__file__).resolve().parents[1] / "data" / "live" / "pred
 # auto=True  : 按 T+1 真实行情自动记账 (纸面跟踪, 默认)
 # auto=False : 实盘模式 —— 不自动记账, 等你填真实成交价才入账。
 #              这条线会停在"待确认成交"状态, 不会自动往前推进。
-DEFAULT_SETTING = {"name": None, "auto": True}
+# capital=None: 用 PROFILES 里的代码默认值; 非 None 则是网页上重置时改过的本金。
+DEFAULT_SETTING = {"name": None, "auto": True, "capital": None}
 
 NAME_MAX = 16
+
+# 本金的合理区间。下限不是拍的: 一个槽位连最便宜的股票一手(100股)都买
+# 不起的话, 策略根本无法运行。上限只是防手抖多敲一个 0。
+CAPITAL_MIN = 5000.0
+CAPITAL_MAX = 10_000_000.0
 
 
 def load_settings():
@@ -174,8 +180,15 @@ def load_settings():
     out = {}
     for pid, v in raw.items():
         if pid in PROFILES and isinstance(v, dict):
+            try:
+                cap = float(v["capital"]) if v.get("capital") is not None else None
+            except (TypeError, ValueError):
+                cap = None
+            if cap is not None and not (CAPITAL_MIN <= cap <= CAPITAL_MAX):
+                cap = None          # 设置文件被手改坏了 -> 退回代码默认
             out[pid] = {"name": v.get("name") or None,
-                        "auto": bool(v.get("auto", True))}
+                        "auto": bool(v.get("auto", True)),
+                        "capital": cap}
     return out
 
 
@@ -211,6 +224,38 @@ def is_auto(pid):
     if is_locked(pid):
         return True
     return setting(pid)["auto"]
+
+
+def capital_of(pid):
+    """该条线当前的本金 —— 网页上“从头再来”改过就用改过的。
+
+    本金不在 FINGERPRINT_KEYS 里, 所以改它不会与已有持仓冲突; 但它只在
+    --init 时生效(作为起始现金), 所以光改它不重置是没用的 —— 因此
+    set_capital 只由重置接口调用。
+
+    基准线永远用代码里的值: 它就该一直待在那里不动。
+    """
+    if pid not in PROFILES:
+        raise KeyError(pid)
+    if is_locked(pid):
+        return float(PROFILES[pid]["capital"])
+    return float(setting(pid)["capital"] or PROFILES[pid]["capital"])
+
+
+def set_capital(pid, cap):
+    """改本金。仅供重置流程调用 —— 单独改它不会影响已建立的账。"""
+    if pid not in PROFILES:
+        raise KeyError(pid)
+    if is_locked(pid):
+        raise PermissionError(f"{PROFILES[pid]['name']} 是基准线, 本金固定不可改")
+    cap = float(cap)
+    if not (CAPITAL_MIN <= cap <= CAPITAL_MAX):
+        raise ValueError(
+            f"本金要在 {CAPITAL_MIN:,.0f} ~ {CAPITAL_MAX:,.0f} 之间")
+    s = load_settings()
+    s.setdefault(pid, dict(DEFAULT_SETTING))["capital"] = cap
+    save_settings(s)
+    return cap
 
 
 def set_name(pid, name):
@@ -268,7 +313,7 @@ def signal_args(pid, include_features=True):
 
 def init_args(pid):
     """首次建立(或重置)该条线的参数 —— 会清空持仓记录"""
-    return signal_args(pid) + ["--capital", str(PROFILES[pid]["capital"]), "--init"]
+    return signal_args(pid) + ["--capital", str(capital_of(pid)), "--init"]
 
 
 if __name__ == "__main__":
@@ -288,7 +333,9 @@ if __name__ == "__main__":
             nm = display_name(pid)
             alias = "" if nm == p["name"] else f"  [原名 {p['name']}]"
             print(f"{pid:10s} {nm}{mark}{alias}")
-            print(f"           本金 {p['capital']:,.0f} / {p['tranche-n']} 只 / "
-                  f"每只预算 {p['capital']/p['tranche-n']:,.0f}")
+            cap = capital_of(pid)
+            changed = "" if cap == p["capital"] else f"  [代码默认 {p['capital']:,.0f}]"
+            print(f"           本金 {cap:,.0f}{changed} / {p['tranche-n']} 只 / "
+                  f"每只预算 {cap/p['tranche-n']:,.0f}")
             print(f"           记账 {'自动(按行情)' if is_auto(pid) else '手动(等确认成交)'}")
             print(f"           状态 {state_file(pid)}")

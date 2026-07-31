@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -33,9 +34,10 @@ from fastapi.middleware.cors import CORSMiddleware
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from action_page import (ACTION_HTML, build_recommend, build_today,  # noqa: E402
                          list_profiles)
-from live_config import (DEFAULT_PROFILE, PROFILES, display_name,  # noqa: E402
-                         is_auto, is_locked, set_auto, set_name,
-                         signal_args, state_file)
+from live_config import (DEFAULT_PROFILE, PROFILES, capital_of,  # noqa: E402
+                         display_name, init_args, is_auto, is_locked,
+                         set_auto, set_capital, set_name, signal_args,
+                         state_file)
 
 # ── 路径 ──
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,6 +95,30 @@ def _ops_deny():
             {"error": "服务器未设置 QUANT_OPS_PASSWORD, 所有改账操作已禁用",
              "need_password": False}, status_code=503)
     return JSONResponse({"error": "需要密码", "need_password": True}, status_code=401)
+
+
+def _archive_profile(pid):
+    """重置前把旧状态和旧计划挪进 archive/, 而不是直接删。
+
+    重置等于把这条线的历史业绩清零, 是所有改账操作里最重的一个。留一份
+    归档, 出问题时还能回溯"重置前到底是什么样"。
+
+    状态用复制(留原件给 --init 覆盖), 计划用移动(旧计划必须从 live/ 消失,
+    否则页面会把上一轮的挂单当成这一轮的)。
+    """
+    arc = LIVE_DIR / "archive"
+    arc.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = {"state": None, "plans": 0}
+    src = LIVE_DIR / state_file(pid)
+    if src.exists():
+        dst = arc / f"{src.stem}_{ts}.json"
+        shutil.copy2(src, dst)
+        out["state"] = dst.name
+    for pp in LIVE_DIR.glob(f"plan_{pid}_*.json"):
+        shutil.move(str(pp), str(arc / f"{pp.stem}_{ts}.json"))
+        out["plans"] += 1
+    return out
 
 
 def _check_profile(pid, write=True):
@@ -249,13 +275,21 @@ async def api_status():
                 pass
         val = lot["shares"] * ref
         mv += val
-        held = None
+        # 两个天数都按交易日算, 但回答不同问题:
+        #   held_days   -> 到期时钟, 续持会归零 (决定什么时候动它)
+        #   tenure_days -> 真实持有时长, 只增不减 (这笔一共拿了多久)
+        held = tenure = None
         if cal and lot.get("open_signal_date"):
             try:
                 idx = pd.DatetimeIndex(cal)
-                i1 = int(idx.searchsorted(pd.Timestamp(lot["open_signal_date"]), side="right")) - 1
                 i2 = int(idx.searchsorted(ref_date, side="right")) - 1
-                held = max(0, i2 - i1)
+
+                def _pos(d):
+                    return int(idx.searchsorted(pd.Timestamp(d), side="right")) - 1
+
+                held = max(0, i2 - _pos(lot["open_signal_date"]))
+                first = lot.get("first_open_signal_date") or lot["open_signal_date"]
+                tenure = max(0, i2 - _pos(first))
             except Exception:
                 pass
         positions.append({
@@ -264,6 +298,7 @@ async def api_status():
             "last_close": round(ref, 3), "market_value": round(val, 2),
             "pnl_pct": round((ref / lot["buy_price"] - 1) * 100, 2),
             "open_date": lot.get("open_date"), "held_days": held,
+            "tenure_days": tenure, "n_rolled": int(lot.get("rolled") or 0),
         })
     cash = st.get("cash", 0)
     equity = cash + mv
@@ -873,6 +908,48 @@ async def api_confirm(req: Request):
     return {"ok": True, "profile": pid, "n_fills": len(clean),
             "confirm_file": cf.name,
             "note": "已提交, 正在结算并生成下一份计划 (约 30~60 秒)"}
+
+
+@app.post("/api/profile/reset")
+async def api_reset(req: Request):
+    """从头再来: 清空这条线的持仓与历史, 现金回到本金, 立刻重新建仓。
+
+    可顺便改本金 —— 本金不在指纹里, 但它只在 --init 时作为起始现金生效,
+    所以"改本金"和"重置"必须是同一个动作, 分开做没有意义。
+
+    旧状态与旧计划先归档到 data/live/archive/, 不是直接删。改账操作里这是
+    最重的一个 (等于把这条线的历史业绩清零), 必须留得下回溯的余地。
+
+    要跑完整模型出建仓计划, 约 30~60 秒, 所以走后台线程 + 轮询 /api/run-status。
+    """
+    if not _ops_ok(req):
+        return _ops_deny()
+    body = await req.json()
+    pid = body.get("profile")
+    if (bad := _check_profile(pid)) is not None:
+        return bad
+    if _running["active"]:
+        return JSONResponse({"error": "已有任务在跑, 请稍候"}, status_code=409)
+
+    # 本金: 不传 = 沿用当前值; 传了就先落盘, 让 init_args 取到新值
+    if body.get("capital") is not None:
+        try:
+            set_capital(pid, body["capital"])
+        except (TypeError, ValueError) as e:
+            return JSONResponse({"error": str(e) or "本金填得不对"}, status_code=400)
+        except PermissionError as e:
+            return JSONResponse({"error": str(e)}, status_code=403)
+
+    st = _state_of(pid) or {}
+    before = {"cash": st.get("cash"), "n_lots": len(st.get("lots") or []),
+              "initial_capital": st.get("initial_capital"),
+              "n_history": len(st.get("history") or [])}
+    archived = _archive_profile(pid)
+    cmd = [PY, "-u", SIGNAL_SCRIPT] + init_args(pid)
+    threading.Thread(target=_run_bg, args=(cmd, f"重置 {pid}"), daemon=True).start()
+    return {"ok": True, "profile": pid, "capital": capital_of(pid),
+            "archived": archived, "before": before,
+            "note": "已归档旧账, 正在按新本金重新建仓 (约 30~60 秒)"}
 
 
 def _cash_op(pid, extra, task):

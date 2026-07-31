@@ -33,7 +33,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from live_config import PROFILES, init_args, state_file  # noqa: E402
+from live_config import (PROFILES, capital_of, init_args,  # noqa: E402
+                         state_file)
 
 PY = sys.executable
 LIVE = ROOT / "data" / "live"
@@ -55,15 +56,16 @@ def show():
     print(f"{'profile':10s} {'名称':<10s} {'本金':>8s} {'只':>3s} {'状态':<10s} {'持仓':>4s} {'现金':>10s}")
     for pid, p in PROFILES.items():
         st = current(pid)
+        cap = capital_of(pid)
         if st is None:
-            print(f"{pid:10s} {p['name']:<10s} {p['capital']:>8,.0f} {p['tranche-n']:>3d} "
+            print(f"{pid:10s} {p['name']:<10s} {cap:>8,.0f} {p['tranche-n']:>3d} "
                   f"{'未建立':<10s} {'-':>4s} {'-':>10s}")
             continue
         if st.get("_broken"):
             print(f"{pid:10s} {p['name']:<10s} {'':>8s} {'':>3s} 损坏: {st['_broken'][:40]}")
             continue
         n = len(st.get("lots") or [])
-        print(f"{pid:10s} {p['name']:<10s} {p['capital']:>8,.0f} {p['tranche-n']:>3d} "
+        print(f"{pid:10s} {p['name']:<10s} {cap:>8,.0f} {p['tranche-n']:>3d} "
               f"{'已建立':<10s} {n:>4d} {st.get('cash', 0):>10,.0f}")
 
 
@@ -91,7 +93,7 @@ def init_one(pid, force):
         print(f"[{pid}] 已存在 (持仓 {n} 只, 现金 {st.get('cash', 0):,.0f}) — 跳过。"
               f"要归零请加 --force")
         return None
-    print(f"[{pid}] {PROFILES[pid]['name']}: 本金 {PROFILES[pid]['capital']:,.0f} / "
+    print(f"[{pid}] {PROFILES[pid]['name']}: 本金 {capital_of(pid):,.0f} / "
           f"{PROFILES[pid]['tranche-n']} 只")
     if st is not None:
         archive(pid)
