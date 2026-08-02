@@ -107,6 +107,13 @@ parser.add_argument("--load-preds", type=str, default=None,
 parser.add_argument("--features-from", type=str, default=None,
                     help="直接复用另一份回测 json 里的 selected_features (data/processed/ 下), "
                          "不现场筛选。用于隔离'数据变了'和'特征集变了'两个变量")
+parser.add_argument("--min-pred", type=float, default=0.0,
+                    help="建仓信号强度门槛: 只买 pred >= X 的候选(单位=预期5日超额收益,"
+                    " 如 0.005 = 0.5%)。不达标的槽位留现金。需要 v2 缓存(带 pred_vals)。"
+                    " 0 = 关闭(无条件买满)")
+parser.add_argument("--fill-daily", action="store_true",
+                    help="空槽位逐日补买: 非换仓日若持仓 < TRANCHE_N 且当日有过门槛的候选,"
+                    " 立即补买(新批次自带 5 日到期时钟)。与 --min-pred 搭配使用")
 parser.add_argument("--export-matrix", type=str, default=None,
                     help="把准备好的训练矩阵(含市场/隔夜特征、demean标签、选定特征列)导出到 "
                          "data/processed/ 下的 parquet(+同名.meta.json), 然后退出。"
@@ -153,6 +160,8 @@ PERIODIC = args.portfolio_mode == "periodic"
 NO_ROLL = args.no_roll
 LOT_FLEX = args.lot_flex
 ROLL_RANK = args.roll_rank
+MIN_PRED = args.min_pred
+FILL_DAILY = args.fill_daily
 TARGET_POSITIONS = TRANCHE_N if PERIODIC else HOLD_DAYS * TRANCHE_N
 MIN_TRAIN_DAYS = 250
 
@@ -835,6 +844,11 @@ rejected_buy = rejected_sell = 0
 rej = {"buy_halt": 0, "buy_limit_up": 0, "buy_lot_too_big": 0,
        "buy_no_cash": 0, "sell_halt": 0, "sell_limit_down": 0}
 n_lot_flex = 0               # 整手粒度救济触发次数 (--lot-flex)
+n_below_thresh = 0           # 因信号强度门槛留空的槽位次数 (--min-pred)
+n_daily_fill = 0             # 非换仓日补买成交笔数 (--fill-daily)
+if MIN_PRED > 0 and daily_preds and daily_preds[0].get("pred_vals") is None:
+    raise SystemExit("ERROR: --min-pred 需要带 pred_vals 的 v2 预测缓存, "
+                     "当前缓存是旧格式(只存排名)")
 ic_hist, in_cash, ic_cash = [], False, False
 n_cash_days = 0
 # 续持次数: 到期但仍在目标名单里, 省下一次往返成本
@@ -874,7 +888,10 @@ for i, (dp, exec_date) in enumerate(sched):
     roll_set = set()
     if NO_ROLL:
         pass                  # --no-roll: 退回旧行为(到期一律卖掉再买回), 仅供 A/B
-    elif PERIODIC and is_rebal and not in_cash:
+    elif PERIODIC and (is_rebal or FILL_DAILY) and not in_cash:
+        # FILL_DAILY 时天天建 roll_set: 中途补买的批次会在非换仓日到期,
+        # 它们也该享受同样的续持经济(仍在目标名单就不白付往返成本)。
+        # 主周期批次只在换仓日到期, 不受影响。
         _blocked = dp.get("blocked") or set()
         # --roll-rank: 卖出门槛比买入宽。新买仍只买前 TRANCHE_N 名,
         # 但已持仓只要没掉出前 M 名就不卖 (避免为微小排名变化付往返成本)
@@ -923,8 +940,9 @@ for i, (dp, exec_date) in enumerate(sched):
 
     # ── 2. 开新批次: 用 1/HOLD_DAYS 的权益买 TRANCHE_N 只 ──
     # (is_rebal 已在上面算过; 空仓转回场当天允许立即建仓)
+    # FILL_DAILY: 非换仓日也进入买入段, 但只在有空槽位时真正买得成
     buy_fee = 0.0
-    if not in_cash and is_rebal:
+    if not in_cash and (is_rebal or FILL_DAILY):
         equity = cash + sum(l["shares"] * (get_px(klines, l["code"], d, EXEC_FIELD) or l["buy_price"])
                             for l in lots)
 
@@ -987,8 +1005,17 @@ for i, (dp, exec_date) in enumerate(sched):
         # 从已持仓数起算, 否则续持的那几只不计数, 总持仓会超过 TRANCHE_N。
         # (旧逻辑下卖单被拒(停牌/跌停)时也有同样的超配问题)
         bought = len(lots)
+        _pred_of = None
+        if MIN_PRED > 0:
+            _pv = dp.get("pred_vals")
+            _pred_of = dict(zip(dp["ranked"], _pv)) if _pv else {}
         for code in dp["ranked"]:
             if bought >= TRANCHE_N:
+                break
+            # 信号强度门槛: ranked 按 pred 降序, 第一个不达标的之后全都不达标。
+            # 留空的槽位不沿排名退而求其次 —— 那正是要避免的"买弱信号"。
+            if _pred_of is not None and _pred_of.get(code, -1.0) < MIN_PRED:
+                n_below_thresh += TRANCHE_N - bought
                 break
             if code in held:            # 已持有则跳到下一名, 保证广度
                 continue
@@ -1029,10 +1056,12 @@ for i, (dp, exec_date) in enumerate(sched):
             lots.append({"code": code, "shares": shares, "buy_price": px, "open_idx": i})
             held.add(code)
             bought += 1
+            if not is_rebal:
+                n_daily_fill += 1
             trade_log.append({"date": dstr, "signal_date": sig_str, "code": code,
                               "action": "buy", "shares": shares, "price": px,
                               "gross": gross, "fee": fee, "net": -(gross + fee),
-                              "reason": "new_tranche"})
+                              "reason": "new_tranche" if is_rebal else "daily_fill"})
 
     buy_fee_sum += buy_fee
     sell_fee_sum += sell_fee
@@ -1167,6 +1196,7 @@ json.dump({
     "reversal_guard": args.reversal_guard,
     "lot_flex": LOT_FLEX,
     "roll_rank": ROLL_RANK,
+    "min_pred": MIN_PRED, "fill_daily": FILL_DAILY,
     "features": len(features), "selected_features": features,
     "feat_select_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}",
     "feat_select_seeds": args.select_seeds,
@@ -1194,6 +1224,8 @@ json.dump({
         "n_trades": len(trade_log),
         "n_rolled": n_rolled,
         "n_lot_flex": n_lot_flex,
+        "n_below_thresh": n_below_thresh,
+        "n_daily_fill": n_daily_fill,
         "cash_days": n_cash_days,
         "cash_days_pct": round(100 * n_cash_days / n, 1) if n else 0.0,
         "beat_benchmark": bool(excess.mean() > 0),

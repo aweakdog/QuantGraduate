@@ -893,6 +893,10 @@ def calc_fundamental_features(code6: str, trade_dates: pd.Series) -> Optional[pd
                 hist = hist.set_index("date")
                 # 报告期截止日 → 发布日偏移(未来泄露修复 #2)
                 hist.index = hist.index.map(_fund_pub_date)
+                # 年报(12/31→次年4/30) 与一季报(3/31→4/30) 会撞到同一发布日,
+                # 映射后必须再去重, 否则 reindex 抛 "duplicate labels" 被静默
+                # 吞掉, 导致全部基本面列丢失。同日保留报告期更新的一条。
+                hist = hist[~hist.index.duplicated(keep="last")].sort_index()
 
                 for col in core_cols:
                     if col not in hist.columns:
@@ -1219,9 +1223,32 @@ def build_features_for_stock(code: str, code6: str) -> Optional[pd.DataFrame]:
     result["code"] = code
     return result
 
+def _build_one_stock(code: str, out_dir: str, cutoff: pd.Timestamp) -> bool:
+    """构建单只股票并直接写特征文件, 只返回成败
+
+    定义在模块顶层 (而非 build_all 内的闭包) 是为了能被 ProcessPoolExecutor
+    pickle; 不返回 DataFrame 是为了避开进程间传 1GB+ 数据的开销。
+    """
+    code6 = code[:6]
+    try:
+        df = build_features_for_stock(code, code6)
+        if df is None:
+            return False
+        df["date"] = pd.to_datetime(df["date"])
+        df = df[df["date"] >= cutoff].copy()
+        if len(df) < 20:
+            return False
+        df.to_parquet(os.path.join(out_dir, f"{code6}.parquet"), index=False)
+        return True
+    except Exception as e:
+        log.warning("  %s 失败: %s", code, e)
+        return False
+
+
 def build_all(incremental: bool = True, max_workers: int = 16,
               watchlist_file: Optional[str] = None,
-              out_file: Optional[str] = None) -> None:
+              out_file: Optional[str] = None,
+              procs: int = 0) -> None:
     """构建全部股票的特征矩阵 (六维特征 → 训练集 v15)
 
     流程:
@@ -1235,8 +1262,10 @@ def build_all(incremental: bool = True, max_workers: int = 16,
         max_workers: 并行线程数 (默认 16)
         watchlist_file: 股票池 json 文件名, 默认 watchlist_top120.json
         out_file: 输出训练集文件名, 默认 training_data_v15.parquet
+        procs: >0 时用多进程真并行取代多线程 (绕过 pandas 的 GIL 瓶颈)
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
+                                    as_completed)
 
     if watchlist_file:
         watchlist_path = os.path.join(DATA_DIR, "universe", watchlist_file)
@@ -1276,7 +1305,7 @@ def build_all(incremental: bool = True, max_workers: int = 16,
                 feat_max = pd.read_parquet(feat_path, columns=["date"])["date"].max()
                 kl_path = os.path.join(DATA_DIR, "raw", "kline", f"{code6}.parquet")
                 if os.path.exists(kl_path):
-                    kl_max = pd.read_parquet(kl_path, columns=["时间"])["时间"].max()
+                    kl_max = pd.read_parquet(kl_path, columns=["date"])["date"].max()
                     if feat_max >= kl_max:
                         skipped += 1
                         continue
@@ -1286,44 +1315,31 @@ def build_all(incremental: bool = True, max_workers: int = 16,
     log.info("  需构建 %d 只, 跳过 %d 只 (已最新)", len(to_build), skipped)
 
     # ── 2. 并行构建 ──
-    all_dfs, successes, build_fail = [], 0, 0
-    built_codes6 = set()  # 记录新构建成功的 code6
+    #   pandas 的 rolling/merge 大量持有 GIL, 多线程只能跑满约 1 个核;
+    #   procs>0 时用多进程真并行 (worker 只写盘, 不把 DataFrame pickle 回来)
+    successes, build_fail = 0, 0
     t0 = time.time()
-    _lock = __import__("threading").Lock()
 
-    def _build_one(s: dict) -> Optional[pd.DataFrame]:
-        code = s["code"]
-        code6 = code[:6]
-        name = s["name"]
-        try:
-            df = build_features_for_stock(code, code6)
-            if df is None:
-                return None
-            df["date"] = pd.to_datetime(df["date"])
-            df = df[df["date"] >= cutoff].copy()
-            if len(df) < 20:
-                return None
-            feat_path = os.path.join(out_dir, f"{code6}.parquet")
-            df.to_parquet(feat_path, index=False)
-            return (code6, df)
-        except Exception as e:
-            log.warning("  %s 失败: %s", code, e)
-            return None
+    if procs and procs > 0:
+        Pool, n_par, tag = ProcessPoolExecutor, procs, f"{procs} 进程"
+    else:
+        Pool, n_par, tag = ThreadPoolExecutor, max_workers, f"{max_workers} 线程"
+    log.info("  并行方式: %s", tag)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        fut_map = {pool.submit(_build_one, s): s for s in to_build}
+    with Pool(max_workers=n_par) as pool:
+        fut_map = {pool.submit(_build_one_stock, s["code"], out_dir, cutoff): s
+                   for s in to_build}
         for i, fut in enumerate(as_completed(fut_map)):
             s = fut_map[fut]
-            result = fut.result()
-            if result is not None:
-                with _lock:
-                    code6, df = result
-                    all_dfs.append(df)
-                    built_codes6.add(code6)
-                    successes += 1
+            try:
+                ok = fut.result()
+            except Exception as e:
+                log.warning("  %s 异常: %s", s["code"], e)
+                ok = False
+            if ok:
+                successes += 1
             else:
-                with _lock:
-                    build_fail += 1
+                build_fail += 1
             if (i + 1) % 50 == 0 or i == len(to_build) - 1:
                 log.info("  [%d/%d] %s — 成功 %d, 失败 %d",
                          i + 1, len(to_build), s["name"], successes, build_fail)
@@ -1332,12 +1348,10 @@ def build_all(incremental: bool = True, max_workers: int = 16,
     log.info("  并行构建完成: %.1fs (成功 %d, 失败 %d, 跳过 %d)",
              elapsed, successes, build_fail, skipped)
 
-    # ── 3. 合并所有股票（新构建 + 跳过股票从特征文件读取）──
+    # ── 3. 从特征文件统一读回合并 (新构建的和跳过的一视同仁) ──
+    all_dfs = []
     for s in stocks:
-        code = s["code"]
-        code6 = code[:6]
-        if code6 in built_codes6:
-            continue  # 已包含新构建的
+        code6 = s["code"][:6]
         feat_path = os.path.join(out_dir, f"{code6}.parquet")
         if not os.path.exists(feat_path):
             continue
@@ -1347,7 +1361,7 @@ def build_all(incremental: bool = True, max_workers: int = 16,
             df["code"] = df["code"].astype(str)
             all_dfs.append(df)
         except Exception as e:
-            log.warning("  读取跳过股票 %s 特征文件失败: %s", code6, e)
+            log.warning("  读取特征文件失败 %s: %s", code6, e)
 
     # 合并保存
     if all_dfs:
@@ -1375,10 +1389,13 @@ if __name__ == "__main__":
                     help="禁用增量跳过")
     ap.add_argument("--workers", type=int, default=16,
                     help="并行线程数 (默认 16)")
+    ap.add_argument("--procs", type=int, default=0,
+                    help="多进程并行数 (>0 时绕开 pandas GIL 瓶颈, 推荐 24)")
     ap.add_argument("--watchlist", type=str, default=None,
                     help="股票池 json 文件名 (data/universe/ 下), 如 watchlist_pit.json")
     ap.add_argument("--out", type=str, default=None,
                     help="输出训练集文件名 (data/processed/ 下)")
     args = ap.parse_args()
     build_all(incremental=args.incremental, max_workers=args.workers,
-              watchlist_file=args.watchlist, out_file=args.out)
+              watchlist_file=args.watchlist, out_file=args.out,
+              procs=args.procs)

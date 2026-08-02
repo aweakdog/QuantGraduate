@@ -284,8 +284,8 @@ async def page_login():
 
 @app.get("/api/access/summary")
 async def api_access_summary(req: Request, days: int = 30, geo: int = 1):
-    if not _ops_ok(req):
-        return _ops_deny()
+    if not _pro_ops_ok(req):
+        return _pro_ops_deny()
     days = max(1, min(int(days or 30), 90))
     s = access_log.summary(days)
     first = access_log.first_seen_map()
@@ -304,8 +304,8 @@ async def api_access_summary(req: Request, days: int = 30, geo: int = 1):
 @app.get("/api/access/events")
 async def api_access_events(req: Request, limit: int = 200, pages: int = 0,
                             geo: int = 1):
-    if not _ops_ok(req):
-        return _ops_deny()
+    if not _pro_ops_ok(req):
+        return _pro_ops_deny()
     limit = max(1, min(int(limit or 200), 1000))
     rows = access_log.read_events(limit=limit, only_pages=bool(pages))
     g = access_log.resolve_geo([r.get("ip") for r in rows]) if geo else {}
@@ -425,6 +425,62 @@ async def api_ops_logout():
 @app.get("/api/ops/status")
 async def api_ops_status(req: Request):
     return {"authed": _ops_ok(req), "configured": bool(_ops_password())}
+
+
+# ── 运维面板专用口令 (QUANT_PRO_OPS_PASSWORD) ──
+# /pro 页的写操作(生成信号/同步对账/访问日志)用独立口令,
+# 与首页改账口令(QUANT_OPS_PASSWORD)互不通用。
+PRO_OPS_COOKIE = "pro_ops_token"
+PRO_OPS_TTL = 12 * 3600
+
+
+def _pro_ops_password():
+    return os.environ.get("QUANT_PRO_OPS_PASSWORD") or ""
+
+
+def _pro_ops_sign(exp: int) -> str:
+    key = ("pro-ops:" + _pro_ops_password()).encode()
+    return hmac.new(key, str(exp).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _pro_ops_ok(req: Request) -> bool:
+    if not _pro_ops_password():
+        return False
+    tok = req.cookies.get(PRO_OPS_COOKIE, "")
+    if "." not in tok:
+        return False
+    exp_s, sig = tok.split(".", 1)
+    try:
+        exp = int(exp_s)
+    except ValueError:
+        return False
+    if exp < time.time():
+        return False
+    return hmac.compare_digest(sig, _pro_ops_sign(exp))
+
+
+def _pro_ops_deny():
+    if not _pro_ops_password():
+        return JSONResponse(
+            {"error": "服务器未设置 QUANT_PRO_OPS_PASSWORD, 运维操作已禁用",
+             "need_password": False}, status_code=503)
+    return JSONResponse({"error": "需要密码", "need_password": True}, status_code=401)
+
+
+@app.post("/api/pro-ops/login")
+async def api_pro_ops_login(req: Request):
+    pw = _pro_ops_password()
+    if not pw:
+        return JSONResponse({"error": "服务器未设置 QUANT_PRO_OPS_PASSWORD"}, status_code=503)
+    body = await req.json()
+    got = str(body.get("password", ""))
+    if not hmac.compare_digest(got, pw):
+        return JSONResponse({"error": "密码错误"}, status_code=403)
+    exp = int(time.time()) + PRO_OPS_TTL
+    r = JSONResponse({"ok": True, "expires_in": PRO_OPS_TTL})
+    r.set_cookie(PRO_OPS_COOKIE, f"{exp}.{_pro_ops_sign(exp)}", max_age=PRO_OPS_TTL,
+                 httponly=True, samesite="lax", path="/")
+    return r
 
 
 # ── 全局 ──
@@ -598,8 +654,8 @@ async def api_plan():
 async def api_signal(req: Request):
     # 跑信号会写 state (结算挂单、生成新计划), 属于改账 —— 与首页那批
     # /api/profile/* 一样得过 ops 口令。之前这里没校验, 等于"能看就能改"。
-    if not _ops_ok(req):
-        return _ops_deny()
+    if not _pro_ops_ok(req):
+        return _pro_ops_deny()
     if _running["active"]:
         return JSONResponse({"error": "信号生成正在运行中, 请等待"}, status_code=409)
     _running.update(active=True, log="", started_at=datetime.now().isoformat(),
@@ -637,8 +693,8 @@ async def api_signal_status():
 # 但必须要 ops 口令 —— 它是所有接口里破坏力最大的一个。
 @app.post("/api/sync-template")
 async def api_sync_template(req: Request):
-    if not _ops_ok(req):
-        return _ops_deny()
+    if not _pro_ops_ok(req):
+        return _pro_ops_deny()
     r = subprocess.run(
         [PY, SIGNAL_SCRIPT] + SIGNAL_ARGS + ["--sync-template"],
         capture_output=True, text=True, cwd=str(ROOT), timeout=30,
@@ -651,8 +707,8 @@ async def api_sync_template(req: Request):
 
 @app.post("/api/sync")
 async def api_sync(req: Request):
-    if not _ops_ok(req):
-        return _ops_deny()
+    if not _pro_ops_ok(req):
+        return _pro_ops_deny()
     body = await req.json()
     tmp = LIVE_DIR / "sync_input.json"
     tmp.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1559,7 +1615,7 @@ function opsCancel(){
 
 async function opsSubmit(){
   const pw = document.getElementById('ops-pw').value || '';
-  const r = await fetch('/api/ops/login', {method:'POST',
+  const r = await fetch('/api/pro-ops/login', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pw})});
   if (r.ok){
     document.getElementById('ops-modal').style.display = 'none';
@@ -1819,7 +1875,7 @@ function accessPasswordBox(){
 
 async function accessLogin(){
   const pw = (document.getElementById('acc-pw')||{}).value || '';
-  const r = await fetch('/api/ops/login', {method:'POST',
+  const r = await fetch('/api/pro-ops/login', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pw})});
   if (r.ok){ loadAccess(); return; }
   const d = await r.json().catch(()=>({}));

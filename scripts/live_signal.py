@@ -122,6 +122,11 @@ ap.add_argument("--allow-stale", action="store_true", help="训练集比K线旧�
 ap.add_argument("--as-of", default=None,
                 help="假装数据只到该日期 (回放/补跑/自测用), 不使用之后的任何数据")
 ap.add_argument("--alternates", type=int, default=8, help="额外输出几只候补股")
+ap.add_argument("--seed-ensemble", default="42,7,123,2024,31337",
+                help="逗号分隔的 LightGBM 种子列表。每个种子训一套模型, 预测取平均。"
+                     "同 IC 下前3名选股方差是单种子的主要脆弱点(单种子回测 IR 均值"
+                     "0.92±0.26, 5种子集成 1.23~1.30, 见 docs/progress_2026-08-02.md)。"
+                     "传单个种子如 '42' 退回旧行为")
 ap.add_argument("--preds-cache", default=None,
                 help="预测结果缓存路径。四条线的模型完全相同(特征/标签/训练集/超参都不"
                      "依赖 tranche_n 与本金), 各训一遍是 4 倍浪费。指定同一个缓存文件, "
@@ -187,6 +192,9 @@ LOCKED_PARAMS = dict(
     min_child_samples=50, random_state=42, n_jobs=10, verbosity=-1,
     boosting_type="dart",
 )
+ENSEMBLE_SEEDS = [int(s) for s in str(args.seed_ensemble).split(",") if s.strip()]
+if not ENSEMBLE_SEEDS:
+    raise SystemExit("ERROR: --seed-ensemble 不能为空")
 TRADE_COST = 0.0006
 MIN_FEE = 5.0
 SLIPPAGE = args.slippage
@@ -1268,6 +1276,7 @@ if args.preds_cache:
         "train_file": args.train_file, "pit_universe": args.pit_universe,
         "label": LABEL, "features": list(features),
         "params": {k: str(v) for k, v in sorted(LOCKED_PARAMS.items())},
+        "seeds": ENSEMBLE_SEEDS,
         "rows": int(len(train_df)),
     }, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
@@ -1289,12 +1298,19 @@ if _cache_key:
 
 if ranked is None:
     print(f"\n[训练] 样本 < {pd.Timestamp(cutoff).date()} | "
-          f"{train_df['date'].nunique()} 天 {len(train_df):,} 行 {len(features)} 特征")
+          f"{train_df['date'].nunique()} 天 {len(train_df):,} 行 {len(features)} 特征 | "
+          f"{len(ENSEMBLE_SEEDS)} 种子集成")
     X = train_df.groupby("code")[features].transform(lambda c: c.ffill().fillna(0))
-    model = lgb.LGBMRegressor(**LOCKED_PARAMS).fit(X, train_df[LABEL])
-
     Xt = df.loc[tm, features].fillna(0)
-    preds = model.predict(Xt)
+    # 多种子集成: 同数据同超参, 只换 random_state, 预测取普通平均(保留收益率量纲)。
+    # 前3名选股对训练噪声极度敏感(两两种子 top3 重合率仅 75%), 平均后方差抵消。
+    # 回测验证: plain-mean 与 z-mean top3 重合 99.3%, 集成 IC 与单种子持平。
+    preds = None
+    for _sd in ENSEMBLE_SEEDS:
+        _m = lgb.LGBMRegressor(**dict(LOCKED_PARAMS, random_state=_sd)).fit(X, train_df[LABEL])
+        _p = _m.predict(Xt)
+        preds = _p if preds is None else preds + _p
+    preds = preds / len(ENSEMBLE_SEEDS)
     ranked = (pd.DataFrame({"code": df.loc[tm, "code"].astype(str).str[:6].values, "pred": preds})
               .sort_values("pred", ascending=False).reset_index(drop=True))
     if _cache_key and not args.dry_run:

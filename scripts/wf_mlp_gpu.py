@@ -48,6 +48,10 @@ parser.add_argument("--init-epochs", type=int, default=30, help="首日全量训
 parser.add_argument("--daily-epochs", type=int, default=2, help="每日扩窗微调轮数")
 parser.add_argument("--full-refit-every", type=int, default=60,
                     help="每 N 个交易日重新全量训练一次 (防 warm-start 漂移)")
+parser.add_argument("--feat-transform", choices=["csrank", "raw"], default="csrank",
+                    help="csrank(默认): 每日每特征截面 rank 归一到[0,1], NaN→0.5中性。"
+                         "NN 对特征尺度/重尾敏感, 裸特征(raw)实测 IC 接近 0; "
+                         "截面 rank 只用当日同时刻数据, PIT 安全。raw 仅供对照")
 parser.add_argument("--save-preds", required=True,
                     help="输出预测缓存 pickle 文件名 (data/processed/ 下, v2 格式)")
 parser.add_argument("--max-days", type=int, default=0, help="只跑前 N 个信号日 (冒烟用, 0=全部)")
@@ -73,6 +77,9 @@ torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+# 多进程共机必限: torch 默认开满所有核, 8 个进程 × 128 线程会把 CPU 踩死
+# (实测负载 280+, GPU 利用率 1%)。训练数据常驻 GPU 后 CPU 只剩轻活
+torch.set_num_threads(4)
 dev = torch.device(args.device if torch.cuda.is_available() else "cpu")
 if dev.type == "cpu":
     print("!! CUDA 不可用, 退回 CPU (慢, 仅调试)")
@@ -83,12 +90,20 @@ df["date"] = pd.to_datetime(df["date"])
 df["code"] = df["code"].astype(str)
 print(f"  {len(df)} 行, {df['code'].nunique()} 只, {len(FEATURES)} 特征")
 
-# ── 训练用 X: 按 code 先 ffill 再 fillna(0) (与 wf_v35 训练分支同口径) ──
 df = df.sort_values(["code", "date"], kind="mergesort").reset_index(drop=True)
-Xfill = df.groupby("code")[FEATURES].ffill().fillna(0.0).astype(np.float32)
 y_all = df[LABEL].astype(np.float32)
-# ── 预测用 X: 当日原始值直接 fillna(0) (与 wf_v35 预测分支同口径) ──
-Xpred = df[FEATURES].fillna(0.0).astype(np.float32)
+if args.feat_transform == "csrank":
+    # 截面 rank: 每日每特征归一到[0,1], 再平移缩放到均值0方差1。
+    # 训练/预测同一变换(只依赖当日截面, 无需区分 ffill 口径)。
+    print("截面 rank 变换...")
+    Xcs = df.groupby("date")[FEATURES].rank(pct=True)
+    Xcs = ((Xcs.fillna(0.5) - 0.5) / 0.2887).astype(np.float32)
+    Xfill = Xpred = Xcs
+else:
+    # ── 训练用 X: 按 code 先 ffill 再 fillna(0) (与 wf_v35 训练分支同口径) ──
+    Xfill = df.groupby("code")[FEATURES].ffill().fillna(0.0).astype(np.float32)
+    # ── 预测用 X: 当日原始值直接 fillna(0) (与 wf_v35 预测分支同口径) ──
+    Xpred = df[FEATURES].fillna(0.0).astype(np.float32)
 
 all_dates = np.array(sorted(df["date"].unique()))
 date_pos = {d: i for i, d in enumerate(all_dates)}
@@ -122,25 +137,27 @@ lossf = nn.MSELoss()
 
 
 def train_window(cut_ts, epochs, lr=None):
-    """在 date < cut_ts 且有标签的样本上训练"""
+    """在 date < cut_ts 且有标签的样本上训练。
+    整窗口一次性搬上 GPU (最大 28.4万行×80列×4B ≈ 91MB), 打乱/取 batch
+    全在 GPU 上做 —— 否则逐 batch CPU→GPU 拷贝会让 8 卡并行时 CPU 先于 GPU 饱和。"""
     tm = (date_vals < cut_ts) & ~np.isnan(y_all.values)
     idx = np.flatnonzero(tm)
     if lr is not None:
         for g in opt.param_groups:
             g["lr"] = lr
-    Xt = torch.from_numpy(Xfill.values[idx])
-    yt = torch.from_numpy(y_all.values[idx])
+    Xt = torch.from_numpy(Xfill.values[idx]).to(dev)
+    yt = torch.from_numpy(y_all.values[idx]).to(dev)
     n = len(idx)
     model.train()
     for _ in range(epochs):
-        perm = torch.randperm(n)
+        perm = torch.randperm(n, device=dev)
         for s in range(0, n, args.batch_size):
             b = perm[s: s + args.batch_size]
-            xb, yb = Xt[b].to(dev, non_blocking=True), yt[b].to(dev, non_blocking=True)
             opt.zero_grad()
-            loss = lossf(model(xb), yb)
+            loss = lossf(model(Xt[b]), yt[b])
             loss.backward()
             opt.step()
+    del Xt, yt
     return n
 
 
@@ -196,7 +213,8 @@ ic_t = ics.mean() / (ics.std(ddof=1) / np.sqrt(len(ics))) if len(ics) > 2 else f
 print(f"\nMLP walk-forward 完成: {len(daily_preds)} 天 | IC 均值 {ics.mean():+.4f} "
       f"t={ic_t:.2f} | 用时 {(datetime.now()-t0).total_seconds():.0f}s")
 
-out_meta = {"model": "mlp", "hidden": args.hidden, "dropout": args.dropout,
+out_meta = {"model": "mlp", "feat_transform": args.feat_transform,
+            "hidden": args.hidden, "dropout": args.dropout,
             "lr": args.lr, "seed": args.seed, "init_epochs": args.init_epochs,
             "daily_epochs": args.daily_epochs, "full_refit_every": args.full_refit_every,
             "matrix": args.matrix, "train_file": meta.get("train_file"),
