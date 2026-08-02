@@ -122,6 +122,10 @@ ap.add_argument("--allow-stale", action="store_true", help="训练集比K线旧�
 ap.add_argument("--as-of", default=None,
                 help="假装数据只到该日期 (回放/补跑/自测用), 不使用之后的任何数据")
 ap.add_argument("--alternates", type=int, default=8, help="额外输出几只候补股")
+ap.add_argument("--skip-boards", default="",
+                help="不能买的板块代码前缀, 逗号分隔 (如 '30,688' = 创业板+科创板)。"
+                     "模型级隔离: 训练样本/截面demean/候选池全部只看剩下的股。"
+                     "没开相应板块权限的账户用。空 = 不限制")
 ap.add_argument("--seed-ensemble", default="42,7,123,2024,31337",
                 help="逗号分隔的 LightGBM 种子列表。每个种子训一套模型, 预测取平均。"
                      "同 IC 下前3名选股方差是单种子的主要脆弱点(单种子回测 IR 均值"
@@ -195,6 +199,7 @@ LOCKED_PARAMS = dict(
 ENSEMBLE_SEEDS = [int(s) for s in str(args.seed_ensemble).split(",") if s.strip()]
 if not ENSEMBLE_SEEDS:
     raise SystemExit("ERROR: --seed-ensemble 不能为空")
+SKIP_BOARDS = tuple(s.strip() for s in str(args.skip_boards).split(",") if s.strip())
 TRADE_COST = 0.0006
 MIN_FEE = 5.0
 SLIPPAGE = args.slippage
@@ -1166,6 +1171,13 @@ _last_lab_date = df.loc[_lab_ok, "date"].max()
 df = df[_lab_ok | (df["date"] > _last_lab_date)]
 if args.pit_universe:
     df = apply_pit_universe(df, args.pit_universe)
+if SKIP_BOARDS:
+    # 与回测(wf_v35 --skip-boards)同口径: 买不了的板块从世界里剔除 ——
+    # 训练样本/截面 demean/候选池都不含, 模型把全部注意力花在能买的股上。
+    _n0 = len(df)
+    df = df[~df["code"].astype(str).str.startswith(SKIP_BOARDS)]
+    print(f"  板块过滤({args.skip_boards}): {_n0:,} -> {len(df):,} 行 "
+          f"(仅主板, 无创/科板权限)")
 
 print("构建增强特征...")
 mkt_df, mkt_features, regime_src = compute_market_features()
@@ -1277,6 +1289,7 @@ if args.preds_cache:
         "label": LABEL, "features": list(features),
         "params": {k: str(v) for k, v in sorted(LOCKED_PARAMS.items())},
         "seeds": ENSEMBLE_SEEDS,
+        "skip_boards": list(SKIP_BOARDS),
         "rows": int(len(train_df)),
     }, sort_keys=True, default=str).encode()).hexdigest()[:16]
 

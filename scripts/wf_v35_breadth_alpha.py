@@ -107,6 +107,13 @@ parser.add_argument("--load-preds", type=str, default=None,
 parser.add_argument("--features-from", type=str, default=None,
                     help="直接复用另一份回测 json 里的 selected_features (data/processed/ 下), "
                          "不现场筛选。用于隔离'数据变了'和'特征集变了'两个变量")
+parser.add_argument("--skip-boards", type=str, default="",
+                    help="不能买的板块代码前缀, 逗号分隔。如 '30,688' = 创业板+科创板"
+                    " (没开通权限的账户)。空 = 不限制")
+parser.add_argument("--skip-boards-mode", choices=["substitute", "cash"],
+                    default="substitute",
+                    help="遇到受限板块股怎么办: substitute=顺位递补下一名主板股(默认);"
+                    " cash=该槽位留现金到下轮(不递补)")
 parser.add_argument("--min-pred", type=float, default=0.0,
                     help="建仓信号强度门槛: 只买 pred >= X 的候选(单位=预期5日超额收益,"
                     " 如 0.005 = 0.5%)。不达标的槽位留现金。需要 v2 缓存(带 pred_vals)。"
@@ -162,6 +169,8 @@ LOT_FLEX = args.lot_flex
 ROLL_RANK = args.roll_rank
 MIN_PRED = args.min_pred
 FILL_DAILY = args.fill_daily
+SKIP_BOARDS = tuple(s.strip() for s in args.skip_boards.split(",") if s.strip())
+SKIP_CASH = args.skip_boards_mode == "cash"
 TARGET_POSITIONS = TRANCHE_N if PERIODIC else HOLD_DAYS * TRANCHE_N
 MIN_TRAIN_DAYS = 250
 
@@ -600,6 +609,14 @@ _last_lab_date = df.loc[_lab_ok, "date"].max()
 df = df[_lab_ok | (df["date"] > _last_lab_date)]
 if args.pit_universe:
     df = apply_pit_universe(df, args.pit_universe)
+if SKIP_BOARDS and not args.load_preds:
+    # 训练时就把受限板块剪掉: 训练样本/截面 demean/候选池/基准全部只看能买的股。
+    # 这是"没权限账户"的诚实世界 —— 比执行层事后跳过更彻底(模型不再把注意力
+    # 花在永远买不了的股上)。注意基准也变成主板等权, IR 不能直接与全板块版比。
+    _n0 = len(df)
+    df = df[~df["code"].astype(str).str.startswith(SKIP_BOARDS)]
+    print(f"板块过滤({args.skip_boards}): {_n0} -> {len(df)} 行, "
+          f"{df['code'].nunique()} 只 (训练+候选+基准全部只看主板)")
 
 print("构建增强特征...")
 mkt_df, mkt_features, regime_src = compute_market_features()
@@ -846,6 +863,7 @@ rej = {"buy_halt": 0, "buy_limit_up": 0, "buy_lot_too_big": 0,
 n_lot_flex = 0               # 整手粒度救济触发次数 (--lot-flex)
 n_below_thresh = 0           # 因信号强度门槛留空的槽位次数 (--min-pred)
 n_daily_fill = 0             # 非换仓日补买成交笔数 (--fill-daily)
+n_board_skip = 0             # 因板块权限跳过的候选次数 (--skip-boards)
 if MIN_PRED > 0 and daily_preds and daily_preds[0].get("pred_vals") is None:
     raise SystemExit("ERROR: --min-pred 需要带 pred_vals 的 v2 预测缓存, "
                      "当前缓存是旧格式(只存排名)")
@@ -901,6 +919,8 @@ for i, (dp, exec_date) in enumerate(sched):
                 break
             if code in _blocked:
                 continue
+            if SKIP_BOARDS and str(code).startswith(SKIP_BOARDS):
+                continue          # 买不了的板块不可能持有, 也不占目标名单位置
             roll_set.add(code)
 
     # ── 1. 卖出到期批次 (持满 HOLD_DAYS) ──
@@ -1021,6 +1041,15 @@ for i, (dp, exec_date) in enumerate(sched):
                 continue
             if code in blocked:         # 刚急涨过的不追
                 continue
+            if SKIP_BOARDS and str(code).startswith(SKIP_BOARDS):
+                n_board_skip += 1
+                if SKIP_CASH:
+                    # 留现金模式: 槽位被"消耗"但不买, 预算也预留不给后面的槽位。
+                    # (否则就变成变相递补: 钱流给下一名, 只是换个名字)
+                    alloc = remaining / (TRANCHE_N - bought)
+                    remaining -= alloc
+                    bought += 1
+                continue                # 递补模式: 直接看下一名
             px = get_px(klines, code, d, EXEC_FIELD)
             if px is None:                          # 停牌/无行情
                 rejected_buy += 1
@@ -1197,6 +1226,7 @@ json.dump({
     "lot_flex": LOT_FLEX,
     "roll_rank": ROLL_RANK,
     "min_pred": MIN_PRED, "fill_daily": FILL_DAILY,
+    "skip_boards": list(SKIP_BOARDS), "skip_boards_mode": args.skip_boards_mode,
     "features": len(features), "selected_features": features,
     "feat_select_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}",
     "feat_select_seeds": args.select_seeds,
@@ -1226,6 +1256,7 @@ json.dump({
         "n_lot_flex": n_lot_flex,
         "n_below_thresh": n_below_thresh,
         "n_daily_fill": n_daily_fill,
+        "n_board_skip": n_board_skip,
         "cash_days": n_cash_days,
         "cash_days_pct": round(100 * n_cash_days / n, 1) if n else 0.0,
         "beat_benchmark": bool(excess.mean() > 0),

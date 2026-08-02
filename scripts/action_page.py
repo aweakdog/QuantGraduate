@@ -21,7 +21,7 @@ import pandas as pd
 
 import trading_calendar
 from live_config import (DEFAULT_PROFILE, PROFILES, capital_of, display_name,
-                         is_auto, is_locked, state_file)
+                         is_auto, is_locked, main_board_only, state_file)
 
 # 各 exec_mode 的下单窗口 (北京时间的时:分)。
 #   t1close -> 尾盘集合竞价前那十分钟
@@ -191,6 +191,7 @@ def list_profiles():
              # capital 用生效值而不是代码默认值 —— 网页上重置时可能改过
              "capital": capital_of(k), "default_capital": v["capital"],
              "positions": v["tranche-n"],
+             "main_board_only": main_board_only(k),
              "desc": v["desc"], "auto": is_auto(k), "locked": is_locked(k)}
             for k, v in PROFILES.items()]
 
@@ -198,7 +199,8 @@ def list_profiles():
 def build_recommend(root: Path, pid=None):
     """每日推荐看板: 模型当天打分最高的股票。
 
-    模型排序本身与本金/持仓数无关, 四条线的 recommend 完全一样;
+    模型排序与本金/持仓数无关, 但主板-only 的线(skip-boards)模型不同,
+    其推荐榜只含主板股(读的是该线自己的 plan);
     差异只在于"买不买得起" —— 每只预算 = 总资产/持仓数, 不足一手(100股)
     的会被跳过。所以这里按当前 profile 标出 affordable, 避免照榜买入后
     发现根本买不了。
@@ -450,6 +452,7 @@ def build_today(root: Path, pid=None):
             "regime_filter": cfg.get("regime_filter"),
             # 每只预算决定了能买的最高股价(一手=100股), 是低本金的关键约束
             "per_slot_budget": round(equity / cfg["tranche_n"], 0) if cfg.get("tranche_n") else None,
+            "main_board_only": main_board_only(pid),
         },
         "freshness": fresh,
         "market": {
@@ -491,6 +494,8 @@ ACTION_HTML = """<!DOCTYPE html>
         border-radius:4px;margin-left:4px;vertical-align:middle}
   .mode-auto{background:#1e3a2b;color:#86efac}
   .mode-man{background:#3a2a12;color:#fcd34d}
+  /* 主板-only 徽标: 该线账户没开创业板/科创板权限 */
+  .mode-mb{background:#172554;color:#93c5fd}
 
   /* 操作按钮 */
   .acts{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
@@ -946,7 +951,8 @@ function renderProfs(active){
   $('#profs').innerHTML = PROFS.map(p => `
     <div class="prof ${p.id===active?'on':''}" onclick="setPid('${p.id}')">
       <div class="pn">${esc(p.name)}<span class="mode ${p.locked?'mode-lock':(p.auto?'mode-auto':'mode-man')}">${
-        p.locked?'基准':(p.auto?'纸面':'实盘')}</span></div>
+        p.locked?'基准':(p.auto?'纸面':'实盘')}</span>${
+        p.main_board_only?'<span class="mode mode-mb">主板</span>':''}</div>
       <div class="pm">${p.positions} 只 · 每只 ${money(
         (p.equity != null ? p.equity : p.capital) / p.positions)}</div>
     </div>`).join('');
@@ -1489,6 +1495,7 @@ async function loadAct(){
   h += `<div class="card"><h2>这条线的方案</h2>
       <div style="font-size:13px;color:#8a93a6;line-height:1.9">
         ${d.profile_desc||''}<br>
+        ${s.main_board_only?'<b style="color:#93c5fd">只买主板股</b> —— 未开创业板/科创板权限, 模型训练与选股都不含 30/68 开头的股<br>':''}
         持仓 <b style="color:#c9cdd6">${s.positions||'--'} 只</b> ·
         每 <b style="color:#c9cdd6">${s.hold_days||'--'} 个交易日</b>整体换仓 ·
         每只预算 <b style="color:#c9cdd6">${money(s.per_slot_budget)}</b><br>

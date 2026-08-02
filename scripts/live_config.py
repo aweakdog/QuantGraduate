@@ -98,19 +98,25 @@ PROFILES = {
         "capital": 20000.0,
         "tranche-n": 2,
         "lot-flex": 0.5,
-        "desc": "只持 2 只, 预算大高价股也能买。回测 IR 0.72 (5种子集成, flex0.5), 集中度最高。",
+        # 账户没开创业板/科创板权限 (2026-08-02, 用户预计两年后才开)。
+        # 模型级隔离: 训练/候选/基准只看主板, 而非执行层事后跳过
+        # (事后跳过实测丢掉 ~70% 利润, 见 docs/progress_2026-08-02.md)。
+        "skip-boards": "30,688",
+        "desc": "只持 2 只, 预算大高价股也能买。仅主板: 回测4年 +94% (主板集成, 前半段曾跑输主板基准)。",
     },
     "steady5w": {
         "name": "稳妥 5万",
         "capital": 50000.0,
         "tranche-n": 5,
-        "desc": "5 只分散, 单股爆雷影响最小。回测 IR 1.05 (5种子集成), 两段 1.23/1.05。",
+        "skip-boards": "30,688",   # 同 aggr2w: 账户无创/科板权限
+        "desc": "5 只分散, 单股爆雷影响最小。仅主板: 回测4年 +84%, 两段都跑赢主板基准。",
     },
     "aggr5w": {
         "name": "激进 5万",
         "capital": 50000.0,
         "tranche-n": 3,
-        "desc": "回测 IR 1.26 (5种子集成, 两段 1.12/1.42)。仅 3 只, 集中度高回撤大。",
+        "skip-boards": "30,688",   # 同 aggr2w: 账户无创/科板权限
+        "desc": "仅 3 只集中。仅主板: 回测4年 +108% / 回撤 -29%, 两段都跑赢主板基准。",
     },
     # ── 不可更改的基准线 ───────────────────────────
     # 上面四条是给真人用的, 会被改名、手工记账、校准现金、删持仓 ——
@@ -219,6 +225,11 @@ def is_locked(pid):
     return bool(PROFILES.get(pid, {}).get("locked"))
 
 
+def main_board_only(pid):
+    """这条线是否只买主板 (账户没开创业板/科创板权限)"""
+    return bool(PROFILES.get(pid, {}).get("skip-boards"))
+
+
 def display_name(pid):
     """用户改过就用用户的, 否则用代码里的默认名。
 
@@ -317,11 +328,15 @@ def signal_args(pid, include_features=True):
     # 此参数不在 FINGERPRINT_KEYS 里, 所以来回切换不会弄坏已有持仓。
     if not is_auto(pid):
         out += ["--require-confirm"]
-    # 四条线的模型完全一样(只有建仓环节按 tranche-n 不同), 各训一遍是 4 倍
-    # CPU 白烧。共用一个预测缓存: 当天第一条线训练并写入, 其余直接读。
+    # 同模型的线共用一个预测缓存: 当天第一条线训练并写入, 其余直接读。
     # 缓存键含信号日与全部训练输入, 任一项变化都会自动重训, 不会读到过期预测。
     # 同样不在 FINGERPRINT_KEYS 里, 加它不影响已有持仓。
-    out += ["--preds-cache", str(PREDS_CACHE_PATH)]
+    # 主板-only 的线模型不同(训练集/截面都变了), 用独立缓存文件 ——
+    # 否则两类线在同一文件里互相覆盖, 每天 6 次全部 cache miss 白训。
+    _cache = PREDS_CACHE_PATH
+    if params.get("skip-boards"):
+        _cache = _cache.with_name(f"{_cache.stem}_mb{_cache.suffix}")
+    out += ["--preds-cache", str(_cache)]
     if include_features and FEATURES_FROM:
         out += ["--features-from", FEATURES_FROM]
     return out
