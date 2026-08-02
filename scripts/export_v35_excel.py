@@ -80,34 +80,55 @@ def benchmark_series(dates, train_file="training_data_v24.parquet", pit_universe
     return b.reindex(pd.to_datetime(dates)).fillna(0.0).values
 
 
+SELL_REASON = {"matured": "持满到期", "end": "回测期末清仓",
+               "roll_trim": "连任减持(超出新预算部分)", "regime_exit": "大盘转弱清仓"}
+
+
 def build_operations(trades, names, concepts, pv_by_date):
-    """FIFO 配对 买入 -> 卖出, 生成一行一笔完整操作"""
+    """FIFO 配对 买入 -> 卖出, 生成一行一笔完整操作。
+
+    支持部分卖出 (roll_trim 只卖一片): 按股数拆开买入批次, 成本/费用按比例
+    分摊, 剩余股数留在队列里等下一笔卖出。否则“整笔买入 vs 小片卖出”硬配一行,
+    净收益会出现 -5万 这种鬼数字。
+    """
     pending = defaultdict(deque)
     rows = []
     for t in sorted(trades, key=lambda x: (x["date"], x["action"] != "sell")):
         code = str(t["code"])[:6]
         if t["action"] == "buy":
-            pending[code].append(t)
+            pending[code].append(dict(t))   # 拷贝: 部分卖出时要原地改剩余股数
             continue
-        buy = pending[code].popleft() if pending[code] else None
-        if buy is None:
-            continue
-        hold_days = (pd.Timestamp(t["date"]) - pd.Timestamp(buy["date"])).days
-        gross_pnl = t["gross"] - buy["gross"]
-        net_pnl = t["net"] + buy["net"]        # buy 的 net 已是负数
-        rows.append({
-            "买入日期": buy["date"], "卖出日期": t["date"], "自然持有天数": hold_days,
-            "股票代码": code, "股票名称": names.get(code, ""),
-            "板块": ", ".join(concepts.get(code, [])[:3]),
-            "股数": buy["shares"], "买入价": round(buy["price"], 3), "卖出价": round(t["price"], 3),
-            "买入金额": round(buy["gross"], 2), "卖出金额": round(t["gross"], 2),
-            "买入费用": round(buy["fee"], 2), "卖出费用": round(t["fee"], 2),
-            "毛收益": round(gross_pnl, 2), "净收益": round(net_pnl, 2),
-            "收益率%": round(net_pnl / buy["gross"] * 100, 2) if buy["gross"] else None,
-            "卖出原因": {"matured": "持满到期", "end": "回测期末清仓"}.get(t.get("reason"), t.get("reason")),
-            "卖出后总资产": pv_by_date.get(t["date"]),
-            "状态": "已完成",
-        })
+        remaining = t["shares"]
+        while remaining > 0 and pending[code]:
+            buy = pending[code][0]
+            take = min(buy["shares"], remaining)
+            fb = take / buy["shares"]              # 这批买入被消耗的比例
+            fs = take / t["shares"]                # 这笔卖出分给该批的比例
+            b_gross, b_fee = buy["gross"] * fb, buy["fee"] * fb
+            s_gross, s_fee = t["gross"] * fs, t["fee"] * fs
+            net_pnl = (s_gross - s_fee) - (b_gross + b_fee)
+            hold_days = (pd.Timestamp(t["date"]) - pd.Timestamp(buy["date"])).days
+            rows.append({
+                "买入日期": buy["date"], "卖出日期": t["date"], "自然持有天数": hold_days,
+                "股票代码": code, "股票名称": names.get(code, ""),
+                "板块": ", ".join(concepts.get(code, [])[:3]),
+                "股数": take, "买入价": round(buy["price"], 3), "卖出价": round(t["price"], 3),
+                "买入金额": round(b_gross, 2), "卖出金额": round(s_gross, 2),
+                "买入费用": round(b_fee, 2), "卖出费用": round(s_fee, 2),
+                "毛收益": round(s_gross - b_gross, 2), "净收益": round(net_pnl, 2),
+                "收益率%": round(net_pnl / b_gross * 100, 2) if b_gross else None,
+                "卖出原因": SELL_REASON.get(t.get("reason"), t.get("reason")),
+                "卖出后总资产": pv_by_date.get(t["date"]),
+                "状态": "已完成" if t.get("reason") != "roll_trim" else "部分卖出",
+            })
+            # 消耗这批买入的 take 股, 成本按比例减少; 清零则出队
+            buy["shares"] -= take
+            buy["gross"] -= b_gross
+            buy["fee"] -= b_fee
+            buy["net"] = -(buy["gross"] + buy["fee"])
+            if buy["shares"] <= 0:
+                pending[code].popleft()
+            remaining -= take
     for code, q in pending.items():
         for buy in q:
             rows.append({
@@ -191,7 +212,9 @@ def export(src: Path, out: Path):
     tr["板块"] = tr["code"].map(lambda c: ", ".join(concepts.get(str(c)[:6], [])[:3]))
     tr["action"] = tr["action"].map({"buy": "买入", "sell": "卖出", "force_sell": "期末清仓"}).fillna(tr["action"])
     tr["reason"] = tr["reason"].map({"new_tranche": "新开一档", "matured": "持满到期",
-                                     "end": "回测期末", "regime_exit": "大盘转弱清仓"}).fillna(tr["reason"])
+                                     "end": "回测期末", "regime_exit": "大盘转弱清仓",
+                                     "roll_trim": "连任减持", "roll_topup": "连任加仓",
+                                     "daily_fill": "日内补仓"}).fillna(tr["reason"])
     tr = tr.rename(columns={"date": "日期", "code": "股票代码", "action": "操作", "shares": "股数",
                             "price": "成交价", "gross": "成交金额", "fee": "手续费",
                             "net": "现金变动", "reason": "原因"})
