@@ -48,15 +48,20 @@ def load_meta():
     return names, concepts
 
 
-def benchmark_series(dates, train_file="training_data_v24.parquet", pit_universe=None):
+def benchmark_series(dates, train_file="training_data_v24.parquet", pit_universe=None,
+                     skip_boards=()):
     """池内等权买入持有基准的日收益, 与回测口径一致
 
     开启 PIT 成分约束时, 基准只统计当期生效成分股 (与回测完全同口径)。
+    主板-only 回测(skip_boards)的基准同样剪掉受限板块 —— 否则每日汇总表的
+    超额收益列和绩效摘要(读回测自带的主板基准)会对不上。
     """
     df = pd.read_parquet(ROOT / "data" / "processed" / train_file,
                          columns=["date", "code", "fwd_1d_ret"])
     df["date"] = pd.to_datetime(df["date"])
     df = df.dropna(subset=["fwd_1d_ret"])
+    if skip_boards:
+        df = df[~df["code"].astype(str).str.startswith(tuple(skip_boards))]
     if pit_universe:
         u = pd.read_parquet(ROOT / "data" / "universe" / pit_universe)
         u["effective_date"] = pd.to_datetime(u["effective_date"])
@@ -157,7 +162,7 @@ def export(src: Path, out: Path):
 
     # ── 每日汇总 ──
     bench = benchmark_series(daily["date"], res.get("train_file", "training_data_v24.parquet"),
-                            res.get("pit_universe"))
+                            res.get("pit_universe"), tuple(res.get("skip_boards") or ()))
     daily["基准日收益"] = bench
     daily["超额收益"] = daily["daily_ret"] - bench
     daily["策略净值"] = (1 + daily["daily_ret"]).cumprod()
