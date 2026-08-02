@@ -95,14 +95,20 @@ ap.add_argument("--regime-ma", type=int, default=20)
 ap.add_argument("--regime-breadth", type=float, default=0.35)
 ap.add_argument("--regime-confirm", type=int, default=1)
 ap.add_argument("--reversal-guard", type=float, default=0.0)
+ap.add_argument("--lot-flex", type=float, default=0.0,
+                help="整手粒度救济: 槽位预算买不起一手(100股)时, 若一手成本 <= 预算"
+                     "*(1+flex) 且现金足够, 仍买这一手而不是沿排名换下一只。"
+                     "与回测 --lot-flex 同义。0 = 关闭")
 ap.add_argument("--n-features", type=int, default=80)
 ap.add_argument("--corr-threshold", type=float, default=0.9)
 ap.add_argument("--feat-cutoff", default="2023-09-19",
                 help="特征筛选只允许用该日期之前的数据 (与回测保持一致)")
 ap.add_argument("--features-from",
-                default="wf_daily_em_t1close_s001_fundfix_ts2022-09-01_te2026-07-27_cap20000.json",
+                default="wf_daily_REGRESS_CHK_ts2022-09-01_te2026-07-27_cap50000.json",
                 help="直接复用回测结果 json 里的 selected_features (data/processed/ 下); "
-                     "设为 none 则现场重新筛选")
+                     "设为 none 则现场重新筛选。默认与 live_config.FEATURES_FROM 一致 "
+                     "(修复 drop_market_wide 后的干净 80 特征); 旧的 fundfix 58 特征集"
+                     "含 8 个市场级日历假象特征, 不要再用")
 ap.add_argument("--capital", type=float, default=20000.0, help="初始本金 (仅 --init 时使用)")
 ap.add_argument("--init", action="store_true", help="重置状态文件, 用 --capital 作为起始现金")
 ap.add_argument("--state", default="state.json", help="状态文件名 (data/live/ 下)")
@@ -184,6 +190,7 @@ LOCKED_PARAMS = dict(
 TRADE_COST = 0.0006
 MIN_FEE = 5.0
 SLIPPAGE = args.slippage
+LOT_FLEX = args.lot_flex
 HOLD_DAYS, TRANCHE_N = args.hold_days, args.tranche_n
 PERIODIC = args.portfolio_mode == "periodic"
 TARGET_POSITIONS = TRANCHE_N if PERIODIC else HOLD_DAYS * TRANCHE_N
@@ -677,8 +684,12 @@ def settle(st, pending, exec_date, kl, names, cal):
             alloc = remaining / (TRANCHE_N - bought)
             shares = int(alloc / (px * 100)) * 100
             if shares <= 0:
-                rejected.append({"code": code, "action": "buy", "reason": "预算不足一手"})
-                continue
+                # 整手粒度救济: 与回测引擎同义 (wf_v35 --lot-flex)
+                if LOT_FLEX > 0 and px * 100 <= alloc * (1 + LOT_FLEX):
+                    shares = 100
+                else:
+                    rejected.append({"code": code, "action": "buy", "reason": "预算不足一手"})
+                    continue
             gross = shares * px
             fee = max(gross * TRADE_COST, MIN_FEE)
             if gross + fee > st["cash"]:
@@ -1392,10 +1403,14 @@ if not in_cash and is_rebal:
             alloc = remaining / (TRANCHE_N - bought)
             shares = int(alloc / (px * 100)) * 100
             if shares <= 0:
-                alt_plan.append({"code": code, "name": names.get(code, ""),
-                                 "ref_close": round(ref, 3), "pred": round(pred_map[code], 6),
-                                 "note": "预算不足一手"})
-                continue
+                # 整手粒度救济: 计划与结算必须同一口径, 否则挂单和入账会对不上
+                if LOT_FLEX > 0 and px * 100 <= alloc * (1 + LOT_FLEX):
+                    shares = 100
+                else:
+                    alt_plan.append({"code": code, "name": names.get(code, ""),
+                                     "ref_close": round(ref, 3), "pred": round(pred_map[code], 6),
+                                     "note": "预算不足一手"})
+                    continue
             gross = shares * px
             fee = max(gross * TRADE_COST, MIN_FEE)
             remaining -= gross + fee

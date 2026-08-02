@@ -90,6 +90,10 @@ parser.add_argument("--reversal-guard", type=float, default=0.0,
                     help="反转护栏: 排除信号日近5日涨幅处于截面前 X 分位的候选股 "
                          "(如 0.10 = 剔除涨幅前10%的股票, 0 = 关闭)。"
                          "针对急涨行情中追高被打脸的问题")
+parser.add_argument("--lot-flex", type=float, default=0.0,
+                    help="整手粒度救济: 槽位预算买不起一手(100股)时, 若一手成本 "
+                         "<= 槽位预算*(1+flex) 且现金足够, 仍买这一手, 而不是沿排名 "
+                         "换下一只。用等权纪律换信号保真度。0 = 关闭(旧行为)")
 parser.add_argument("--save-preds", type=str, default=None,
                     help="把逐日模型预测结果缓存到此 pickle (data/processed/ 下)")
 parser.add_argument("--load-preds", type=str, default=None,
@@ -133,6 +137,7 @@ TEST_START, TEST_END = args.test_start, args.test_end
 HOLD_DAYS, TRANCHE_N = args.hold_days, args.tranche_n
 PERIODIC = args.portfolio_mode == "periodic"
 NO_ROLL = args.no_roll
+LOT_FLEX = args.lot_flex
 TARGET_POSITIONS = TRANCHE_N if PERIODIC else HOLD_DAYS * TRANCHE_N
 MIN_TRAIN_DAYS = 250
 
@@ -786,6 +791,7 @@ rejected_buy = rejected_sell = 0
 # 拒单原因分解: 停牌/涨停/一手都买不起/现金不足/跌停卖不掉
 rej = {"buy_halt": 0, "buy_limit_up": 0, "buy_lot_too_big": 0,
        "buy_no_cash": 0, "sell_halt": 0, "sell_limit_down": 0}
+n_lot_flex = 0               # 整手粒度救济触发次数 (--lot-flex)
 ic_hist, in_cash, ic_cash = [], False, False
 n_cash_days = 0
 # 续持次数: 到期但仍在目标名单里, 省下一次往返成本
@@ -956,9 +962,15 @@ for i, (dp, exec_date) in enumerate(sched):
             alloc = remaining / (TRANCHE_N - bought)
             shares = int(alloc / (px * 100)) * 100
             if shares <= 0:                         # 预算不足一手(100股)
-                rejected_buy += 1
-                rej["buy_lot_too_big"] += 1
-                continue
+                # 整手粒度救济: 一手成本在预算容忍带内就买, 保住排名靠前的信号。
+                # 超出的部分由 remaining 自然扣减, 后面的槽位预算相应变小。
+                if LOT_FLEX > 0 and px * 100 <= alloc * (1 + LOT_FLEX):
+                    shares = 100
+                    n_lot_flex += 1
+                else:
+                    rejected_buy += 1
+                    rej["buy_lot_too_big"] += 1
+                    continue
             gross = shares * px
             fee = max(gross * TRADE_COST, MIN_FEE)
             if gross + fee > cash:
@@ -1107,6 +1119,7 @@ json.dump({
     "regime_filter": args.regime_filter, "regime_ma": args.regime_ma,
     "regime_breadth": args.regime_breadth, "regime_confirm": args.regime_confirm,
     "reversal_guard": args.reversal_guard,
+    "lot_flex": LOT_FLEX,
     "features": len(features), "selected_features": features,
     "feat_select_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}",
     "feat_select_seeds": args.select_seeds,
@@ -1133,6 +1146,7 @@ json.dump({
         "reject_breakdown": rej,
         "n_trades": len(trade_log),
         "n_rolled": n_rolled,
+        "n_lot_flex": n_lot_flex,
         "cash_days": n_cash_days,
         "cash_days_pct": round(100 * n_cash_days / n, 1) if n else 0.0,
         "beat_benchmark": bool(excess.mean() > 0),
