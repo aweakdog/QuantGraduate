@@ -94,6 +94,11 @@ parser.add_argument("--lot-flex", type=float, default=0.0,
                     help="整手粒度救济: 槽位预算买不起一手(100股)时, 若一手成本 "
                          "<= 槽位预算*(1+flex) 且现金足够, 仍买这一手, 而不是沿排名 "
                          "换下一只。用等权纪律换信号保真度。0 = 关闭(旧行为)")
+parser.add_argument("--roll-rank", type=int, default=0,
+                    help="卖出容忍: 到期持仓只要仍在当日排名前 M 名就继续持有, 而不是"
+                         "只有进前 TRANCHE_N 名才续持。买入门槛不变(仍只买最强的)。"
+                         "从第2名滑到第7名的股不再值得新买, 但也不值得付往返成本换掉。"
+                         "0 = 关闭(等于 TRANCHE_N, 旧行为)")
 parser.add_argument("--save-preds", type=str, default=None,
                     help="把逐日模型预测结果缓存到此 pickle (data/processed/ 下)")
 parser.add_argument("--load-preds", type=str, default=None,
@@ -102,6 +107,14 @@ parser.add_argument("--load-preds", type=str, default=None,
 parser.add_argument("--features-from", type=str, default=None,
                     help="直接复用另一份回测 json 里的 selected_features (data/processed/ 下), "
                          "不现场筛选。用于隔离'数据变了'和'特征集变了'两个变量")
+parser.add_argument("--export-matrix", type=str, default=None,
+                    help="把准备好的训练矩阵(含市场/隔夜特征、demean标签、选定特征列)导出到 "
+                         "data/processed/ 下的 parquet(+同名.meta.json), 然后退出。"
+                         "给外部模型实验(如 GPU MLP)用, 保证数据口径与本脚本完全一致")
+parser.add_argument("--lgb-seed", type=int, default=42,
+                    help="LightGBM random_state。不是可调超参 —— 仅供多种子集成实验"
+                         "(同一模型训多个种子平均排名, 降低前3名选择方差)使用。"
+                         "禁止用它挑好看的单种子结果")
 parser.add_argument("--tag", type=str, default=None)
 args = parser.parse_args()
 
@@ -128,6 +141,7 @@ LOCKED_PARAMS = dict(
     min_child_samples=50, random_state=42, n_jobs=10, verbosity=-1,
     boosting_type="dart",
 )
+LOCKED_PARAMS["random_state"] = args.lgb_seed   # 仅多种子集成用, 见 --lgb-seed 说明
 
 TRADE_COST = args.trade_cost
 MIN_FEE = args.min_fee
@@ -138,6 +152,7 @@ HOLD_DAYS, TRANCHE_N = args.hold_days, args.tranche_n
 PERIODIC = args.portfolio_mode == "periodic"
 NO_ROLL = args.no_roll
 LOT_FLEX = args.lot_flex
+ROLL_RANK = args.roll_rank
 TARGET_POSITIONS = TRANCHE_N if PERIODIC else HOLD_DAYS * TRANCHE_N
 MIN_TRAIN_DAYS = 250
 
@@ -641,6 +656,23 @@ else:
     FEAT_IMPORTANCE = _imp_table.head(120).to_dict("records")
 style_cols = [c for c in STYLE_CANDIDATES if c in df.columns]
 
+if args.export_matrix:
+    _mp = DATA_DIR / "processed" / args.export_matrix
+    _cols = ["date", "code", LABEL, LABEL_RAW] + features
+    df[_cols].to_parquet(_mp, index=False)
+    _meta = {"features": features, "label": LABEL, "label_raw": LABEL_RAW,
+             "label_horizon": LABEL_HORIZON, "first_pred": str(pd.Timestamp(FIRST_PRED).date()),
+             "min_train_days": MIN_TRAIN_DAYS,
+             "test_start": TEST_START, "test_end": TEST_END,
+             "train_file": args.train_file, "pit_universe": args.pit_universe,
+             "features_from": args.features_from,
+             "说明": "行 = PIT池内样本; y_target 已按日 demean; 末尾无标签日期仅供出信号; "
+                   "训练时 X 按 code 先 ffill 再 fillna(0), 预测日直接 fillna(0) (与 wf_v35 同口径)"}
+    with open(str(_mp) + ".meta.json", "w", encoding="utf-8") as fh:
+        json.dump(_meta, fh, ensure_ascii=False, indent=1)
+    print(f"已导出训练矩阵: {_mp} ({len(df)} 行, {len(features)} 特征) + meta。退出。")
+    raise SystemExit(0)
+
 mkt_position = None
 if args.vol_target:
     va = mkt_df.set_index("date")["mkt_vol_20d"] * np.sqrt(252)
@@ -670,13 +702,20 @@ if args.load_preds:
     with open(_cache, "rb") as fh:
         cached = pickle.load(fh)
     meta, daily_preds = cached["meta"], cached["preds"]
-    # 校验模型相关参数一致, 不一致则拒绝复用
-    for k, v in [("train_file", args.train_file), ("pit_universe", args.pit_universe),
-                 ("label", args.label), ("objective", args.objective),
-                 ("test_start", TEST_START), ("test_end", TEST_END),
-                 ("neutralize_style", args.neutralize_style),
-                 ("n_features", len(features)),
-                 ("feat_cutoff", f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}")]:
+    # 校验模型相关参数一致, 不一致则拒绝复用。
+    # 外部模型缓存(meta 带 "model" 字段, 如 wf_mlp_gpu / 种子集成)不比 objective:
+    # 它们本来就不是 LightGBM, 但数据口径字段必须全部一致。
+    _checks = [("train_file", args.train_file), ("pit_universe", args.pit_universe),
+               ("label", args.label),
+               ("test_start", TEST_START), ("test_end", TEST_END),
+               ("neutralize_style", args.neutralize_style),
+               ("n_features", len(features)),
+               ("feat_cutoff", f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}")]
+    if "model" not in meta:
+        _checks.append(("objective", args.objective))
+    else:
+        print(f"  外部模型缓存: model={meta['model']} (跳过 objective 校验)")
+    for k, v in _checks:
         if meta.get(k) != v:
             raise SystemExit(f"ERROR: 预测缓存不匹配 ({k}: 缓存={meta.get(k)} 当前={v})")
     # 护栏只依赖行情不依赖模型, 每次按当前参数重算
@@ -735,6 +774,7 @@ for i, pred_date in enumerate([] if args.load_preds else dates):
             blocked = set(r5.loc[pct >= 1 - args.reversal_guard, "code"])
 
     daily_preds.append({"date": pred_date, "ranked": list(ranked["code"]),
+                        "pred_vals": [round(float(v), 6) for v in ranked["pred"]],
                         "ic": ic, "blocked": blocked})
 
     if i % 50 == 0 or i == len(dates) - 1:
@@ -750,7 +790,10 @@ if args.save_preds:
             "neutralize_style": args.neutralize_style,
             "n_features": len(features),
             "feat_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}"}
-    slim = [{"date": dp["date"], "ranked": dp["ranked"], "ic": dp["ic"]} for dp in daily_preds]
+    # v2 格式: 多存 pred_vals (与 ranked 对齐的预测值)。没有它就无法做
+    # "信号强度门槛/离散度择时"一类实验 —— 旧 v1 缓存只存了排名。
+    slim = [{"date": dp["date"], "ranked": dp["ranked"], "ic": dp["ic"],
+             "pred_vals": dp.get("pred_vals")} for dp in daily_preds]
     with open(cache_path, "wb") as fh:
         pickle.dump({"meta": meta, "preds": slim}, fh)
     print(f"预测缓存已保存: {cache_path}")
@@ -833,8 +876,11 @@ for i, (dp, exec_date) in enumerate(sched):
         pass                  # --no-roll: 退回旧行为(到期一律卖掉再买回), 仅供 A/B
     elif PERIODIC and is_rebal and not in_cash:
         _blocked = dp.get("blocked") or set()
+        # --roll-rank: 卖出门槛比买入宽。新买仍只买前 TRANCHE_N 名,
+        # 但已持仓只要没掉出前 M 名就不卖 (避免为微小排名变化付往返成本)
+        _lim = max(TRANCHE_N, ROLL_RANK) if ROLL_RANK else TRANCHE_N
         for code in dp["ranked"]:
-            if len(roll_set) >= TRANCHE_N:
+            if len(roll_set) >= _lim:
                 break
             if code in _blocked:
                 continue
@@ -1120,6 +1166,7 @@ json.dump({
     "regime_breadth": args.regime_breadth, "regime_confirm": args.regime_confirm,
     "reversal_guard": args.reversal_guard,
     "lot_flex": LOT_FLEX,
+    "roll_rank": ROLL_RANK,
     "features": len(features), "selected_features": features,
     "feat_select_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}",
     "feat_select_seeds": args.select_seeds,
