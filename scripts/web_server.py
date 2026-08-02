@@ -1408,6 +1408,43 @@ async def api_recommend(profile: str = None):
     return build_recommend(ROOT, profile)
 
 
+@app.get("/api/kline")
+async def api_kline(code: str, period: str = "day", bars: int = 120):
+    """单只股票的 K 线 (日/周/月), 推荐看板点开看图用。只读。
+
+    周/月线由日线现场重采样 (周=自然周五收, 月=自然月末), 和行情软件口径
+    一致。价格是入库的前复权价, 与模型看到的一致。
+    """
+    import pandas as pd  # 懒加载: 只有这个接口用 pandas, 不拖慢服务启动
+    c = "".join(ch for ch in str(code) if ch.isdigit())[:6]
+    if len(c) != 6:
+        return JSONResponse({"error": f"非法代码 {code!r}"}, status_code=400)
+    if period not in ("day", "week", "month"):
+        return JSONResponse({"error": f"period 只能是 day/week/month"}, status_code=400)
+    p = KLINE_DIR / f"{c}.parquet"
+    if not p.exists():
+        return JSONResponse({"error": f"{c} 没有K线数据"}, status_code=404)
+    kl = pd.read_parquet(p).rename(columns={
+        "时间": "date", "收盘价": "close", "开盘价": "open",
+        "最高价": "high", "最低价": "low", "成交量": "volume"})
+    kl["date"] = pd.to_datetime(kl["date"])
+    kl = kl.sort_values("date").set_index("date")[["open", "high", "low", "close", "volume"]]
+    if period != "day":
+        rule = "W-FRI" if period == "week" else "ME"
+        kl = kl.resample(rule).agg({"open": "first", "high": "max", "low": "min",
+                                    "close": "last", "volume": "sum"}).dropna(subset=["close"])
+    bars = max(20, min(int(bars), 500))
+    kl = kl.tail(bars)
+    return {
+        "code": c, "period": period, "n": len(kl),
+        "k": [{"d": d.strftime("%Y-%m-%d"),
+               "o": round(float(r["open"]), 3), "h": round(float(r["high"]), 3),
+               "l": round(float(r["low"]), 3), "c": round(float(r["close"]), 3),
+               "v": float(r["volume"] or 0)}
+              for d, r in kl.iterrows()],
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def action_page():
     """默认页 = 行动清单 (给看的人照着执行)"""

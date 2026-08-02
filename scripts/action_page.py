@@ -497,6 +497,15 @@ ACTION_HTML = """<!DOCTYPE html>
   /* 主板-only 徽标: 该线账户没开创业板/科创板权限 */
   .mode-mb{background:#172554;color:#93c5fd}
 
+  /* K线弹窗: 推荐行点开看日/周/月K */
+  .kmodal{max-width:760px;width:94vw}
+  .ktabs{display:flex;gap:6px;margin:10px 0}
+  .ktab{flex:1;text-align:center;padding:7px 0;border-radius:8px;background:#14171e;
+        color:#8a93a6;font-size:13px;font-weight:600;cursor:pointer;border:1px solid #1e222b}
+  .ktab.on{background:#2563eb;color:#fff;border-color:#2563eb}
+  .kbody svg{width:100%;height:auto;display:block}
+  .kinfo{font-size:11px;color:#6f7889;margin-top:6px;line-height:1.6}
+
   /* 操作按钮 */
   .acts{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
   .btn{flex:1;min-width:96px;text-align:center;padding:9px 8px;border-radius:9px;
@@ -859,16 +868,95 @@ function recRow(r){
     ((LASTD && LASTD.exec_day_text) ? esc(LASTD.exec_day_text) + '买' : '计划买入') + '</span>');
   if (!r.affordable) chips.push('<span class="chip chip-no">买不起一手</span>');
   if (r.blocked) chips.push('<span class="chip chip-blk">急涨回避</span>');
-  return `<div class="rec ${r.rank<=3?'top3':''}">
+  return `<div class="rec ${r.rank<=3?'top3':''}" data-code="${r.code}" onclick="showK(this.dataset.code)"
+       style="cursor:pointer" title="点击看 K 线">
     <div class="rk">${r.rank}</div>
     <div class="rb">
       <div class="rn">${r.name||r.code}
-        <span style="font-size:12px;color:#6f7889;font-weight:400">${r.code}</span>${chips.join('')}</div>
+        <span style="font-size:12px;color:#6f7889;font-weight:400">${r.code}</span>${chips.join('')}
+        <span style="font-size:11px;color:#3b82f6">📈</span></div>
       <div class="rm">收盘 ${r.close==null?'--':r.close} · 一手 ${money(r.lot_cost)}</div>
     </div>
     <div class="rv"><span style="color:#8a93a6">得分</span><br>
       <b style="color:#c9cdd6">${r.pred==null?'--':(r.pred*100).toFixed(2)}</b></div>
   </div>`;
+}
+
+// ── K线弹窗 (日/周/月) ──────────────────────────────────────
+let KCODE = null, KPER = localStorage.getItem('kper') || 'day';
+
+async function showK(code){
+  KCODE = code;
+  const it = ((LASTD && LASTD.items) || []).find(x => x.code === code) || {};
+  $('#modal').innerHTML = `
+    <div class="mask" onclick="if(event.target===this)closeModal()">
+      <div class="modal kmodal">
+        <h3 style="margin-bottom:2px">${esc(it.name||code)}
+          <span style="color:#6f7889;font-size:13px;font-weight:400">${esc(code)}</span></h3>
+        <div class="ktabs">
+          <div class="ktab" id="kt-day" onclick="setKPer('day')">日K</div>
+          <div class="ktab" id="kt-week" onclick="setKPer('week')">周K</div>
+          <div class="ktab" id="kt-month" onclick="setKPer('month')">月K</div>
+        </div>
+        <div class="kbody" id="kbody"></div>
+        <div class="kinfo" id="kinfo"></div>
+        <div class="mbtns"><div class="btn" onclick="closeModal()">关闭</div></div>
+      </div></div>`;
+  loadK();
+}
+
+function setKPer(p){ KPER = p; localStorage.setItem('kper', p); loadK(); }
+
+async function loadK(){
+  for (const p of ['day','week','month'])
+    $('#kt-'+p).classList.toggle('on', p===KPER);
+  const bars = KPER==='day' ? 120 : (KPER==='week' ? 104 : 96);
+  $('#kbody').innerHTML = '<div style="text-align:center;color:#6f7889;padding:40px 0">加载中…</div>';
+  let d;
+  try{ d = await (await fetch(`/api/kline?code=${KCODE}&period=${KPER}&bars=${bars}`)).json(); }
+  catch(e){ $('#kbody').innerHTML = '<div style="text-align:center;color:#6f7889;padding:40px 0">加载失败</div>'; return; }
+  if (!d.k || !d.k.length){ $('#kbody').innerHTML = '<div style="text-align:center;color:#6f7889;padding:40px 0">'+esc(d.error||'无数据')+'</div>'; return; }
+  $('#kbody').innerHTML = candleSVG(d.k);
+  const L = d.k[d.k.length-1];
+  const chg = d.k.length>1 ? (L.c/d.k[d.k.length-2].c-1)*100 : 0;
+  $('#kinfo').innerHTML = `${d.k.length} 根 · 最新 ${L.d} 收 <b style="color:${chg>=0?'#f25c54':'#4caf50'}">${L.c}
+    (${chg>=0?'+':''}${chg.toFixed(2)}%)</b> · 黄线MA5 蓝线MA20 · 前复权价, 与模型看到的一致`;
+}
+
+function candleSVG(k){
+  const W=720, PH=290, VH=64, GAP=14, H=PH+GAP+VH+18;
+  const n=k.length, slot=W/n, bw=Math.max(1.5, slot*0.62);
+  const hi=Math.max(...k.map(x=>x.h)), lo=Math.min(...k.map(x=>x.l));
+  const vmax=Math.max(...k.map(x=>x.v))||1, pr=hi-lo||1;
+  const y=v=>PH-(v-lo)/pr*(PH-12)-6, x=i=>i*slot+slot/2;
+  const ma=w=>k.map((_,i)=> i<w-1?null: k.slice(i-w+1,i+1).reduce((s,b)=>s+b.c,0)/w);
+  const line=(arr,color)=>{
+    const pts=arr.map((v,i)=>v==null?null:`${x(i).toFixed(1)},${y(v).toFixed(1)}`).filter(Boolean);
+    return pts.length>1?`<polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="1.1" opacity="0.85"/>`:'';
+  };
+  let s=`<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
+  // 网格 + 价格刻度
+  for(let g=0;g<=3;g++){
+    const gy=6+g*(PH-12)/3, pv=(hi-g*pr/3);
+    s+=`<line x1="0" y1="${gy}" x2="${W}" y2="${gy}" stroke="#1e222b" stroke-width="1"/>`;
+    s+=`<text x="${W-4}" y="${gy-3}" fill="#6f7889" font-size="10" text-anchor="end">${pv.toFixed(2)}</text>`;
+  }
+  // 日期刻度 (5个)
+  for(let t=0;t<5;t++){
+    const i=Math.min(n-1, Math.round(t*(n-1)/4));
+    s+=`<text x="${x(i)}" y="${H-4}" fill="#6f7889" font-size="10" text-anchor="middle">${k[i].d.slice(2)}</text>`;
+  }
+  // 蜡烛 (A股: 红涨绿跌) + 量
+  for(let i=0;i<n;i++){
+    const b=k[i], up=b.c>=b.o, col=up?'#f25c54':'#4caf50';
+    s+=`<line x1="${x(i)}" y1="${y(b.h)}" x2="${x(i)}" y2="${y(b.l)}" stroke="${col}" stroke-width="1"/>`;
+    const top=y(Math.max(b.o,b.c)), hh=Math.max(1, Math.abs(y(b.o)-y(b.c)));
+    s+=`<rect x="${x(i)-bw/2}" y="${top}" width="${bw}" height="${hh}" fill="${col}"/>`;
+    const vh=b.v/vmax*(VH-4);
+    s+=`<rect x="${x(i)-bw/2}" y="${PH+GAP+VH-vh}" width="${bw}" height="${vh}" fill="${col}" opacity="0.55"/>`;
+  }
+  s+=line(ma(5),'#f9e2af')+line(ma(20),'#89b4fa');
+  return s+'</svg>';
 }
 
 function setView(v){
