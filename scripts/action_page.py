@@ -156,23 +156,63 @@ def _next_rebal(state, plan):
     return date, left
 
 
-def _freshness(root: Path, state, plan):
-    """判断展示的计划是否对应最新交易日。
+def _trading_days_between(state, start, end):
+    """日历上 start -> end 之间隔了几个交易日。查不到就返回 None。"""
+    cal = state.get("calendar") or []
+    if not cal or not start or not end:
+        return None
+    idx = pd.DatetimeIndex([pd.Timestamp(x) for x in cal])
+    i0 = int(idx.searchsorted(pd.Timestamp(start), side="right")) - 1
+    i1 = int(idx.searchsorted(pd.Timestamp(end), side="right")) - 1
+    if i0 < 0 or i1 < 0:
+        return None
+    return max(0, i1 - i0)
 
-    K线最新日 > 计划信号日 说明当日流水线还没跑(或失败), 页面上的操作是旧的。
+
+def _freshness(root: Path, state, plan):
+    """判断展示的计划是否对应最新交易日, 并给出【落后的真实原因】。
+
+    计划信号日落后于最新行情日, 有两种完全不同的原因, 必须分开报:
+
+      awaiting_confirm —— 实盘模式在等你填真实成交价。这条线是【故意】停住的
+          (live_signal.py 的 require_confirm 闸门), 流水线本身好得很。
+          之前这里一律报"当日流水线可能未跑或失败", 页面顶部让你确认成交、
+          主横幅却红底写"数据未更新", 两条信息自相矛盾, 会把人指去查一个
+          根本不存在的故障。
+
+      pipeline —— 真的没跑或跑失败了, 需要去运维页看日志。
+
+    另外要区分"等确认"是否已逾期: 计划的执行日就是最新交易日时, 属于当晚
+    数据刚到、正常等你确认, 完全不该报警; 执行日已经比最新交易日早了 N 个
+    交易日还没确认, 才需要升级提醒。
     """
     pipe = _load_json(root / "data" / "live" / "pipeline_status.json") or {}
     kline_date = pipe.get("kline_max_date")
     train_date = pipe.get("train_max_date") or (pipe.get("new_train_info") or {}).get("max_date")
     sig = (plan or {}).get("signal_date")
-    stale, note = False, ""
-    if kline_date and sig:
-        if pd.Timestamp(sig) < pd.Timestamp(kline_date):
-            stale = True
+    await_ac = state.get("awaiting_confirm") or None
+    stale, note, reason, overdue = False, "", "", None
+
+    if kline_date and sig and pd.Timestamp(sig) < pd.Timestamp(kline_date):
+        stale = True
+        # 落后能否由"在等确认"解释: 等确认锁住的正是这份计划
+        explained = bool(await_ac) and str(await_ac.get("signal_date") or "") == str(sig)
+        if explained:
+            reason = "awaiting_confirm"
+            exec_date = await_ac.get("exec_date")
+            overdue = _trading_days_between(state, exec_date, kline_date)
+            if overdue:
+                note = (f"这条线在等你确认 {exec_date} 的成交, 已过 {overdue} 个交易日"
+                        f"未确认。期间不记账也不出新信号 —— 确认或选「未成交」后立即追平。")
+            else:
+                note = (f"这条线在等你确认 {exec_date} 的成交, 确认后才会出新信号。"
+                        f"流水线正常, 不是数据问题。")
+        else:
+            reason = "pipeline"
             note = (f"计划信号日 {sig} 落后于最新行情日 {kline_date}, "
                     f"当日流水线可能未跑或失败")
     if not sig:
-        stale, note = True, "还没有任何操作计划"
+        stale, note, reason = True, "还没有任何操作计划", "no_plan"
     return {
         "kline_date": kline_date,
         "train_date": train_date,
@@ -181,6 +221,8 @@ def _freshness(root: Path, state, plan):
         "pipeline_finished_at": pipe.get("finished_at"),
         "pipeline_skipped": pipe.get("skipped_reason"),
         "stale": stale,
+        "reason": reason,
+        "awaiting_overdue_days": overdue,
         "note": note,
     }
 
@@ -352,7 +394,14 @@ def build_today(root: Path, pid=None):
     is_rebal = bool((plan or {}).get("is_rebal"))
 
     # ── 行动类型: 决定页面主横幅 ──
-    if fresh["stale"]:
+    # "等你确认"不是故障, 所以不能走 stale 那条红底"数据未更新"分支 ——
+    # 页面顶部已经在让你填成交价了, 主横幅再说"数据未更新"是自相矛盾的。
+    if fresh["stale"] and fresh["reason"] == "awaiting_confirm":
+        action = "await"
+        od = fresh["awaiting_overdue_days"]
+        headline = "等你确认成交" if not od else f"等你确认成交 · 已逾期 {od} 天"
+        subline = fresh["note"]
+    elif fresh["stale"]:
         action = "stale"
         headline = "数据未更新"
         subline = fresh["note"]
@@ -630,6 +679,8 @@ ACTION_HTML = """<!DOCTYPE html>
   .b-trade{background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#eef4ff}
   .b-cash{background:linear-gradient(135deg,#7c2d12,#ea580c);color:#fff5ec}
   .b-stale{background:linear-gradient(135deg,#7f1d1d,#dc2626);color:#fff0f0}
+  /* 等你确认: 是待办不是故障, 用琥珀色(与待确认面板同色系), 不要用报错的红 */
+  .b-await{background:linear-gradient(135deg,#78350f,#b45309);color:#fff7ed}
   .b-init{background:#26292f;color:#c9cdd6}
 
   .card{background:#14171e;border-radius:14px;padding:16px;margin-bottom:12px}
@@ -1470,7 +1521,8 @@ async function loadAct(){
   $('#sigdate').textContent = d.signal_date ? ('信号日 ' + d.signal_date) : '';
   $('#gen').textContent = d.plan_generated_at ? ('计划生成于 ' + d.plan_generated_at.replace('T',' ')) : '';
 
-  const bcls = {none:'b-none', trade:'b-trade', cash:'b-cash', stale:'b-stale', init:'b-init'}[d.action] || 'b-init';
+  const bcls = {none:'b-none', trade:'b-trade', cash:'b-cash', stale:'b-stale',
+                await:'b-await', init:'b-init'}[d.action] || 'b-init';
   let h = '';
 
   // 实盘模式在等你确认时, 整条线都停着, 所以置顶提示。
@@ -1503,7 +1555,8 @@ async function loadAct(){
     h += `<div class="when">下次换仓 <b>${d.next_rebal.date || ('还有 ' + d.next_rebal.trading_days_left + ' 个交易日')}</b></div>`;
   h += `</div>`;
 
-  if (d.freshness && d.freshness.stale && d.action !== 'stale')
+  // 横幅已经把原因说完了(stale / await 两种), 不再重复一遍
+  if (d.freshness && d.freshness.stale && d.action !== 'stale' && d.action !== 'await')
     h += `<div class="warn">${d.freshness.note}</div>`;
 
   // 操作清单。打勾的含义完全取决于记账方式, 所以标题和说明也跟着变
