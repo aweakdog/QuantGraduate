@@ -19,11 +19,16 @@ Walk-Forward v35: 最小验证版 —— 只改两件事, 检验能否跑赢等�
 强制输出与【等权买入持有】基准的对比: 超额 / IR / beta / alpha
 """
 import pandas as pd, numpy as np, json, warnings, argparse
+import sys
 from pathlib import Path
 from datetime import datetime
 from scipy.stats import spearmanr
 warnings.filterwarnings("ignore")
 import lightgbm as lgb
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 parser = argparse.ArgumentParser(description="WF v35 breadth + alpha vs benchmark")
 parser.add_argument("--test-start", type=str, default="2022-09-01")
@@ -83,6 +88,11 @@ parser.add_argument("--regime-confirm", type=int, default=2,
                     help="连续N个信号日满足条件才切换状态(双向), 抑制来回打脸")
 parser.add_argument("--train-file", type=str, default="training_data_v24.parquet",
                     help="训练集文件名 (data/processed/ 下)")
+parser.add_argument("--train-start", type=str, default=None,
+                    help="训练样本最早日期 (含), 如 2022-09-01。默认用矩阵全部历史。"
+                         "用于在同一份数据上隔离'训练历史长度'这一个变量: 矩阵/股票池/"
+                         "特征全不变, 只截短模型能看到的历史。注意 MIN_TRAIN_DAYS 仍需满足, "
+                         "截短后首个出信号日会相应推后")
 parser.add_argument("--pit-universe", type=str, default=None,
                     help="PIT 股票池 parquet (data/universe/ 下), 如 universe_pit.parquet; "
                          "开启后每行样本只保留当期生效成分股, 训练/预测/基准均受约束")
@@ -162,6 +172,7 @@ MIN_FEE = args.min_fee
 SLIPPAGE = args.slippage
 INIT_CAPITAL = args.initial_capital
 TEST_START, TEST_END = args.test_start, args.test_end
+TRAIN_START = pd.Timestamp(args.train_start) if args.train_start else None
 HOLD_DAYS, TRANCHE_N = args.hold_days, args.tranche_n
 PERIODIC = args.portfolio_mode == "periodic"
 NO_ROLL = args.no_roll
@@ -647,6 +658,8 @@ if not dates:
 # ── 首个真正能出信号的日期 (准入条件与下方训练循环完全一致) ──
 # 特征筛选只能用这一天之前的数据, 否则会用到测试期的 fwd 标签 = 未来泄漏
 _labeled_dates = np.array(sorted(df.loc[df[LABEL].notna(), "date"].unique()))
+if TRAIN_START is not None:
+    _labeled_dates = _labeled_dates[_labeled_dates >= TRAIN_START]
 FIRST_PRED = None
 for _d in dates:
     _gp = date_pos[_d]
@@ -708,6 +721,10 @@ print(f"\n走进式回测: {len(dates)} 天 ({dates[0].date()} ~ {dates[-1].date
 print(f"标签: {LABEL_RAW} (按日期demean) | 持有 {HOLD_DAYS} 天 | 组合模式 {args.portfolio_mode}"
       f" | 目标持仓 {TARGET_POSITIONS} 只 | 本金 ¥{INIT_CAPITAL:,.0f}")
 print(f"目标函数: {args.objective} | 风格中性化: {'开 ' + str(style_cols) if args.neutralize_style else '关'}")
+_hist_from = TRAIN_START if TRAIN_START is not None else df["date"].min()
+print(f"训练历史: {pd.Timestamp(_hist_from):%Y-%m-%d} 起"
+      f"{' (--train-start 截短)' if TRAIN_START is not None else ' (矩阵全部)'}"
+      f" | 至少 {MIN_TRAIN_DAYS} 天 -> 首个出信号日 {pd.Timestamp(FIRST_PRED):%Y-%m-%d}")
 print(f"择时: {'开' if args.ic_timing else '关'} | 波动率目标仓位: {'开' if args.vol_target else '关'}")
 if regime_state is not None:
     _rs = regime_state.loc[(regime_state.index >= pd.Timestamp(TEST_START))]
@@ -732,7 +749,7 @@ if args.load_preds:
     # 外部模型缓存(meta 带 "model" 字段, 如 wf_mlp_gpu / 种子集成)不比 objective:
     # 它们本来就不是 LightGBM, 但数据口径字段必须全部一致。
     _checks = [("train_file", args.train_file), ("pit_universe", args.pit_universe),
-               ("label", args.label),
+               ("label", args.label), ("train_start", args.train_start),
                ("test_start", TEST_START), ("test_end", TEST_END),
                ("neutralize_style", args.neutralize_style),
                ("n_features", len(features)),
@@ -762,7 +779,10 @@ for i, pred_date in enumerate([] if args.load_preds else dates):
     if gpos - LABEL_HORIZON < 0:
         continue
     cutoff = all_dates[gpos - LABEL_HORIZON]
-    train_df = df[(df["date"] < cutoff) & df[LABEL].notna()]
+    _tr_mask = (df["date"] < cutoff) & df[LABEL].notna()
+    if TRAIN_START is not None:
+        _tr_mask &= df["date"] >= TRAIN_START
+    train_df = df[_tr_mask]
     if train_df["date"].nunique() < MIN_TRAIN_DAYS:
         continue
 
@@ -812,6 +832,7 @@ if args.save_preds:
     cache_path = DATA_DIR / "processed" / args.save_preds
     meta = {"train_file": args.train_file, "pit_universe": args.pit_universe,
             "label": args.label, "objective": args.objective,
+            "train_start": args.train_start,
             "test_start": TEST_START, "test_end": TEST_END,
             "neutralize_style": args.neutralize_style,
             "n_features": len(features),
@@ -1220,6 +1241,9 @@ json.dump({
     "hold_days": HOLD_DAYS, "tranche_n": TRANCHE_N, "target_positions": TARGET_POSITIONS,
     "ic_timing": args.ic_timing, "vol_target": args.vol_target,
     "train_file": args.train_file, "pit_universe": args.pit_universe,
+    "train_start": args.train_start,
+    "first_pred": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}",
+    "min_train_days": MIN_TRAIN_DAYS,
     "regime_filter": args.regime_filter, "regime_ma": args.regime_ma,
     "regime_breadth": args.regime_breadth, "regime_confirm": args.regime_confirm,
     "reversal_guard": args.reversal_guard,

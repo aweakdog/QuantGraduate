@@ -1,10 +1,6 @@
 """
 数据引擎 — 模块加载与基础功能测试
 """
-import pytest
-from pathlib import Path
-
-
 class TestDataEngineImport:
 
     def test_pipeline_importable(self):
@@ -38,7 +34,9 @@ class TestDataEngineImport:
 
     def test_chain_leader_monitor_importable(self):
         from pipeline.chain_leader_monitor import (
-            load_supply_chain, check_key_dates, match_news_event
+            check_key_dates,
+            load_supply_chain,
+            match_news_event,
         )
         assert callable(load_supply_chain)
         assert callable(check_key_dates)
@@ -103,3 +101,142 @@ class TestUniverseData:
             data = json.load(f)
         assert "chains" in data
         assert len(data["chains"]) > 0
+
+
+class TestFeatureBuildOptions:
+
+    def test_stock_feature_cutoff(self, monkeypatch, tmp_path):
+        import pandas as pd
+
+        import pipeline.feature_engine as feature_engine
+
+        source = pd.DataFrame({
+            "date": pd.date_range("2018-12-01", periods=80),
+            "value": range(80),
+        })
+        monkeypatch.setattr(
+            feature_engine,
+            "build_features_for_stock",
+            lambda _code, _code6: source.copy(),
+        )
+
+        assert feature_engine._build_one_stock(
+            "000001.SZ", str(tmp_path), pd.Timestamp("2019-01-01")
+        )
+        result = pd.read_parquet(tmp_path / "000001.parquet")
+        assert result["date"].min() == pd.Timestamp("2019-01-01")
+
+    def test_separate_feature_cache_dir(self, monkeypatch, tmp_path):
+        import json
+
+        import pipeline.feature_engine as feature_engine
+
+        universe = tmp_path / "universe"
+        universe.mkdir()
+        (universe / "empty.json").write_text(
+            json.dumps({"watchlist": []}), encoding="utf-8"
+        )
+        monkeypatch.setattr(feature_engine, "DATA_DIR", str(tmp_path))
+
+        feature_engine.build_all(
+            incremental=False,
+            watchlist_file="empty.json",
+            out_file="training_data_pit_2019.parquet",
+            cutoff_date="2019-01-01",
+            features_dir="features_2019",
+        )
+
+        assert (tmp_path / "processed" / "features_2019").is_dir()
+        assert not (tmp_path / "processed" / "features").exists()
+
+
+class TestTencentKlineFallback:
+
+    def test_sz000_volume_unit_fix(self):
+        import pandas as pd
+
+        from scripts.update_kline_akshare import _finalize_tx
+
+        source = pd.DataFrame([{
+            "date": "2019-01-02", "open": 2.15, "high": 2.16,
+            "low": 2.13, "close": 2.13, "volume": 103360.4,
+            "amount": 22147700.0, "turnover": 0.0104,
+        }])
+        result = _finalize_tx(source, "000018")
+
+        assert result.loc[0, "volume"] == 10336040.0
+        assert result.loc[0, "outstanding_share"] == 993850000.0
+
+    def test_other_stock_volume_already_normalized(self):
+        import pandas as pd
+
+        from scripts.update_kline_akshare import _finalize_tx
+
+        source = pd.DataFrame([{
+            "date": "2019-01-02", "open": 1.50, "high": 1.57,
+            "low": 1.50, "close": 1.54, "volume": 40747700.0,
+            "amount": 62830500.0, "turnover": 0.0207,
+        }])
+        result = _finalize_tx(source, "002477")
+
+        assert result.loc[0, "volume"] == 40747700.0
+        assert result.loc[0, "outstanding_share"] == 1968487922.7053142
+
+
+class TestPitUniverseRules:
+
+    def test_first_2019_semiannual_period(self):
+        import pandas as pd
+
+        from scripts.build_pit_universe import rebalance_dates
+
+        calendar = pd.bdate_range("2019-01-01", "2020-01-10")
+        dates = rebalance_dates(calendar, "2019-07-01", "2020-01-10", "semiannual")
+
+        assert dates[0] == pd.Timestamp("2019-07-01")
+
+    def test_b_shares_are_excluded(self):
+        import pandas as pd
+
+        from scripts.build_pit_universe import exclude_security_prefixes
+
+        source = pd.DataFrame({"code": ["600000", "000001", "200018", "900951"]})
+        result = exclude_security_prefixes(source, ("200", "900"))
+
+        assert result["code"].tolist() == ["600000", "000001"]
+
+    def test_empty_kline_is_not_usable(self, monkeypatch, tmp_path):
+        import pandas as pd
+
+        import scripts.expand_2019_overnight as expand
+
+        pd.DataFrame({"date": []}).to_parquet(tmp_path / "000001.parquet", index=False)
+        pd.DataFrame({"date": ["2019-01-02"]}).to_parquet(
+            tmp_path / "600000.parquet", index=False
+        )
+        monkeypatch.setattr(expand, "KLINE", tmp_path)
+
+        assert expand.usable_kline_codes(["000001", "600000", "002477"]) == {"600000"}
+
+
+class TestPredictionEnsemble:
+
+    def test_plain_mean_aligns_predictions_by_code(self):
+        from scripts.ensemble_pred_caches import combine_day
+
+        rows = [
+            {
+                "ranked": ["A", "B", "C", "D", "E", "F"],
+                "pred_vals": [6, 5, 4, 3, 2, 1],
+            },
+            {
+                "ranked": ["F", "E", "D", "C", "B", "A"],
+                "pred_vals": [1, 2, 3, 4, 5, 6],
+            },
+        ]
+        labels = {"A": 6, "B": 5, "C": 4, "D": 3, "E": 2, "F": 1}
+        result = combine_day(rows, labels)
+
+        assert result["ranked"] == ["A", "B", "C", "D", "E", "F"]
+        assert result["pred_vals"] == [6, 5, 4, 3, 2, 1]
+        assert result["ic"] == 1.0

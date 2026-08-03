@@ -172,12 +172,13 @@ def main():
         if a.full_market:
             # scope=all 已是 519 池的超集, 不必再单独拉一遍
             run([PY, "-u", "scripts/update_kline_akshare.py",
-                 "--scope", "all", "--procs", str(a.procs), "--timeout", "25"],
+                 "--scope", "all", "--start", "20190101",
+                 "--procs", str(a.procs), "--timeout", "25"],
                 "kline_full_market", timeout=7200)
         else:
             run([PY, "-u", "scripts/update_kline_akshare.py",
                  "--scope", "universe", "--watchlist", WATCHLIST,
-                 "--procs", str(a.procs), "--timeout", "25"],
+                 "--start", "20190101", "--procs", str(a.procs), "--timeout", "25"],
                 "kline_universe", timeout=3600)
     else:
         stage("kline", ok=True, skipped=True)

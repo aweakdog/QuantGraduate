@@ -20,8 +20,8 @@ import argparse
 import json
 import signal
 import time
-from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -30,7 +30,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 KLINE_DIR = ROOT / "data" / "raw" / "kline"
 UNIVERSE = ROOT / "data" / "universe" / "watchlist_216.json"
-START_DATE = "20210101"
+START_DATE = "20190101"    # 保留扩容后的训练历史, 日常全量重拉不得截回 2021
 
 FINAL_COLS = ["date", "open", "high", "low", "close", "volume",
               "amount", "outstanding_share", "turnover"]
@@ -59,7 +59,7 @@ def all_local_codes():
     return sorted(p.stem for p in KLINE_DIR.glob("*.parquet"))
 
 
-class FetchTimeout(Exception):
+class FetchTimeoutError(Exception):
     """单次拉取超时"""
 
 
@@ -76,7 +76,7 @@ def hard_timeout(seconds):
         return
     try:
         signal.signal(signal.SIGALRM,
-                      lambda *_: (_ for _ in ()).throw(FetchTimeout()))
+                      lambda *_: (_ for _ in ()).throw(FetchTimeoutError()))
     except ValueError:
         yield          # 不在主线程 (多线程模式), 退化为无保护
         return
@@ -92,9 +92,9 @@ def _finalize(df):
     return df[[c for c in FINAL_COLS if c in df.columns]]
 
 
-def fetch_sina(code, end_date):
+def fetch_sina(code, end_date, start_date=START_DATE):
     import akshare as ak
-    df = ak.stock_zh_a_daily(symbol=sina_symbol(code), start_date=START_DATE,
+    df = ak.stock_zh_a_daily(symbol=sina_symbol(code), start_date=start_date,
                              end_date=end_date, adjust="qfq")
     if df is None or not len(df):
         return None
@@ -106,10 +106,10 @@ def fetch_sina(code, end_date):
     return _finalize(df)
 
 
-def fetch_em(code, end_date):
+def fetch_em(code, end_date, start_date=START_DATE):
     import akshare as ak
     df = ak.stock_zh_a_hist(symbol=str(code)[:6], period="daily",
-                            start_date=START_DATE, end_date=end_date, adjust="qfq")
+                            start_date=start_date, end_date=end_date, adjust="qfq")
     if df is None or not len(df):
         return None
     df = df.rename(columns=EM_COLMAP)
@@ -124,19 +124,50 @@ def fetch_em(code, end_date):
     return _finalize(df)
 
 
-def fetch_one(code, end_date, timeout=25):
+def _finalize_tx(df, code):
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    for c in ("open", "high", "low", "close", "volume", "amount", "turnover"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    if str(code)[:6].startswith("000"):
+        df["volume"] *= 100.0
+    df["outstanding_share"] = (df["volume"] / df["turnover"]).replace(
+        [float("inf"), float("-inf")], pd.NA)
+    return _finalize(df)
+
+
+def fetch_tx(code, end_date, start_date=START_DATE, timeout=25):
+    import akshare as ak
+    symbol = sina_symbol(code)
+    if symbol.startswith("bj"):
+        return None
+    df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start_date,
+                               end_date=end_date, adjust="qfq", timeout=timeout)
+    if df is None or not len(df):
+        return None
+    return _finalize_tx(df, code)
+
+
+def fetch_one(code, end_date, timeout=25, start_date=START_DATE):
     try:
         with hard_timeout(timeout):
-            df = fetch_sina(code, end_date)
+            df = fetch_sina(code, end_date, start_date)
+        if df is not None and len(df):
+            return df
+    except Exception:
+        pass
+    try:
+        with hard_timeout(timeout):
+            df = fetch_em(code, end_date, start_date)
         if df is not None and len(df):
             return df
     except Exception:
         pass
     with hard_timeout(timeout):
-        return fetch_em(code, end_date)
+        return fetch_tx(code, end_date, start_date, timeout)
 
 
-def process(code, end_date, dry_run, retries=3, timeout=25):
+def process(code, end_date, dry_run, retries=3, timeout=25, start_date=START_DATE):
     out = KLINE_DIR / f"{code}.parquet"
     old_max = None
     if out.exists():
@@ -147,7 +178,7 @@ def process(code, end_date, dry_run, retries=3, timeout=25):
             pass
     for attempt in range(retries):
         try:
-            df = fetch_one(code, end_date, timeout)
+            df = fetch_one(code, end_date, timeout, start_date)
             if df is None or not len(df):
                 return code, "empty", old_max, None
             new_max = df["date"].max()
@@ -171,6 +202,8 @@ def main():
     ap.add_argument("--watchlist", default=None,
                     help="data/universe/ 下的股票池 json (仅 --scope universe 生效)")
     ap.add_argument("--end-date", default=datetime.now().strftime("%Y%m%d"))
+    ap.add_argument("--start", default=START_DATE,
+                    help="历史起点 YYYYMMDD。改早会全量重拉覆盖 (前复权本就需要整段自洽)")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--procs", type=int, default=0,
                     help="多进程并发数 (>0 时用多进程绕开新浪 py_mini_racer 线程不安全)")
@@ -195,16 +228,17 @@ def main():
             a.workers = 1
         mode = f"{a.workers} 线程"
 
-    print(f"更新日K线 | scope={a.scope} | {len(codes)} 只 | 截止 {a.end_date} | "
+    print(f"更新日K线 | scope={a.scope} | {len(codes)} 只 | {a.start}~{a.end_date} | "
           f"{mode} | {'DRY-RUN' if a.dry_run else '写入'}")
     t0 = time.time()
     ok = err = empty = 0
     added_total = 0
     newest = None
-    Pool = ProcessPoolExecutor if a.procs > 0 else ThreadPoolExecutor
+    pool_class = ProcessPoolExecutor if a.procs > 0 else ThreadPoolExecutor
     n_par = a.procs if a.procs > 0 else a.workers
-    with Pool(max_workers=n_par) as ex:
-        futs = {ex.submit(process, c, a.end_date, a.dry_run, 3, a.timeout): c
+    with pool_class(max_workers=n_par) as ex:
+        futs = {ex.submit(process, c, a.end_date, a.dry_run, 3, a.timeout,
+                          a.start): c
                 for c in codes}
         for i, f in enumerate(as_completed(futs), 1):
             code, st, om, nm = f.result()

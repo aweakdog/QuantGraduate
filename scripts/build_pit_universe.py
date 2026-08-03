@@ -23,9 +23,10 @@ import warnings
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
+
+warnings.filterwarnings("ignore")
 
 ROOT = Path(__file__).resolve().parents[1]
 KL = ROOT / "data/raw/kline"
@@ -79,6 +80,12 @@ def rebalance_dates(cal, start, end, freq):
     return sorted(set(out))
 
 
+def exclude_security_prefixes(meta, prefixes):
+    if not prefixes:
+        return meta.copy()
+    return meta[~meta["code"].astype(str).str.zfill(6).str.startswith(prefixes)].copy()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--top-n", type=int, default=300)
@@ -94,6 +101,8 @@ def main():
     ap.add_argument("--out", default=None,
                    help="输出文件名 (data/universe/ 下), 默认 universe_pit.parquet。"
                         "做实验时务必指定其它名字 —— 默认文件被 live_signal/daily_rebuild 依赖")
+    ap.add_argument("--exclude-prefixes", default="200,900",
+                    help="排除的证券代码前缀; 默认排除深沪 B 股")
     ap.add_argument("--jobs", type=int, default=16, help="加载K线的并行进程数")
     a = ap.parse_args()
 
@@ -102,8 +111,10 @@ def main():
 
     meta = pd.read_parquet(META)
     meta["code"] = meta["code"].astype(str).str.zfill(6)
+    excluded = tuple(x.strip() for x in a.exclude_prefixes.split(",") if x.strip())
+    meta = exclude_security_prefixes(meta, excluded)
     print(f"元数据 {len(meta)} 只 (在市 {meta['delist_date'].isna().sum()}, "
-          f"已退市 {meta['delist_date'].notna().sum()})")
+          f"已退市 {meta['delist_date'].notna().sum()}, 排除前缀 {excluded or '无'})")
 
     cal = trading_calendar()
     rebs = rebalance_dates(cal, a.start, a.end, a.freq)
@@ -125,20 +136,20 @@ def main():
              for r in meta.to_dict("records")]
 
     recs = []
-    for T in rebs:
-        win = cal[cal < T][-a.lookback:]
+    for effective_date in rebs:
+        win = cal[cal < effective_date][-a.lookback:]
         if len(win) < a.lookback * 0.5:
             continue
         w0 = win[0]
         min_cover = len(win) * 0.75
-        t_i8, w0_i8 = T.value, w0.value
+        t_i8, w0_i8 = effective_date.value, w0.value
         cand = []
         for code, ld, dd in mrecs:
             # 条件1: 上市满 N 年
-            if pd.isna(ld) or (T - ld).days < a.min_listed_years * 365.25:
+            if pd.isna(ld) or (effective_date - ld).days < a.min_listed_years * 365.25:
                 continue
             # 条件2: T 时点未退市
-            if pd.notna(dd) and dd <= T:
+            if pd.notna(dd) and dd <= effective_date:
                 continue
             s = store.get(code)
             if s is None:
@@ -159,9 +170,9 @@ def main():
         d = pd.DataFrame(cand, columns=["code", "mcap", "adv"])
         d = d.sort_values(a.rank_by, ascending=False).head(a.top_n).reset_index(drop=True)
         d["rank"] = d.index + 1
-        d["effective_date"] = T
+        d["effective_date"] = effective_date
         recs.append(d)
-        print(f"  {T.date()}  候选合格 {len(cand):>4} -> 选中 {len(d)} | "
+        print(f"  {effective_date.date()}  候选合格 {len(cand):>4} -> 选中 {len(d)} | "
               f"市值门槛 {d['mcap'].min()/1e8:>7.1f}亿 | ADV门槛 {d['adv'].min()/1e8:.2f}亿")
 
     u = pd.concat(recs, ignore_index=True)
@@ -174,18 +185,18 @@ def main():
           f"{u['effective_date'].nunique()} 个生效期")
 
     # 换手率: 相邻期成分变化
-    print(f"\n=== 成分股换手 ===")
+    print("\n=== 成分股换手 ===")
     prev = None
-    for T, g in u.groupby("effective_date"):
+    for effective_date, g in u.groupby("effective_date"):
         cur = set(g["code"])
         if prev is not None:
             add, drop = cur - prev, prev - cur
-            print(f"  {pd.Timestamp(T).date()}  新进 {len(add):>3} | 剔除 {len(drop):>3} | "
+            print(f"  {pd.Timestamp(effective_date).date()}  新进 {len(add):>3} | 剔除 {len(drop):>3} | "
                   f"保留 {len(cur & prev):>3} ({100*len(cur & prev)/len(cur):.0f}%)")
         prev = cur
 
     # 幸存者偏差残留
-    print(f"\n=== 幸存者偏差残留检查 ===")
+    print("\n=== 幸存者偏差残留检查 ===")
     win_del = meta[(meta["delist_date"] >= a.start) & (meta["delist_date"] <= a.end)]
     have = [c for c in win_del["code"] if c in store]
     print(f"  窗口内退市 {len(win_del)} 只, 其中本地有K线的仅 {len(have)} 只")
@@ -197,6 +208,7 @@ def main():
         "min_listed_years": a.min_listed_years, "freq": a.freq,
         "rank_by": a.rank_by, "min_adv": a.min_adv,
         "start": a.start, "end": a.end,
+        "exclude_prefixes": list(excluded),
         "rule": f"{a.rank_by}排序取前N; 已上市满N年; 未退市; 窗口数据覆盖>=75%; ADV>={a.min_adv:.0e}",
         "mcap_definition": "median(vwap x outstanding_share), vwap=amount/volume 为真实未复权均价",
         "known_limitations": [

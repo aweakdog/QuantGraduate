@@ -1248,7 +1248,9 @@ def _build_one_stock(code: str, out_dir: str, cutoff: pd.Timestamp) -> bool:
 def build_all(incremental: bool = True, max_workers: int = 16,
               watchlist_file: Optional[str] = None,
               out_file: Optional[str] = None,
-              procs: int = 0) -> None:
+              procs: int = 0,
+              cutoff_date: str = "2022-09-01",
+              features_dir: str = "features") -> None:
     """构建全部股票的特征矩阵 (六维特征 → 训练集 v15)
 
     流程:
@@ -1263,6 +1265,8 @@ def build_all(incremental: bool = True, max_workers: int = 16,
         watchlist_file: 股票池 json 文件名, 默认 watchlist_top120.json
         out_file: 输出训练集文件名, 默认 training_data_v15.parquet
         procs: >0 时用多进程真并行取代多线程 (绕过 pandas 的 GIL 瓶颈)
+        cutoff_date: 每只股票写入特征缓存的最早日期
+        features_dir: data/processed 下的特征缓存目录名
     """
     from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
                                     as_completed)
@@ -1281,9 +1285,9 @@ def build_all(incremental: bool = True, max_workers: int = 16,
     log.info("训练特征: %d 只 (%s), incremental=%s, max_workers=%d",
              len(stocks), os.path.basename(watchlist_path), incremental, max_workers)
 
-    out_dir = os.path.join(DATA_DIR, "processed", "features")
+    out_dir = os.path.join(DATA_DIR, "processed", features_dir)
     os.makedirs(out_dir, exist_ok=True)
-    cutoff = pd.Timestamp("2022-09-01")
+    cutoff = pd.Timestamp(cutoff_date)
 
     # ── 0. 单线程预热缓存: 用第1只股票日期激发概念/主题缓存, 避免多线程重复计算 ──
     t_pre = time.time()
@@ -1395,7 +1399,12 @@ if __name__ == "__main__":
                     help="股票池 json 文件名 (data/universe/ 下), 如 watchlist_pit.json")
     ap.add_argument("--out", type=str, default=None,
                     help="输出训练集文件名 (data/processed/ 下)")
+    ap.add_argument("--cutoff", type=str, default="2022-09-01",
+                    help="每只股票写入特征缓存的最早日期")
+    ap.add_argument("--features-dir", type=str, default="features",
+                    help="特征缓存目录名 (data/processed/ 下)")
     args = ap.parse_args()
     build_all(incremental=args.incremental, max_workers=args.workers,
               watchlist_file=args.watchlist, out_file=args.out,
-              procs=args.procs)
+              procs=args.procs, cutoff_date=args.cutoff,
+              features_dir=args.features_dir)
