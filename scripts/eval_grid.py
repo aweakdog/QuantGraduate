@@ -82,13 +82,90 @@ EXEC_BASE = ["--hold-days", "5", "--portfolio-mode", "periodic",
 # ── 待评估的配置 ────────────────────────────────────────────
 # 只允许放【执行层】参数, 否则 --load-preds 会因缓存不匹配而拒绝运行
 # (这正是我们想要的保护: 模型层参数变了就必须重建缓存)。
+#
+# 不能放这里的东西 (会静默变成另一个语义):
+#   --skip-boards  wf_v35 里是 `if SKIP_BOARDS and not args.load_preds` ——
+#       带 --load-preds 时只在执行层跳过, 不再从训练/截面/候选池里剔除。
+#       这是"事后跳过"变体, 实测丢掉约 70% 利润, 与线上主板线的语义不同。
+#       要评估主板线必须另建一套缓存(模型层就隔离掉那些板块)。
+#   --objective / --n-features / --neutralize-style / --train-start
+#       都是模型层, 改了必须重建缓存 (脚本会因缓存不匹配直接报错, 是好事)。
+#
+# 关于"试很多配置"的风险: 试得越多, 靠运气过门槛的概率越高。这里的对冲是
+# 要求【两个独立窗口同时达标】—— 一个纯噪声的改动要在两段不同 regime 上
+# 同时表现好, 概率低得多。但也别无节制地加: 保持在 10 个以内, 且每个都要
+# 有事前的机制解释, 而不是"扫一遍看哪个数字最大"。
 CONFIGS = {
-    "base3":  {"desc": "3只持仓, 不择时 (对应线上 aggr5w 的持仓数)",
+    # ── 基线 ──
+    "base3":  {"desc": "3只持仓, 不择时 (对应线上 aggr5w/aggr10w 的持仓数)",
                "args": ["--tranche-n", "3", "--initial-capital", "50000",
                         "--regime-filter", "off"]},
     "base5":  {"desc": "5只持仓, 不择时 (对应线上 steady5w)",
                "args": ["--tranche-n", "5", "--initial-capital", "50000",
                         "--regime-filter", "off"]},
+
+    # ── 第二轮: 目标是压最差种子的回撤与离散度, 不是抬中位数 ──
+    # 机制: 大盘转弱时整体空仓。3只持仓的深回撤基本都发生在系统性下跌中,
+    # 个股选得再准也躲不开 beta(实测 beta 1.43)。注意历史上 breadth 择时在
+    # 单次 n=3 回测里被判定"有害", 但那个结论本身就落在噪声里, 需要重测。
+    "g3_regime": {"desc": "3只 + breadth择时(弱势空仓), 压系统性回撤",
+                  "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                           "--regime-filter", "breadth", "--regime-ma", "20",
+                           "--regime-breadth", "0.40", "--regime-confirm", "2"]},
+    # 机制: 波动率目标仓位 —— 高波动期自动降低敞口
+    "g3_vol":    {"desc": "3只 + 波动率目标仓位, 高波动期降敞口",
+                  "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                           "--regime-filter", "off", "--vol-target"]},
+    # 机制: 信号不够强就不买, 留现金。避免在模型没把握时硬凑3只
+    # 门槛取 0.006: 实测每日前3名预测均值的中位数是 窗口A 0.0111 / 窗口B 0.0062,
+    # 所以 0.006 大约过滤掉窗口B 一半的换仓日、窗口A 四分之一。
+    # (先试过 0.002, 95~100% 的日子都能过, 等于没加门槛)
+    # 注意这是绝对阈值, 两个窗口的预测值分布本身不同 -> 它在两窗口上的松紧不一致,
+    # 这本身就是个鲁棒性隐患, 结果要结合这点看。
+    "g3_minpred": {"desc": "3只 + 信号强度门槛0.006, 打分不够就留现金",
+                   "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                            "--regime-filter", "off", "--min-pred", "0.006"]},
+    # 机制: 不追已经急涨的股。3只持仓下单只追高被打脸的伤害被放大3倍
+    "g3_rev":    {"desc": "3只 + 反转护栏(剔除近5日涨幅前10%)",
+                  "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                           "--regime-filter", "off", "--reversal-guard", "0.10"]},
+    # 机制: 降换手省费用。基线费用占本金 16%, 每年烧 4%, 是确定性损失
+    "g3_roll":   {"desc": "3只 + 卖出容忍(仍在前8名就续持), 降换手省费用",
+                  "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                           "--regime-filter", "off", "--roll-rank", "8"]},
+    # 5只版本只带最有希望的两个, 避免配置数膨胀
+    "g5_regime": {"desc": "5只 + breadth择时",
+                  "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                           "--regime-filter", "breadth", "--regime-ma", "20",
+                           "--regime-breadth", "0.40", "--regime-confirm", "2"]},
+    "g5_roll":   {"desc": "5只 + 卖出容忍(前10名续持)",
+                  "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                           "--regime-filter", "off", "--roll-rank", "10"]},
+
+    # ── 第三轮: 只组合"在两个窗口上都单独有效"的机制 ──
+    # 第二轮结果: regime择时 与 min-pred 都在 A(少亏) 和 B(多赚) 两侧同向改善;
+    # vol-target 与 reversal-guard 在 B 上把 +11.8% 变成 -23.0% / -13.4%, 已淘汰。
+    # 两个有效机制作用层次不同(一个大盘级空仓, 一个信号级信心), 值得叠加。
+    "c3_rg_mp":  {"desc": "3只 + breadth择时 + 信号门槛0.006",
+                  "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                           "--regime-filter", "breadth", "--regime-ma", "20",
+                           "--regime-breadth", "0.40", "--regime-confirm", "2",
+                           "--min-pred", "0.006"]},
+    "c5_rg_mp":  {"desc": "5只 + breadth择时 + 信号门槛0.006",
+                  "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                           "--regime-filter", "breadth", "--regime-ma", "20",
+                           "--regime-breadth", "0.40", "--regime-confirm", "2",
+                           "--min-pred", "0.006"]},
+    "c3_rg_mp_rl": {"desc": "3只 + breadth择时 + 信号门槛 + 卖出容忍(省费用)",
+                    "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                             "--regime-filter", "breadth", "--regime-ma", "20",
+                             "--regime-breadth", "0.40", "--regime-confirm", "2",
+                             "--min-pred", "0.006", "--roll-rank", "8"]},
+    "c5_rg_mp_rl": {"desc": "5只 + breadth择时 + 信号门槛 + 卖出容忍",
+                    "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                             "--regime-filter", "breadth", "--regime-ma", "20",
+                             "--regime-breadth", "0.40", "--regime-confirm", "2",
+                             "--min-pred", "0.006", "--roll-rank", "10"]},
 }
 
 # ── 验收门槛 ────────────────────────────────────────────────
@@ -350,12 +427,53 @@ def phase_report(args):
                 s["sharpe_median"], s["sharpe_worst"], s["maxdd_median"],
                 s["maxdd_worst"], f"{s['n_loss']}/{s['n_seeds']}", s["fee_median"]))
         print(f"  结论: {v}" + (f"  |  未达标项: {'; '.join(fails)}" if fails else ""))
+    _print_cross_table(out, args)
     dst = PROC / "eval_grid_report.json"
     dst.write_text(json.dumps({"thresholds": THRESHOLDS, "windows": WINDOWS,
                                "seeds": args.seeds, "results": out},
                               ensure_ascii=False, indent=2))
     print()
     print(f"报告已写入 {dst}")
+
+
+def _print_cross_table(out, args):
+    """横向对比表, 按【两窗口里更差的那个夏普最差值】排序。
+
+    为什么按最差种子排而不是按中位数或收益: 我们要挑的是"运气不好时也能接受"
+    的配置。按收益排会把 3 只持仓那种右尾配置排到前面, 那正是要避免的陷阱。
+    """
+    if len(out) < 2:
+        return
+    print()
+    print("=" * 108)
+    print("横向对比 (按两窗口中较差的「夏普最差种子」排序 —— 挑的是下限, 不是上限)")
+    print("=" * 108)
+    rows = []
+    for cname, r in out.items():
+        sa, sb = r["A"], r["B"]
+        if not sa or not sb:
+            continue
+        rows.append((
+            cname,
+            min(sa["sharpe_worst"], sb["sharpe_worst"]),
+            min(sa["sharpe_median"], sb["sharpe_median"]),
+            min(sa["maxdd_worst"], sb["maxdd_worst"]),
+            min(sa["ret_median"], sb["ret_median"]),
+            max(sa["n_loss"] / sa["n_seeds"], sb["n_loss"] / sb["n_seeds"]) * 100,
+            max(sa["fee_median"], sb["fee_median"]),
+            r["verdict"],
+        ))
+    rows.sort(key=lambda x: -x[1])
+    print("%-12s %10s %10s %10s %10s %9s %8s %8s" % (
+        "配置", "夏普最差", "夏普中位", "回撤最差", "收益中位", "亏损种子%", "费用%", "结论"))
+    print("%-12s %10s %10s %10s %10s %9s %8s %8s" % (
+        "", "(取较差窗口)", "(取较差)", "(取较差)", "(取较差)", "(取较高)", "", ""))
+    for r in rows:
+        print("%-12s %10.2f %10.2f %10.1f %10.1f %9.0f %8.1f %8s" % r)
+    print()
+    print("门槛: 夏普最差>=%.2f 夏普中位>=%.2f 回撤最差>=%.1f%% 亏损种子<=%.0f%%" % (
+        THRESHOLDS["sharpe_worst"], THRESHOLDS["sharpe_median"],
+        THRESHOLDS["maxdd_worst"], THRESHOLDS["max_loss_seeds_pct"]))
 
 
 def main():
