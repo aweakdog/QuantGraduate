@@ -673,6 +673,7 @@ ACTION_HTML = """<!DOCTYPE html>
 
   .foot{font-size:12px;color:#5e6675;margin-top:16px;text-align:center;line-height:1.8}
   .foot a{color:#7c8598}
+  .foot .disc{color:#6f7889;margin-top:6px}
   .warn{background:#2a1d1d;border:1px solid #7f1d1d;color:#fca5a5;border-radius:10px;
         padding:11px 13px;font-size:13px;margin-bottom:12px}
   .empty{color:#5e6675;font-size:14px;padding:6px 0}
@@ -700,6 +701,7 @@ ACTION_HTML = """<!DOCTYPE html>
   <div class="foot">
     数据每天收盘后自动更新 · <a href="/pro">运维仪表盘</a><br>
     <span id="gen"></span>
+    <div class="disc">本站信息仅供参考，不构成任何投资建议</div>
   </div>
 </div>
 <div id="modal"></div>

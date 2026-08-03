@@ -224,6 +224,7 @@ input:focus{border-color:#2563eb}
      border-radius:10px;padding:13px;font-size:16px;font-weight:600;cursor:pointer}
 .btn:disabled{opacity:.5}
 .err{color:#fca5a5;font-size:13px;margin-top:12px;min-height:18px}
+.disc{color:#6b7280;font-size:12px;line-height:1.7;margin-top:16px;text-align:center}
 </style></head><body>
 <div class="box">
   <h1>实盘看板</h1>
@@ -231,6 +232,7 @@ input:focus{border-color:#2563eb}
   <input id="pw" type="password" placeholder="查看口令" autocomplete="current-password">
   <button class="btn" id="go" onclick="go()">进入</button>
   <div class="err" id="err"></div>
+  <div class="disc">本站信息仅供参考，不构成任何投资建议</div>
 </div>
 <script>
 const $ = s => document.querySelector(s);
@@ -1601,6 +1603,10 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="card" id="access-card" style="display:none">
     <div class="card-title">访问日志</div>
     <div id="access-body"><span class="empty">加载中...</span></div>
+  </div>
+
+  <div style="font-size:12px;color:#666;text-align:center;margin:18px 0 6px">
+    本站信息仅供参考，不构成任何投资建议
   </div>
 </div>
 
