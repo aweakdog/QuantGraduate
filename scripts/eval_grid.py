@@ -210,6 +210,50 @@ CONFIGS = {
     "t5_ic":     {"desc": "5只 + IC择时",
                   "args": ["--tranche-n", "5", "--initial-capital", "50000",
                            "--regime-filter", "off", "--ic-timing"]},
+
+    # ── 与线上 5 条线逐字对应的配置 ──────────────────────────
+    # 为什么不能拿上面通用配置的结论直接上线: 本金这个变量翻转过结论
+    # (5万下 3只最好, 100万下 20只最好), 而线上有 2万/5万/10万 三种本金、
+    # 2/3/5 三种持仓数、两条线开着 lot-flex。必须按线各测一遍。
+    # 每条线都有 _off / _rg 一对, 唯一差别是择时开关, 便于直接读出增量。
+    # 变体要选对: steady2w 是全市场(--variant full), 其余四条是主板(--variant mb)。
+    "live_steady5w_off": {"desc": "线上 steady5w: 5万/5只/主板, 不择时",
+                          "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                                   "--regime-filter", "off"]},
+    "live_steady5w_rg":  {"desc": "线上 steady5w + breadth择时",
+                          "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                                   "--regime-filter", "breadth", "--regime-ma", "20",
+                                   "--regime-breadth", "0.40", "--regime-confirm", "2"]},
+    "live_aggr5w_off":   {"desc": "线上 aggr5w: 5万/3只/主板, 不择时",
+                          "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                                   "--regime-filter", "off"]},
+    "live_aggr5w_rg":    {"desc": "线上 aggr5w + breadth择时",
+                          "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                                   "--regime-filter", "breadth", "--regime-ma", "20",
+                                   "--regime-breadth", "0.40", "--regime-confirm", "2"]},
+    "live_aggr10w_off":  {"desc": "线上 aggr10w: 10万/3只/主板, 不择时",
+                          "args": ["--tranche-n", "3", "--initial-capital", "100000",
+                                   "--regime-filter", "off"]},
+    "live_aggr10w_rg":   {"desc": "线上 aggr10w + breadth择时",
+                          "args": ["--tranche-n", "3", "--initial-capital", "100000",
+                                   "--regime-filter", "breadth", "--regime-ma", "20",
+                                   "--regime-breadth", "0.40", "--regime-confirm", "2"]},
+    "live_aggr2w_off":   {"desc": "线上 aggr2w: 2万/2只/主板/lot-flex0.5, 不择时",
+                          "args": ["--tranche-n", "2", "--initial-capital", "20000",
+                                   "--lot-flex", "0.5", "--regime-filter", "off"]},
+    "live_aggr2w_rg":    {"desc": "线上 aggr2w + breadth择时",
+                          "args": ["--tranche-n", "2", "--initial-capital", "20000",
+                                   "--lot-flex", "0.5",
+                                   "--regime-filter", "breadth", "--regime-ma", "20",
+                                   "--regime-breadth", "0.40", "--regime-confirm", "2"]},
+    "live_steady2w_off": {"desc": "线上 steady2w: 2万/3只/全市场/lot-flex0.5, 不择时",
+                          "args": ["--tranche-n", "3", "--initial-capital", "20000",
+                                   "--lot-flex", "0.5", "--regime-filter", "off"]},
+    "live_steady2w_rg":  {"desc": "线上 steady2w + breadth择时",
+                          "args": ["--tranche-n", "3", "--initial-capital", "20000",
+                                   "--lot-flex", "0.5",
+                                   "--regime-filter", "breadth", "--regime-ma", "20",
+                                   "--regime-breadth", "0.40", "--regime-confirm", "2"]},
 }
 
 # ── 验收门槛 ────────────────────────────────────────────────
