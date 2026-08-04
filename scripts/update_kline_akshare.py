@@ -148,23 +148,45 @@ def fetch_tx(code, end_date, start_date=START_DATE, timeout=25):
     return _finalize_tx(df, code)
 
 
-def fetch_one(code, end_date, timeout=25, start_date=START_DATE):
-    try:
-        with hard_timeout(timeout):
-            df = fetch_sina(code, end_date, start_date)
-        if df is not None and len(df):
-            return df
-    except Exception:
-        pass
+def fetch_one(code, end_date, timeout=25, start_date=START_DATE,
+              sina_tries=3):
+    """按 新浪 -> 东财 -> 腾讯 的顺序取数, 返回 (df, 来源名)
+
+    为什么要多试新浪几次再降级 (2026-08-04)
+    ──────────────────────────────────────
+    三个源的【前复权口径不一致】: 同一只股票, 新浪与腾讯的日收益率最大能差
+    3.1%(实测 000001), 相关性 0.998 而非 1.0 —— 也就是说复权后的收益率本身
+    就不一样, 不只是价格水平的差异。
+
+    而原实现是"新浪一失败立刻换源", 限流稍微抖一下就降级。实测每次全量拉取
+    约 6% 的股票落到备用源, 且【每次是哪些股票都不一样】:
+        同一批 400 只, 前后两次拉取: 16 只新变成备用源, 15 只修回正常源
+    后果是训练数据不可复现 —— 同样的代码同样的参数, 两次拉取得到不同的价格
+    序列, 于是特征筛选、IC、回测结论都会漂移。这比"少数股票口径不同"严重得多。
+
+    所以: 新浪多试几次(带退避)再降级, 把降级压到真正取不到数的少数股票。
+    并把实际用的来源返回给调用方记进 manifest, 让这件事可观测、可度量。
+    """
+    for i in range(max(1, sina_tries)):
+        try:
+            with hard_timeout(timeout):
+                df = fetch_sina(code, end_date, start_date)
+            if df is not None and len(df):
+                return df, "sina"
+        except Exception:
+            pass
+        if i < sina_tries - 1:
+            time.sleep(0.8 * (i + 1))
     try:
         with hard_timeout(timeout):
             df = fetch_em(code, end_date, start_date)
         if df is not None and len(df):
-            return df
+            return df, "em"
     except Exception:
         pass
     with hard_timeout(timeout):
-        return fetch_tx(code, end_date, start_date, timeout)
+        df = fetch_tx(code, end_date, start_date, timeout)
+    return df, ("tx" if df is not None and len(df) else None)
 
 
 def process(code, end_date, dry_run, retries=3, timeout=25, start_date=START_DATE):
@@ -176,24 +198,26 @@ def process(code, end_date, dry_run, retries=3, timeout=25, start_date=START_DAT
             old_max = pd.to_datetime(o["date"]).max()
         except Exception:
             pass
+    # 返回值多带一个"实际用了哪个源": 三个源的前复权口径不一致, 必须可追溯,
+    # 否则数据里混着不同口径而无从察觉 (见 fetch_one 的注释)
     for attempt in range(retries):
         try:
-            df = fetch_one(code, end_date, timeout, start_date)
+            df, src = fetch_one(code, end_date, timeout, start_date)
             if df is None or not len(df):
-                return code, "empty", old_max, None
+                return code, "empty", old_max, None, src
             new_max = df["date"].max()
             if dry_run:
-                return code, "dry", old_max, new_max
+                return code, "dry", old_max, new_max, src
             tmp = out.with_suffix(".tmp.parquet")
             df.to_parquet(tmp, index=False)
             tmp.replace(out)
             added = 0 if old_max is None else int((df["date"] > old_max).sum())
-            return code, f"ok+{added}", old_max, new_max
+            return code, f"ok+{added}", old_max, new_max, src
         except Exception as e:
             if attempt == retries - 1:
-                return code, f"err:{type(e).__name__}", old_max, None
+                return code, f"err:{type(e).__name__}", old_max, None, None
             time.sleep(1.5 * (attempt + 1))
-    return code, "err", old_max, None
+    return code, "err", old_max, None, None
 
 
 def main():
@@ -210,11 +234,22 @@ def main():
     ap.add_argument("--timeout", type=int, default=25,
                     help="单只单次拉取硬超时秒数 (0=关闭)")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--codes", default=None,
+                    help="只拉指定的代码(逗号分隔)或代码清单文件路径(每行一个)。"
+                         "用于补拉个别股票, 例如已退市股 —— 它们只有腾讯源有数据, "
+                         "而 all_local_codes() 是按本地已有文件列的, 不含从未拉到过的股")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    codes = (universe_codes(a.watchlist) if a.scope == "universe"
-             else all_local_codes())
+    if a.codes:
+        _p = Path(a.codes)
+        _raw = (_p.read_text(encoding="utf-8").splitlines() if _p.exists()
+                else a.codes.split(","))
+        codes = sorted({x.split("#")[0].strip().zfill(6)[:6]
+                        for x in _raw if x.split("#")[0].strip()})
+    else:
+        codes = (universe_codes(a.watchlist) if a.scope == "universe"
+                 else all_local_codes())
     if a.limit:
         codes = codes[:a.limit]
     KLINE_DIR.mkdir(parents=True, exist_ok=True)
@@ -234,6 +269,9 @@ def main():
     ok = err = empty = 0
     added_total = 0
     newest = None
+    # 记录每只股票实际用了哪个源。三个源的前复权口径不一致(见 fetch_one),
+    # 混在一起而不可见是个隐患: 训练数据会随每次拉取悄悄变化。
+    src_of = {}
     pool_class = ProcessPoolExecutor if a.procs > 0 else ThreadPoolExecutor
     n_par = a.procs if a.procs > 0 else a.workers
     with pool_class(max_workers=n_par) as ex:
@@ -241,7 +279,9 @@ def main():
                           a.start): c
                 for c in codes}
         for i, f in enumerate(as_completed(futs), 1):
-            code, st, om, nm = f.result()
+            code, st, om, nm, src = f.result()
+            if src:
+                src_of[code] = src
             if st.startswith("ok"):
                 ok += 1
                 added_total += int(st.split("+")[1])
@@ -265,6 +305,41 @@ def main():
 
     print(f"\n完成 {time.time()-t0:.0f}s | ok={ok} err={err} empty={empty}")
     print(f"新增 {added_total} 行 | 最新交易日 {newest.date() if newest is not None else '-'}")
+
+    # ── 数据来源分布 ──────────────────────────────────────
+    # 必须每次打出来: 备用源占比一旦升高, 说明相当一部分股票的复权口径变了,
+    # 而这会让训练数据不可复现(同参数两次拉取得到不同价格序列)。
+    if src_of and not a.dry_run:
+        from collections import Counter
+        cnt = Counter(src_of.values())
+        tot = sum(cnt.values())
+        print("\n数据来源分布 (三个源的前复权口径不一致, 备用源占比越低越好):")
+        for k in ("sina", "em", "tx"):
+            if cnt.get(k):
+                print(f"  {k:5} {cnt[k]:5} 只 ({cnt[k]/tot*100:5.1f}%)"
+                      + ("   <- 主源" if k == "sina" else "   <- 备用源, 口径与主源不同"))
+        mani = KLINE_DIR.parent / "kline_source_manifest.json"
+        prev = {}
+        if mani.exists():
+            try:
+                prev = json.loads(mani.read_text(encoding="utf-8")).get("source_of", {})
+            except Exception:
+                prev = {}
+        flipped = [c for c, v in src_of.items() if c in prev and prev[c] != v]
+        if flipped:
+            print(f"  本次有 {len(flipped)} 只股票的来源发生变化 -> 它们的历史收益率被改写")
+            print(f"    例: {flipped[:8]}")
+        # 必须【合并】而不是覆盖: 部分拉取(--codes/--limit)只涉及少数股票,
+        # 整个覆盖会把其余几千只的来源记录抹掉, 于是这份清单就失去了意义。
+        merged = dict(prev)
+        merged.update(src_of)
+        mani.write_text(json.dumps(
+            {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "start": a.start,
+             "scope": (f"codes({len(codes)})" if a.codes else a.scope),
+             "counts_this_run": dict(cnt), "flipped_from_last": flipped,
+             "n_total_tracked": len(merged),
+             "source_of": merged}, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"  来源清单已写入 {mani}")
 
 
 if __name__ == "__main__":
