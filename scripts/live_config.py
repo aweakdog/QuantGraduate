@@ -44,12 +44,26 @@ BASE_PARAMS = {
     "exec-mode": "t1close",
     # 滑点只用于估算成交价与结算, 取回测同值(0.2%)偏保守
     "slippage": 0.002,
-    # breadth 择时在当前配置下反而有害, 实测 (hold=5, 滑点0.2%):
-    #   5万/3只  off +292.4% IR 1.37  vs  breadth  +50.9% IR 0.34
-    #   5万/5只  off +220.2% IR 1.27  vs  breadth  +11.8% IR -0.10
-    #   2万/3只  off +161.1% IR 0.97  vs  breadth   -4.3% IR -0.28
-    # (早期 h10 配置下 breadth 看似大幅有效, 是因为它在补救一个本身就坏的基线)
+    # ⚠ 下面这段历史结论已于 2026-08-04 被证伪, 保留原文以免重犯:
+    #   "breadth 择时在当前配置下反而有害, 实测 (hold=5, 滑点0.2%):
+    #      5万/3只  off +292.4% IR 1.37  vs  breadth  +50.9% IR 0.34
+    #      5万/5只  off +220.2% IR 1.27  vs  breadth  +11.8% IR -0.10
+    #      2万/3只  off +161.1% IR 0.97  vs  breadth   -4.3% IR -0.28"
+    # 问题出在依据是【单次回测】: 同 IC 下 20 个种子的总收益能从 -31% 到 +190%,
+    # 上面那个 +292.4% 正是右尾抽样。用 20种子x双窗口重测(scripts/eval_grid.py):
+    #      3只 窗口A -43.2% -> -23.7% | 窗口B +11.8% -> +73.6%
+    #      5只 窗口A -22.2% ->  -9.8% | 窗口B -11.2% -> +45.3%
+    # 两个窗口、两种持仓数下收益与回撤【同时】改善, breadth 择时是目前最有效的
+    # 单一改动。详见 docs/findings_2026-08-04_regime_dependent_alpha.md
+    # 是否切换为 breadth 待主板口径验证完再定, 所以这里暫时仍为 off。
     "regime-filter": "off",
+    # 这三个必须显式钉死 —— 与 hold-days 同一类坑: live_signal.py 的 argparse
+    # 默认是 regime-breadth=0.35 / regime-confirm=1, 而所有回测(wf_v35)用的是
+    # 0.40 / 2。不写在这里, 一旦把 regime-filter 打开, 线上就会用一套没被回测
+    # 验证过的阈值跑, 而且不会有任何报错。
+    "regime-ma": 20,
+    "regime-breadth": 0.40,
+    "regime-confirm": 2,
     # 5种子集成 (2026-08-02): 同数据同超参只换 random_state, 预测取平均。
     # 动机: 同 IC 下单种子的前3名选择方差是最大脆弱点 —— 5个种子单跑
     # IR 0.57~1.21 (均值0.92), 集成后 1.23~1.30 且两段更均衡。

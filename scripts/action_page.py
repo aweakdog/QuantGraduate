@@ -169,6 +169,25 @@ def _trading_days_between(state, start, end):
     return max(0, i1 - i0)
 
 
+def _epoch_brief(state):
+    """策略配置分段的精简摘要, 给前端提示"累计收益横跨多段配置"用。
+
+    只有换过参数的线才有这个字段(migrate_config.py 写入)。没换过就返回 None,
+    前端不显示任何东西 —— 绝大多数时候不该给页面加噪音。
+    """
+    eps = (state or {}).get("strategy_epochs") or []
+    if len(eps) < 2:
+        return None
+    last = eps[-1]
+    changed = last.get("changed") or {}
+    return {
+        "n": len(eps),
+        "current_since": last.get("since"),
+        "changed": {k: v for k, v in changed.items()},
+        "note": last.get("note"),
+    }
+
+
 def _freshness(root: Path, state, plan):
     """判断展示的计划是否对应最新交易日, 并给出【落后的真实原因】。
 
@@ -493,6 +512,10 @@ def build_today(root: Path, pid=None):
             # 所以做过出入金的条线应以这个数为准。
             "total_pnl": round(equity - init_cap, 2) if init_cap else None,
         },
+        # 这条线的参数换过几次。换过就意味着上面的累计收益横跨多段不同策略,
+        # 那个百分比不对应任何单一策略 —— 必须在页面上说出来, 否则又是一个
+        # "对应不上任何东西的数字"。由 scripts/migrate_config.py 写入。
+        "strategy_epochs": _epoch_brief(state),
         "next_rebal": {"date": nxt_date, "trading_days_left": nxt_left},
         "strategy": {
             "hold_days": cfg.get("hold_days"),
@@ -896,6 +919,20 @@ function holdMeta(r){
     parts.push(left <= 0 ? '已到期' : '还剩 ' + left + ' 日到期');
   }
   return parts.join(' · ');
+}
+
+// 换过策略参数的线, 上面那个"累计盈亏/收益率"横跨多段不同配置, 不对应任何
+// 单一策略。必须说出来 —— 否则又制造一个对应不上任何东西的数字。
+function epochNote(d){
+  const e = d.strategy_epochs;
+  if (!e) return '';
+  const ch = Object.entries(e.changed || {})
+    .map(([k, v]) => `${k}: ${v[0]} → ${v[1]}`).join('、');
+  return `<div class="tipbox" style="margin:11px 0 0">
+    这条线的参数改过 <b>${e.n - 1}</b> 次，当前配置自 <b>${e.current_since}</b> 起生效
+    ${ch ? `（最近一次：${esc(ch)}）` : ''}。<br>
+    上面的<b>累计盈亏与收益率横跨多段不同配置</b>，不代表任何单一策略的表现，
+    比较业绩请按配置分段看。</div>`;
 }
 
 function holdRow(r){
@@ -1630,7 +1667,7 @@ async function loadAct(){
       <div class="kv"><div class="k">本金</div><div class="v">${money(a.initial_capital)}</div></div>
       <div class="kv"><div class="k">现金</div><div class="v">${money(a.cash)}</div></div>
       <div class="kv"><div class="k">持仓市值</div><div class="v">${money(a.market_value)}</div></div>
-    </div></div>`;
+    </div>${epochNote(d)}</div>`;
 
   // 该条线的方案与数据状态
   const f = d.freshness || {};

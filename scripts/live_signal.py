@@ -160,7 +160,24 @@ ap.add_argument("--drop-shares", type=int, default=None,
                 help="配合 --drop-lot: 只处理部分股数(部分卖出/部分记错), "
                      "不填则整笔删除。剩下的仓位保留原开仓日, 到期节奏不变")
 ap.add_argument("--note", default="", help="给现金/持仓类操作附一句备注")
+ap.add_argument("--print-fingerprint", action="store_true",
+                help="只打印当前参数算出的指纹 JSON 后退出, 不读状态不碰数据。"
+                     "给 migrate_config.py 用 —— 指纹必须由本脚本自己算, "
+                     "别处重算一遍会在默认值漂移时静默算错")
 args = ap.parse_args()
+
+# 进 state.json 的 config 指纹的键。与 live_config.FINGERPRINT_KEYS 对齐。
+# 提成常量是为了让 fingerprint() 和 --print-fingerprint 用同一份定义。
+FP_KEYS = ("train_file", "pit_universe", "label", "hold_days", "tranche_n",
+           "portfolio_mode", "exec_mode", "slippage", "regime_filter", "regime_ma",
+           "regime_breadth", "regime_confirm", "reversal_guard")
+
+if args.print_fingerprint:
+    # 必须在任何状态/数据访问之前退出: 参数与 state 不一致时正是要用这个,
+    # 那时候 load_state() 会直接 SystemExit, 就取不到指纹了。
+    print(json.dumps({k: getattr(args, k) for k in FP_KEYS},
+                     ensure_ascii=False, sort_keys=True))
+    sys.exit(0)
 
 DATA_DIR = settings.DATA_DIR
 TRAIN_PATH = DATA_DIR / "processed" / args.train_file
@@ -450,10 +467,7 @@ def build_regime_series(regime_src):
 # 状态
 # ═══════════════════════════════════════════════════════════════
 def fingerprint():
-    return {k: getattr(args, k) for k in
-            ("train_file", "pit_universe", "label", "hold_days", "tranche_n",
-             "portfolio_mode", "exec_mode", "slippage", "regime_filter", "regime_ma",
-             "regime_breadth", "regime_confirm", "reversal_guard")}
+    return {k: getattr(args, k) for k in FP_KEYS}
 
 
 def load_state():
@@ -662,10 +676,12 @@ def settle(st, pending, exec_date, kl, names, cal):
         gross = lot["shares"] * px
         fee = max(gross * TRADE_COST, MIN_FEE)
         st["cash"] += gross - fee
+        _why = "matured" if matured else (
+            "drain_exit" if pending.get("drain") else "regime_exit")
         fills.append({"code": lot["code"], "name": names.get(str(lot["code"])[:6], ""),
                       "action": "sell", "shares": lot["shares"], "price": round(px, 3),
                       "fee": round(fee, 2), "net": round(gross - fee, 2),
-                      "reason": "matured" if matured else "regime_exit", "source": "auto"})
+                      "reason": _why, "source": "auto"})
     st["lots"] = keep
 
     # ── 2. 买入 ──
@@ -1351,6 +1367,18 @@ if args.reversal_guard > 0 and "ret_5d" in df.columns:
 in_cash = bool(regime_series.get(pd.Timestamp(SIGNAL_DATE), False)) if regime_series is not None else False
 was_in_cash = bool(state.get("last_in_cash", False))
 
+# ── 换策略前的排空 ──
+# migrate_config.py 在"要改的参数属于 settle() 会实时读的那一类, 且当前有持仓"
+# 时会打上这个标记。此时借用 in_cash 这条现成路径: 卖光全部持仓、不开新仓,
+# 空仓后迁移工具才会改写指纹。标记由 migrate_config.py 在迁移成功时清除,
+# 所以在此期间即使大盘转强也不会抢先建仓 —— 否则刚买完又要为迁移卖一遍。
+drain = bool(state.get("drain_requested"))
+if drain:
+    in_cash = True
+    print(f"\n[排空中] 已请求切换策略配置, 本次只卖不买 "
+          f"(持仓 {len(state['lots'])} 笔)。清空后跑 "
+          f"scripts/migrate_config.py 完成切换。")
+
 _r = regime_src[regime_src["date"] == pd.Timestamp(SIGNAL_DATE)]
 breadth = float(_r["breadth_above_ma"].iloc[0]) if len(_r) else float("nan")
 mkt_c = float(_r["mkt_close"].iloc[0]) if len(_r) else float("nan")
@@ -1404,7 +1432,8 @@ for lot in state["lots"]:
         row["reason"] = "到期但仍在前列, 续持不动"
         keep_plan.append(row)
     elif matured or in_cash:
-        row["reason"] = "持满到期" if matured else "大盘转弱清仓"
+        row["reason"] = "持满到期" if matured else (
+            "切换策略前排空" if drain else "大盘转弱清仓")
         row["est_proceeds"] = round(lot["shares"] * fill_px(ref, "sell") * (1 - TRADE_COST), 2)
         sell_plan.append(row)
     else:
@@ -1549,6 +1578,9 @@ if not args.dry_run:
 
 state["pending"] = {"signal_date": plan["signal_date"],
                     "in_cash": in_cash, "is_rebal": bool(is_rebal),
+                    # 排空标记随挂单冻结, 让结算时能把成交原因记成"换策略排空"
+                    # 而不是"大盘转弱清仓" —— 两者账面动作一样但含义完全不同
+                    "drain": drain,
                     "ranked": plan["ranked"], "blocked": plan["blocked"]}
 state["last_signal_date"] = plan["signal_date"]
 state["last_in_cash"] = in_cash
