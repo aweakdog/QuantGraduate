@@ -60,12 +60,13 @@ TRAIN_FILE = "training_data_pit_2019.parquet"
 PIT_UNIVERSE = "universe_pit_2019.parquet"
 
 # ── 两个独立窗口 ────────────────────────────────────────────
-# feat_tag: 该窗口"筛特征"运行的 tag, 其产物 json 即该窗口的锁定特征来源
+# 每个窗口的"筛特征"运行 tag 由 feat_tag(win, variant) 生成, 见下方函数 ——
+# full 变体沿用 EVALFEAT_{win} 这个原名, 以便复用已经跑好的产物。
 WINDOWS = {
     "A": {"test_start": "2020-07-01", "test_end": "2022-08-31",
-          "feat_tag": "EVALFEAT_A", "desc": "2021抱团+2022熊市, 未用于调参"},
+          "desc": "2021抱团+2022熊市, 未用于调参"},
     "B": {"test_start": "2022-09-01", "test_end": "2026-07-27",
-          "feat_tag": "EVALFEAT_B", "desc": "历史上被反复用于选参数"},
+          "desc": "历史上被反复用于选参数"},
 }
 
 DEFAULT_SEEDS = [42, 7, 123, 2024, 31337, 1, 2, 3, 5, 11,
@@ -74,6 +75,27 @@ DEFAULT_SEEDS = [42, 7, 123, 2024, 31337, 1, 2, 3, 5, 11,
 # 所有运行共享的模型层参数。改这里等于换模型, 缓存必须重建。
 MODEL_ARGS = ["--train-file", TRAIN_FILE, "--pit-universe", PIT_UNIVERSE,
               "--label", "5d", "--objective", "l2"]
+
+# ── 股票池变体 ──────────────────────────────────────────────
+# 线上 5 条线里有 4 条带 --skip-boards 30,688 (账户没开创业板/科创板权限)。
+# 这【必须】在模型层隔离: wf_v35 里是 `if SKIP_BOARDS and not args.load_preds`,
+# 也就是说带 --load-preds 时只在执行层事后跳过, 不再从训练样本/截面 demean/
+# 候选池里剔除 —— 那是另一个策略(项目文档实测丢掉约 70% 利润)。
+# 所以主板线要单独建一套缓存, 不能复用全市场的。
+#
+# 产物命名: full 沿用原名(不动已建好的 40 个缓存), mb 另起 _mb 前缀。
+VARIANTS = {
+    "full": {"model": [], "exec": [], "feat": "EVALFEAT", "cache": "preds_eval",
+             "ev": "EV", "desc": "全市场 (对应线上 steady2w 与两条基准线)"},
+    "mb":   {"model": ["--skip-boards", "30,688"],
+             "exec": ["--skip-boards", "30,688"],
+             "feat": "EVALFEAT_MB", "cache": "preds_eval_mb", "ev": "EVMB",
+             "desc": "仅主板 (对应线上 aggr2w/steady5w/aggr5w/aggr10w)"},
+}
+# 注意 mb 变体的一个已知口径问题: eval 阶段带 --load-preds 时 df 不再被板块过滤,
+# 所以产物里的 benchmark 仍是全市场等权, 而策略只买主板 -> excess/IR 不可直接
+# 与 full 变体比。本框架的门槛只用 收益/夏普/回撤/亏损种子数, 都不依赖基准,
+# 所以不影响结论; 但看 IR 时要记得这点。
 
 # 所有运行共享的执行层默认值 (与线上 BASE_PARAMS 对齐)
 EXEC_BASE = ["--hold-days", "5", "--portfolio-mode", "periodic",
@@ -210,13 +232,21 @@ def out_path_cap(tag, win, cap):
     return PROC / f"wf_daily_{tag}_ts{w['test_start']}_te{w['test_end']}_cap{int(cap)}.json"
 
 
-def cache_name(win, seed):
-    return f"preds_eval_{win}_s{seed}.pkl"
+def feat_tag(win, variant):
+    return f"{VARIANTS[variant]['feat']}_{win}"
 
 
-def features_json(win):
-    """该窗口锁定特征的来源文件名 (features 阶段的产物)"""
-    return out_path(WINDOWS[win]["feat_tag"], win).name
+def cache_name(win, seed, variant):
+    return f"{VARIANTS[variant]['cache']}_{win}_s{seed}.pkl"
+
+
+def ev_tag(cname, win, seed, variant):
+    return f"{VARIANTS[variant]['ev']}_{cname}_{win}_s{seed}"
+
+
+def features_json(win, variant):
+    """该窗口+变体 锁定特征的来源文件名 (features 阶段的产物)"""
+    return out_path(feat_tag(win, variant), win).name
 
 
 def win_args(win):
@@ -257,53 +287,57 @@ def run_parallel(jobs, jobs_cap, phase):
 
 # ── 阶段1: 每窗口现场筛特征 ─────────────────────────────────
 def phase_features(args):
+    v = VARIANTS[args.variant]
     jobs = []
     for win in args.windows:
-        dst = out_path(WINDOWS[win]["feat_tag"], win)
+        dst = out_path(feat_tag(win, args.variant), win)
         if dst.exists() and not args.force:
-            log(f"窗口{win}: 特征已存在, 跳过 ({dst.name})")
+            log(f"窗口{win}[{args.variant}]: 特征已存在, 跳过 ({dst.name})")
             continue
         # 不传 --features-from = 现场筛选, 且脚本内部只用首个出信号日之前的
         # 数据做筛选(见 wf_v35 里 select_features(..., FIRST_PRED)), 无未来函数
-        cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *MODEL_ARGS,
+        cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *MODEL_ARGS, *v["model"],
                *win_args(win), *EXEC_BASE,
                "--n-features", "80", "--tranche-n", "3",
                "--initial-capital", "50000", "--regime-filter", "off",
-               "--lgb-seed", "42", "--tag", WINDOWS[win]["feat_tag"]]
-        jobs.append((f"win{win}", cmd))
+               "--lgb-seed", "42", "--tag", feat_tag(win, args.variant)]
+        jobs.append((f"{args.variant}_win{win}", cmd))
     if not jobs:
         return
-    log(f"阶段 features: {len(jobs)} 个运行 (每窗口一次现场筛选)")
+    log(f"阶段 features[{args.variant}]: {len(jobs)} 个运行 (每窗口一次现场筛选)")
     failed = run_parallel(jobs, args.jobs, "features")
     if failed:
         raise SystemExit(f"features 阶段失败: {failed}")
     for win in args.windows:
-        sel = json.loads(out_path(WINDOWS[win]["feat_tag"], win).read_text())
-        log(f"窗口{win} 锁定 {len(sel['selected_features'])} 个特征 -> {features_json(win)}")
+        sel = json.loads(out_path(feat_tag(win, args.variant), win).read_text())
+        log(f"窗口{win}[{args.variant}] 锁定 {len(sel['selected_features'])} 个特征 "
+            f"-> {features_json(win, args.variant)}")
 
 
 # ── 阶段2: 建预测缓存 (贵, 一次性) ──────────────────────────
 def phase_caches(args):
+    v = VARIANTS[args.variant]
     jobs = []
     for win in args.windows:
-        fj = out_path(WINDOWS[win]["feat_tag"], win)
+        fj = out_path(feat_tag(win, args.variant), win)
         if not fj.exists():
-            raise SystemExit(f"窗口{win} 还没筛特征, 先跑: eval_grid.py features")
+            raise SystemExit(f"窗口{win}[{args.variant}] 还没筛特征, 先跑: "
+                             f"eval_grid.py features --variant {args.variant}")
         for seed in args.seeds:
-            if (PROC / cache_name(win, seed)).exists() and not args.force:
+            if (PROC / cache_name(win, seed, args.variant)).exists() and not args.force:
                 continue
-            cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *MODEL_ARGS,
+            cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *MODEL_ARGS, *v["model"],
                    *win_args(win), *EXEC_BASE,
                    "--features-from", fj.name,
                    "--tranche-n", "3", "--initial-capital", "50000",
                    "--regime-filter", "off", "--lgb-seed", str(seed),
-                   "--save-preds", cache_name(win, seed),
-                   "--tag", f"EVALCACHE_{win}_s{seed}"]
-            jobs.append((f"{win}_s{seed}", cmd))
+                   "--save-preds", cache_name(win, seed, args.variant),
+                   "--tag", f"EVALCACHE_{args.variant}_{win}_s{seed}"]
+            jobs.append((f"{args.variant}_{win}_s{seed}", cmd))
     if not jobs:
-        log("阶段 caches: 全部已存在, 跳过")
+        log(f"阶段 caches[{args.variant}]: 全部已存在, 跳过")
         return
-    log(f"阶段 caches: {len(jobs)} 个模型运行待跑 (这一步最耗时)")
+    log(f"阶段 caches[{args.variant}]: {len(jobs)} 个模型运行待跑 (这一步最耗时)")
     failed = run_parallel(jobs, args.jobs, "caches")
     if failed:
         raise SystemExit(f"caches 阶段失败: {failed}")
@@ -311,27 +345,29 @@ def phase_caches(args):
 
 # ── 阶段3: 评估配置 (便宜, 复用缓存) ────────────────────────
 def phase_eval(args):
+    v = VARIANTS[args.variant]
     jobs = []
     for cname in args.configs:
         cfg = CONFIGS[cname]
         cap = _cap_of(cfg["args"])
         for win in args.windows:
             for seed in args.seeds:
-                cache = PROC / cache_name(win, seed)
+                cache = PROC / cache_name(win, seed, args.variant)
                 if not cache.exists():
                     raise SystemExit(f"缺预测缓存 {cache.name}, 先跑 caches 阶段")
-                tag = f"EV_{cname}_{win}_s{seed}"
+                tag = ev_tag(cname, win, seed, args.variant)
                 if out_path_cap(tag, win, cap).exists() and not args.force:
                     continue
                 cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *MODEL_ARGS,
                        *win_args(win), *EXEC_BASE,
-                       "--features-from", features_json(win),
-                       "--load-preds", cache.name, *cfg["args"], "--tag", tag]
-                jobs.append((f"{cname}_{win}_s{seed}", cmd))
+                       "--features-from", features_json(win, args.variant),
+                       "--load-preds", cache.name, *cfg["args"], *v["exec"],
+                       "--tag", tag]
+                jobs.append((f"{args.variant}_{cname}_{win}_s{seed}", cmd))
     if not jobs:
-        log("阶段 eval: 全部已存在, 跳过")
+        log(f"阶段 eval[{args.variant}]: 全部已存在, 跳过")
         return
-    log(f"阶段 eval: {len(jobs)} 个执行层运行待跑")
+    log(f"阶段 eval[{args.variant}]: {len(jobs)} 个执行层运行待跑")
     failed = run_parallel(jobs, args.jobs, "eval")
     if failed:
         raise SystemExit(f"eval 阶段失败: {failed}")
@@ -344,11 +380,11 @@ def _cap_of(arglist):
 
 
 # ── 汇总 ────────────────────────────────────────────────────
-def collect(cname, win, seeds):
+def collect(cname, win, seeds, variant):
     cap = _cap_of(CONFIGS[cname]["args"])
     rows = []
     for seed in seeds:
-        p = out_path_cap(f"EV_{cname}_{win}_s{seed}", win, cap)
+        p = out_path_cap(ev_tag(cname, win, seed, variant), win, cap)
         if not p.exists():
             continue
         s = json.loads(p.read_text())["summary"]
@@ -401,6 +437,7 @@ def phase_report(args):
     print()
     print("=" * 108)
     print("多种子 x 双窗口评估报告")
+    print(f"  股票池变体: {args.variant} —— {VARIANTS[args.variant]['desc']}")
     print(f"  窗口A {WINDOWS['A']['test_start']} ~ {WINDOWS['A']['test_end']}  ({WINDOWS['A']['desc']})")
     print(f"  窗口B {WINDOWS['B']['test_start']} ~ {WINDOWS['B']['test_end']}  ({WINDOWS['B']['desc']})")
     print(f"  门槛(两窗口同时): 夏普中位>={THRESHOLDS['sharpe_median']} 最差>={THRESHOLDS['sharpe_worst']}"
@@ -409,8 +446,8 @@ def phase_report(args):
     print("=" * 108)
     out = {}
     for cname in args.configs:
-        sa = summarize(collect(cname, "A", args.seeds))
-        sb = summarize(collect(cname, "B", args.seeds))
+        sa = summarize(collect(cname, "A", args.seeds, args.variant))
+        sb = summarize(collect(cname, "B", args.seeds, args.variant))
         v, fails = verdict(sa, sb)
         out[cname] = {"A": sa, "B": sb, "verdict": v, "fails": fails}
         print()
@@ -428,9 +465,11 @@ def phase_report(args):
                 s["maxdd_worst"], f"{s['n_loss']}/{s['n_seeds']}", s["fee_median"]))
         print(f"  结论: {v}" + (f"  |  未达标项: {'; '.join(fails)}" if fails else ""))
     _print_cross_table(out, args)
-    dst = PROC / "eval_grid_report.json"
+    suffix = "" if args.variant == "full" else f"_{args.variant}"
+    dst = PROC / f"eval_grid_report{suffix}.json"
     dst.write_text(json.dumps({"thresholds": THRESHOLDS, "windows": WINDOWS,
-                               "seeds": args.seeds, "results": out},
+                               "variant": args.variant, "seeds": args.seeds,
+                               "results": out},
                               ensure_ascii=False, indent=2))
     print()
     print(f"报告已写入 {dst}")
@@ -480,6 +519,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("phase", choices=["features", "caches", "eval", "report", "all"])
+    ap.add_argument("--variant", default="full", choices=list(VARIANTS),
+                    help="股票池变体: full=全市场 | mb=仅主板(线上4条线用的口径)。"
+                         "两者的特征/缓存/产物完全分开, 不会互相覆盖")
     ap.add_argument("--windows", default="A,B", help="逗号分隔, 默认 A,B")
     ap.add_argument("--seeds", default="20",
                     help="种子个数(取内置列表前 N 个), 或逗号分隔的具体种子")
