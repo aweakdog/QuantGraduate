@@ -188,6 +188,28 @@ CONFIGS = {
                              "--regime-filter", "breadth", "--regime-ma", "20",
                              "--regime-breadth", "0.40", "--regime-confirm", "2",
                              "--min-pred", "0.006", "--roll-rank", "10"]},
+
+    # ── 第四轮: 用 IC 自身择时, 而不是用大盘 ──
+    # 依据: breadth 择时对"IC 变号"的识别力很差 —— 7 个坏半年里 4 个当时广度
+    # 正常(2021H2 空仓仅 25%), 而空仓率最高的两段(2024H1 57%, 2026 56%)恰恰
+    # IC 最好。它有效是靠降敞口压回撤, 不是靠识别 alpha 变号。
+    # 而 IC 自身有弱持续性(过去/未来相关 0.10~0.15, 126天窗口下同号命中 65~68%),
+    # 所以直接用"已闭合的历史 IC"择时在原理上更对口。
+    # 注意 --ic-timing 的未来函数已于 2026-08-04 修复(原实现用当天 IC 决定当天
+    # 空仓, 而当天 IC 要 5 天后才知道), 修复前的任何结论都不可用。
+    # 样本量警告: 6 年只有约 11 个独立的 126 天区间, 这类规则极易过拟合,
+    # 必须两窗口同时达标, 且即便达标证据也很薄。
+    "t3_ic":     {"desc": "3只 + IC择时(连续3天已闭合IC为负则空仓)",
+                  "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                           "--regime-filter", "off", "--ic-timing"]},
+    "t3_ic_rg":  {"desc": "3只 + IC择时 + breadth择时(两者取或)",
+                  "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                           "--regime-filter", "breadth", "--regime-ma", "20",
+                           "--regime-breadth", "0.40", "--regime-confirm", "2",
+                           "--ic-timing"]},
+    "t5_ic":     {"desc": "5只 + IC择时",
+                  "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                           "--regime-filter", "off", "--ic-timing"]},
 }
 
 # ── 验收门槛 ────────────────────────────────────────────────

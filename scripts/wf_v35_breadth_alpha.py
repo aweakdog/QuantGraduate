@@ -889,6 +889,8 @@ if MIN_PRED > 0 and daily_preds and daily_preds[0].get("pred_vals") is None:
     raise SystemExit("ERROR: --min-pred 需要带 pred_vals 的 v2 预测缓存, "
                      "当前缓存是旧格式(只存排名)")
 ic_hist, in_cash, ic_cash = [], False, False
+# 与 sched 逐项对齐的 IC 序列(含 NaN), 供 --ic-timing 做"只用已闭合的 IC"判断
+ic_seq = []
 n_cash_days = 0
 # 续持次数: 到期但仍在目标名单里, 省下一次往返成本
 n_rolled = 0
@@ -899,12 +901,20 @@ for i, (dp, exec_date) in enumerate(sched):
     ic = dp["ic"]
 
     if args.ic_timing:
-        if not np.isnan(ic):
-            ic_hist.append(ic)
-        if len(ic_hist) >= 10:
-            if all(x < 0 for x in ic_hist[-3:]):
+        # 修未来函数(2026-08-04): 信号日 D 的 IC 是"D 的预测"与"D 往后
+        # LABEL_HORIZON 天的实际收益"的相关性, 要到 D+LABEL_HORIZON 才知道。
+        # 原实现先把当天 IC 追加进 ic_hist, 再用 ic_hist[-3:] 决定当天是否空仓,
+        # 等于拿未来 5 天的收益做今天的决策。
+        # 现在: ic_seq 与 sched 对齐逐日追加(含 NaN), 但只消费 forward 窗口已经
+        # 完全闭合的部分 —— 下标 0..i-LABEL_HORIZON。i-LABEL_HORIZON 那天的
+        # forward 窗口正好覆盖到今天, 收盘后可知, 所以是可用的最新一条。
+        ic_seq.append(ic)
+        _avail = [x for x in ic_seq[:max(0, i - LABEL_HORIZON + 1)]
+                  if not np.isnan(x)]
+        if len(_avail) >= 10:
+            if all(x < 0 for x in _avail[-3:]):
                 ic_cash = True
-            if ic_cash and np.mean(ic_hist[-10:]) > 0:
+            if ic_cash and np.mean(_avail[-10:]) > 0:
                 ic_cash = False
     regime_cash = bool(regime_state.get(dp["date"], False)) if regime_state is not None else False
     was_in_cash = in_cash
