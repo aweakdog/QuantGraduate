@@ -55,6 +55,26 @@ def test_baseline_and_live_lines_actually_differ_in_universe():
         assert PROFILES[live]["tranche-n"] == PROFILES[base]["tranche-n"]
 
 
+def test_desc_reports_distribution_not_single_run():
+    """网页上展示的 desc 必须是分布口径, 不能再写单次回测的数字
+
+    旧 desc 写的是 "回测近3年 +108% / 回撤 -29%" 这类单次跑结果, 而同一配置换
+    随机种子总收益能从 -31% 到 +190%(IC 全在 0.0133~0.0170 的极窄区间) ——
+    等于把抽奖结果当业绩承诺展示给用户。
+    """
+    from live_config import PROFILES
+    for pid, p in PROFILES.items():
+        desc = p["desc"]
+        assert "20种子" in desc, f"{pid} 的 desc 未标注是多种子分布: {desc}"
+        # 必须同时给出两个窗口, 否则又变成只报好消息
+        assert "2022-09~2026-07" in desc, f"{pid} 缺强势窗口数字"
+        assert "2020-07~2022-08" in desc, f"{pid} 缺弱势窗口数字"
+        assert "亏损" in desc, f"{pid} 未说明亏损种子数: {desc}"
+        # 旧措辞不得复活
+        for bad in ("回测近3年", "两段都跑赢"):
+            assert bad not in desc, f"{pid} 的 desc 仍在用单次回测措辞: {bad}"
+
+
 def test_regime_filter_is_in_fingerprint():
     """改 regime-filter 必须触发重置, 否则会拿旧持仓跑新策略的账"""
     from live_config import FINGERPRINT_KEYS
