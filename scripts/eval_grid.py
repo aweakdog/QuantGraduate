@@ -91,6 +91,37 @@ VARIANTS = {
              "exec": ["--skip-boards", "30,688"],
              "feat": "EVALFEAT_MB", "cache": "preds_eval_mb", "ev": "EVMB",
              "desc": "仅主板 (对应线上 aggr2w/steady5w/aggr5w/aggr10w)"},
+
+    # ── 受控实验 (2026-08-05): 只开 --drop-market-wide, 其余一切不变 ──
+    # 动机: 431 个候选特征里有 159 个【截面变异比 = 0】—— 当日对所有股票取
+    # 同一个值(利率/汇率/商品/外盘指数/tev_all_* 全市场事件聚合)。而标签是
+    # 按日期 demean 的截面收益, 所以这类特征对"今天哪只股票比别人强"预测力
+    # 恒为 0, 在树里唯一用处是切分日期区间 = 记忆训练期。
+    # 上轮入选的 80 个特征里就有 12 个是这类(usdcnh/cn5y/us2y_ma5/usdind_ma20/
+    # cn_commodity_idx_*/sox_chg_5d_ma5/tev_all_bull_5d/tev_all_bear_5d/...),
+    # 放宽到变异比<0.05 是 18 个。
+    # wf_v35 本来就有 --drop-market-wide 专门防这件事(帮助文本建议 0.01),
+    # 但从未启用过, 默认 0。
+    #
+    # 这可能解释三件之前想不通的事:
+    #   两窗口特征筛选只重叠 35/80 —— 没有截面信息的特征靠"哪段日期恰好能
+    #     切出来"入选, 换窗口自然全变
+    #   窗口A 20/20 全亏 —— 模型在训练段靠记忆日期, 到测试期失效
+    #   IC 只有 0.03~0.05 —— 80 个里有 12~18 个贡献的是记忆而非 alpha
+    #
+    # 变体只改这一个参数 -> 结果可直接与 full/mb 对比, 差异就是它的影响。
+    # 272 个候选里筛 80, 筛选仍然有效(不像叠加早期可得性白名单后只剩 90 个,
+    # 那样 90 里筛 80 等于不筛, 会把"改了三样东西"混成一个结果无法归因)。
+    "full_dmw": {"model": ["--drop-market-wide", "0.01"],
+                 "exec": [], "feat": "EVALFEAT_DMW", "cache": "preds_eval_dmw",
+                 "ev": "EVDMW",
+                 "desc": "全市场 + 剔除截面无变异特征 (受控实验)"},
+    "mb_dmw":   {"model": ["--skip-boards", "30,688",
+                           "--drop-market-wide", "0.01"],
+                 "exec": ["--skip-boards", "30,688"],
+                 "feat": "EVALFEAT_MBDMW", "cache": "preds_eval_mbdmw",
+                 "ev": "EVMBDMW",
+                 "desc": "仅主板 + 剔除截面无变异特征 (受控实验)"},
 }
 # 注意 mb 变体的一个已知口径问题: eval 阶段带 --load-preds 时 df 不再被板块过滤,
 # 所以产物里的 benchmark 仍是全市场等权, 而策略只买主板 -> excess/IR 不可直接
