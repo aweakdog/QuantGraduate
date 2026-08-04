@@ -1398,6 +1398,57 @@ async def api_drop_lot(req: Request):
     return _cash_op(pid, extra, "删除持仓")
 
 
+@app.post("/api/profile/fix-lot")
+async def api_fix_lot(req: Request):
+    """校准一笔持仓的成本价/股数, 让它和券商 App 一致。
+
+    只动这一笔, 不动现金 —— 现金用 /api/profile/set-cash 单独校准。两者都以
+    券商 App 为准, 分开做才不会把同一笔差额改两遍。
+
+    这是整体对账(--sync)的替代品: 后者一把覆盖整个账户, 网页入口已因破坏力
+    太大而下掉。单笔校准语义明确, 且有备份与 history 记录。
+    """
+    if not _ops_ok(req):
+        return _ops_deny()
+    body = await req.json()
+    pid = body.get("profile")
+    if (bad := _check_profile(pid)) is not None:
+        return bad
+    code = str(body.get("code") or "").strip()
+    if not code.isdigit() or len(code) > 6:
+        return JSONResponse({"error": "股票代码不对"}, status_code=400)
+    code = code.zfill(6)
+
+    extra = ["--fix-lot", code]
+    has = False
+    if body.get("price") not in (None, ""):
+        try:
+            price = float(body["price"])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "成本价要填数字"}, status_code=400)
+        if price <= 0:
+            return JSONResponse({"error": "成本价必须为正"}, status_code=400)
+        extra += ["--fix-price", repr(price)]
+        has = True
+    if body.get("shares") not in (None, ""):
+        try:
+            shares = int(body["shares"])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "股数要填整数"}, status_code=400)
+        if shares <= 0:
+            return JSONResponse(
+                {"error": "股数必须为正。要清掉这笔请用「删除持仓」"},
+                status_code=400)
+        extra += ["--fix-shares", str(shares)]
+        has = True
+    if not has:
+        return JSONResponse({"error": "成本价和股数至少填一个"}, status_code=400)
+
+    if body.get("note"):
+        extra += ["--note", str(body["note"])[:100]]
+    return _cash_op(pid, extra, "校准持仓")
+
+
 @app.get("/api/today")
 async def api_today(profile: str = None):
     """归一化的"明天该做什么" —— 首页用。只读, 不触发模型。"""

@@ -408,6 +408,9 @@ def build_today(root: Path, pid=None):
             "held_days": ph.get("held_days", _held_days(lot)),
             "tenure_days": ph.get("tenure_days", _tenure_days(lot)),
             "n_rolled": ph.get("n_rolled", int(lot.get("rolled") or 0)),
+            # 成本价必须取 state.lots 而不是 plan —— 校准持仓改的就是它,
+            # 而 plan 是出信号那一刻的快照, 校准后不会更新
+            "buy_price": round(bp, 3) if bp else None,
         })
     in_cash = bool((plan or {}).get("in_cash"))
     is_rebal = bool((plan or {}).get("is_rebal"))
@@ -466,6 +469,14 @@ def build_today(root: Path, pid=None):
             # 所以界面上要把这个链条显示出来
             "est_proceeds": r.get("est_proceeds"),
             "est_cost": r.get("est_cost"),
+            # 持仓行用: 校准成本价弹窗要预填当前值
+            "buy_price": r.get("buy_price"),
+            # 该槽位的资金预算。必须显示出来 —— 计划里的 shares 是用【信号日
+            # 收盘价】算的, 而回测与线上结算都按【执行日实际成交价】算股数
+            # (wf_v35 L1096 / live_signal L714)。价格从信号日到下单时刻涨了不少
+            # 时, 照抄推荐股数就会超预算。正确做法是按预算现算:
+            #     股数 = floor(预算 / (当时价 x 100)) x 100
+            "budget": r.get("budget"),
             "side": side,
         }
 
@@ -656,6 +667,11 @@ ACTION_HTML = """<!DOCTYPE html>
        color:#8a93a6;font-size:13px;display:flex;align-items:center;
        justify-content:center;cursor:pointer;margin-left:8px;transition:.15s}
   .del:active{background:#4a1d1d;color:#fca5a5}
+  /* 校准成本价: 与删除同样式但不是危险色 —— 它只修账不动钱 */
+  .fix{flex:0 0 auto;width:28px;height:28px;border-radius:7px;background:#1e222b;
+       color:#8a93a6;font-size:13px;display:flex;align-items:center;
+       justify-content:center;cursor:pointer;margin-left:8px;transition:.15s}
+  .fix:active{background:#1e3a5f;color:#93c5fd}
   .mbtns{display:flex;gap:8px;margin-top:14px}
   .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);
          background:#1e222b;border:1px solid #2a3040;color:#e8eaed;font-size:13px;
@@ -729,6 +745,8 @@ ACTION_HTML = """<!DOCTYPE html>
   .op.sell .line1 .tag{background:#7f1d1d;color:#fecaca}
   .op.buy .line1 .tag{background:#14532d;color:#bbf7d0}
   .op .line2{font-size:13px;color:#8a93a6;margin-top:3px}
+  /* 资金预算行: 比参考价更重要(股数该按下单时价格现算), 但别抢主行的视觉 */
+  .op .line3{font-size:12px;color:#6f7889;margin-top:2px}
   .op .when{font-size:13px;color:#8a93a6;margin-top:8px}
   .op .amt{font-size:15px;font-weight:600;color:#c9cdd6;flex:0 0 auto;text-align:right}
 
@@ -819,10 +837,15 @@ function opRow(r, side, mode){
   const id = side + '_' + r.code;
   const tag = side === 'sell' ? '卖出' : '买入';
   const px = r.ref_price == null ? '' : ' · 参考价 ' + r.ref_price;
+  // 买入行显示资金预算: 推荐股数是用信号日收盘价算的, 而回测与结算都按下单
+  // 时刻的实际价格算股数。价格涨多了照抄股数会超预算, 所以把预算也给出来,
+  // 让人能现算: 股数 = floor(预算 / (当时价 x 100)) x 100
+  const bud = (side === 'buy' && r.budget)
+    ? `<div class="line3">预算 ${money(r.budget)} · 涨多了按预算改股数</div>` : '';
   const head = `<div class="body">
       <div class="line1"><span class="tag">${tag}</span>${esc(r.name||r.code)}
         <span style="font-size:13px;color:#6f7889;font-weight:400">${r.code}</span></div>
-      <div class="line2">${r.shares} 股${px}</div>
+      <div class="line2">${r.shares} 股${px}</div>${bud}
     </div>
     <div class="amt">${money(r.amount)}</div>`;
 
@@ -945,9 +968,57 @@ function holdRow(r){
       <div class="meta">${holdMeta(r)}</div></div>
     <div class="${cls}" style="text-align:right;font-weight:600">${sign}${p==null?'--':p+'%'}
          <div class="meta">${money(r.amount)}</div></div>
-    ${curProf().locked ? '' : `<div class="del" title="删除这笔持仓"
+    ${curProf().locked ? '' : `<div class="fix" title="校准成本价/股数"
+         onclick="askFix('${r.code}','${esc(r.name||'')}',${r.shares},${r.buy_price||0})">⚙</div>
+      <div class="del" title="删除这笔持仓"
          onclick="askDrop('${r.code}','${esc(r.name||'')}',${r.shares},${r.ref_price||0})">✕</div>`}
   </div>`;
+}
+
+// 校准一笔持仓: 让成本价/股数与券商 App 一致。
+// 刻意不动现金 —— 现金用「校准现金」单独改。两者都以券商为准, 分开做才不会
+// 把同一笔差额改两遍。
+function askFix(code, name, shares, buyPx){
+  $('#modal').innerHTML = `
+    <div class="mask" onclick="if(event.target===this)closeModal()">
+      <div class="modal">
+        <h3>校准持仓 · ${esc(name||code)}</h3>
+        <div class="cur">${esc(name||'')} ${code}<br>
+          当前记录：${shares} 股 · 成本价 ${buyPx || '--'}</div>
+        <p>把数字改成<b>券商 App 里的真实值</b>。这是<b>修账，不算盈亏</b>。</p>
+        <label class="fl">成本价</label>
+        <input type="number" id="fxp" step="0.001" min="0" inputmode="decimal"
+               value="${buyPx || ''}">
+        <label class="fl">股数（不改就留着）</label>
+        <input type="number" id="fxs" step="100" min="0" inputmode="numeric"
+               value="${shares || ''}">
+        <div class="hint">
+          · 只改<b>成本价</b>：只影响这笔的浮盈显示，<b>总资产和收益率不变</b>。<br>
+          · 改<b>股数</b>：会改变总资产与收益率，只用于修记账错误；<b>真的买卖了</b>请用
+            确认成交或「删除持仓」。<br>
+          · <b>不会动现金</b>。现金不对请另外用「校准现金」。</div>
+        <div class="err" id="fxerr"></div>
+        <div class="mbtns">
+          <div class="btn" onclick="closeModal()">取消</div>
+          <div class="btn btn-pri" onclick="doFix('${code}')">保存</div>
+        </div>
+      </div>
+    </div>`;
+  setTimeout(() => { const i = $('#fxp'); if (i){ i.focus(); i.select(); } }, 50);
+}
+
+async function doFix(code){
+  const px = $('#fxp').value, sh = $('#fxs').value;
+  const e = $('#fxerr');
+  if (px === '' && sh === ''){ if (e) e.textContent = '成本价和股数至少填一个'; return; }
+  try {
+    await api('/api/profile/fix-lot',
+      {profile: PID, code: code, price: px === '' ? null : px,
+       shares: sh === '' ? null : sh, note: '网页校准持仓'});
+    closeModal(); toast('已校准 ' + code, 4000); load();
+  } catch(err){
+    if (e) e.textContent = err.message; else toast(err.message, 6000);
+  }
 }
 
 function recRow(r){
@@ -1190,8 +1261,9 @@ function askSetCash(){
            这是<b>修账不是盈亏</b>：本金不动，所以收益率会被修正到真实水平。</p>
         <input type="number" id="sc" step="0.01" min="0" inputmode="decimal"
                value="${ACCT.cash==null?'':ACCT.cash}">
-        <div class="hint">只改现金。如果持仓股数也不对，请去
-          <a href="/pro" style="color:#60a5fa">运维页</a>做整体对账。</div>
+        <div class="hint">只改现金。<b>持仓的成本价或股数不对</b>，点持仓行右边的
+          <b>⚙</b> 单独校准那一笔（两者都以券商 App 为准，分开改才不会把同一笔
+          差额改两遍）。</div>
         <div class="err" id="scerr"></div>
         <div class="mbtns">
           <div class="btn" onclick="closeModal()">取消</div>
@@ -1624,6 +1696,17 @@ async function loadAct(){
 
     h += d.sell.map(r => opRow(r,'sell',mode)).join('');
     h += d.buy.map(r => opRow(r,'buy',mode)).join('');
+
+    // 下单口径。这里和回测的一致性很容易被忽略, 但直接决定实盘能不能复现回测:
+    //   参考价 = 信号日收盘价, 只用来估股数, 不是目标买入价
+    //   推荐股数 也是按参考价算的; 回测与结算都按【下单时刻的实际价】算股数
+    // 所以价格涨多了要按预算改股数, 而不是照抄推荐股数(会超预算)。
+    if (d.buy.length)
+      h += `<div class="tipbox" style="margin:11px 0 0">
+        <b>下单口径</b>（照着做才和回测一致）：<br>
+        · <b>参考价是信号日收盘价，不是目标买入价</b>，别挂在这个价位等成交。<br>
+        · 回测假设你在<b>${d.exec_when}按当时市价成交</b>，所以到点就按市价买。<br>
+        · 价格涨多了<b>按预算改股数</b>：股数 = 预算 ÷ (当时价 × 100)，向下取整手。</div>`;
 
     // 换仓日的买入是靠卖出所得来的, 把这个资金链摆明。
     // A股卖出资金当天可用, 所以现实里成立; 但卖不掉或只成交一部分时钱就不够。

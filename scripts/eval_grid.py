@@ -254,6 +254,53 @@ CONFIGS = {
                                    "--lot-flex", "0.5",
                                    "--regime-filter", "breadth", "--regime-ma", "20",
                                    "--regime-breadth", "0.40", "--regime-confirm", "2"]},
+
+    # ── 空槽位逐日补买 (--fill-daily) ────────────────────────
+    # 动机来自实盘: 2026-08-04 aggr5w 目标 3 只只成交 2 只(挂单没买上),
+    # 于是 17,161 元现金要空置到 08-10 的下一个换仓日。
+    # 现有 is_rebal 逻辑有个不对称: `_n_matured == len(lots)` 在【空仓】时
+    # (0==0) 成立所以天天重试建仓, 但【部分成交】(2/3)时不成立就得干等 5 天。
+    # fill-daily 让非换仓日也补满空槽位。注意它会增加换手 -> 增加手续费,
+    # 而手续费是这套系统最大的确定性损失, 所以必须验证净效果而非想当然。
+    # 在当前线上配置(已开 breadth 择时)之上加, 才是真正的增量对比。
+    "live_steady5w_rg_fd": {"desc": "线上 steady5w + 择时 + 空槽逐日补买",
+                            "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                                     "--regime-filter", "breadth", "--regime-ma", "20",
+                                     "--regime-breadth", "0.40", "--regime-confirm", "2",
+                                     "--fill-daily"]},
+    "live_aggr5w_rg_fd":   {"desc": "线上 aggr5w + 择时 + 空槽逐日补买",
+                            "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                                     "--regime-filter", "breadth", "--regime-ma", "20",
+                                     "--regime-breadth", "0.40", "--regime-confirm", "2",
+                                     "--fill-daily"]},
+    # ── 追高上限 (--max-chase): 把实盘的真实成交率建进回测 ──────
+    # 起因: 用户实盘是盘尾挂限价单, 跳空高开的票打不到价位就买不上
+    # (2026-08-04 aggr5w: 601138 高开后收盘 +7.2%, 一股没成交)。
+    # 而回测默认假设 100% 按执行日收盘价成交, 所以回测天然乐观。
+    # 两个方向都要量化: 漏掉这些票本身可能有利(实测那批买进去平均 -0.15%
+    # vs 能买到的 +0.80%), 但空出来的槽位留现金又是拖累。净效果只能实测。
+    "live_aggr5w_rg_ch1": {"desc": "线上 aggr5w + 择时 + 高开>1%放弃(留现金)",
+                           "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                                    "--regime-filter", "breadth", "--regime-ma", "20",
+                                    "--regime-breadth", "0.40", "--regime-confirm", "2",
+                                    "--max-chase", "0.01"]},
+    "live_aggr5w_rg_ch3": {"desc": "线上 aggr5w + 择时 + 高开>3%放弃(留现金)",
+                           "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                                    "--regime-filter", "breadth", "--regime-ma", "20",
+                                    "--regime-breadth", "0.40", "--regime-confirm", "2",
+                                    "--max-chase", "0.03"]},
+    "live_steady5w_rg_ch3": {"desc": "线上 steady5w + 择时 + 高开>3%放弃(留现金)",
+                             "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                                      "--regime-filter", "breadth", "--regime-ma", "20",
+                                      "--regime-breadth", "0.40", "--regime-confirm", "2",
+                                      "--max-chase", "0.03"]},
+
+    "live_steady2w_rg_fd": {"desc": "线上 steady2w + 择时 + 空槽逐日补买",
+                            "args": ["--tranche-n", "3", "--initial-capital", "20000",
+                                     "--lot-flex", "0.5",
+                                     "--regime-filter", "breadth", "--regime-ma", "20",
+                                     "--regime-breadth", "0.40", "--regime-confirm", "2",
+                                     "--fill-daily"]},
 }
 
 # ── 验收门槛 ────────────────────────────────────────────────

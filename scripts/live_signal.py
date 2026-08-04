@@ -159,6 +159,17 @@ ap.add_argument("--phantom", action="store_true",
 ap.add_argument("--drop-shares", type=int, default=None,
                 help="配合 --drop-lot: 只处理部分股数(部分卖出/部分记错), "
                      "不填则整笔删除。剩下的仓位保留原开仓日, 到期节奏不变")
+ap.add_argument("--fix-lot", default=None,
+                help="校准一笔持仓的成本价/股数 (填6位代码), 让它和券商App一致。"
+                     "只改这一笔, 不动现金也不动其它持仓 —— 现金请用 --set-cash "
+                     "单独校准, 两者都以券商App为准, 互不牵连。"
+                     "配 --fix-price 改成本价, --fix-shares 改股数(至少填一个)")
+ap.add_argument("--fix-price", type=float, default=None,
+                help="配合 --fix-lot: 真实成本价(券商App里的持仓成本)。"
+                     "只影响该笔浮盈的显示, 不改变总资产")
+ap.add_argument("--fix-shares", type=int, default=None,
+                help="配合 --fix-lot: 真实股数。会改变总资产与收益率, "
+                     "所以只用于修记账错误; 真的买卖了请用确认成交/删持仓")
 ap.add_argument("--note", default="", help="给现金/持仓类操作附一句备注")
 ap.add_argument("--print-fingerprint", action="store_true",
                 help="只打印当前参数算出的指纹 JSON 后退出, 不读状态不碰数据。"
@@ -943,6 +954,92 @@ def do_sync(st, kl, names):
     print("  python scripts/live_signal.py")
 
 
+def do_fix_lot(st, kl, names):
+    """校准一笔持仓的成本价/股数, 让它和券商 App 一致
+
+    为什么需要: 自动记账用收盘价+估算佣金, 实盘成交价总有零点几个百分点的差;
+    部分成交、分笔成交、手工补单也会让成本价对不上。之前只能用 --sync 整体
+    覆盖, 那是所有操作里破坏力最大的一个(一把改写整个账户)。这里只动一笔。
+
+    关键的语义边界 —— 不动现金:
+      成本价与现金是两笔【各自独立】的记录, 都以券商 App 为准。如果这里顺手
+      按差额调现金, 用户再用 --set-cash 校准一次, 现金就被改了两遍。所以
+      分开: 成本价用本命令, 现金用 --set-cash。
+
+    对报表的影响:
+      改成本价 -> 只影响该笔的浮盈% 显示。总资产 = 现金 + Σ(股数 x 现价),
+                 不含 buy_price, 所以总资产与收益率【不变】。
+      改股数   -> 会改变总资产与收益率, 所以只该用于修记账错误。真买真卖
+                 请走确认成交 / 删持仓, 那两条会正确处理现金。
+    """
+    code = str(args.fix_lot).zfill(6)[:6]
+    if args.fix_price is None and args.fix_shares is None:
+        raise SystemExit("ERROR: --fix-lot 需要至少一个 --fix-price 或 --fix-shares")
+    lots = [l for l in st["lots"] if str(l["code"])[:6] == code]
+    if not lots:
+        held = ", ".join(sorted(str(l["code"])[:6] for l in st["lots"])) or "(空仓)"
+        raise SystemExit(f"ERROR: 持仓里没有 {code}。当前持仓: {held}")
+    if len(lots) > 1:
+        raise SystemExit(
+            f"ERROR: {code} 有 {len(lots)} 笔独立批次, 本命令只处理单笔以免改错。\n"
+            "  这种情况请用整体对账 (--sync)。")
+    lot = lots[0]
+    before = snapshot(st, kl, names)
+    old_px, old_sh = float(lot["buy_price"]), int(lot["shares"])
+    new_px = float(args.fix_price) if args.fix_price is not None else old_px
+    new_sh = int(args.fix_shares) if args.fix_shares is not None else old_sh
+    if new_px <= 0:
+        raise SystemExit(f"ERROR: 成本价必须为正 (收到 {new_px})")
+    if new_sh <= 0:
+        raise SystemExit(
+            f"ERROR: 股数必须为正 (收到 {new_sh})。要清掉这笔请用 --drop-lot, "
+            "它会问清现金怎么算。")
+    # 防手滑: 成本价改动超过 50% 极可能是少打一位或填了市值
+    if abs(new_px / old_px - 1) > 0.5:
+        raise SystemExit(
+            f"ERROR: 成本价要从 {old_px:.3f} 改成 {new_px:.3f} (变动 "
+            f"{(new_px/old_px-1)*100:+.1f}%), 幅度过大已拒绝。\n"
+            "  校准是用来修零点几个百分点的差的。确认没填错(比如把市值当成本价)"
+            "再重试。")
+
+    bak = backup_state("fixlot")
+    lot["buy_price"] = new_px
+    lot["shares"] = new_sh
+    after = snapshot(st, kl, names)
+    st.setdefault("history", []).append({
+        "type": "fix_lot", "at": datetime.now().isoformat(timespec="seconds"),
+        "note": args.note, "code": code,
+        "before": {"buy_price": old_px, "shares": old_sh,
+                   "equity": before["equity"]},
+        "after": {"buy_price": new_px, "shares": new_sh,
+                  "equity": after["equity"]},
+    })
+
+    nm = names.get(code, "")
+    W = 68
+    print(f"\n{'='*W}\n  持仓校准 (修账, 不计为盈亏, 不动现金)\n{'='*W}")
+    print(f"  标的   : {code} {nm}")
+    if new_px != old_px:
+        print(f"  成本价 : {old_px:.3f}  ->  {new_px:.3f}  "
+              f"({(new_px/old_px-1)*100:+.2f}%)")
+    if new_sh != old_sh:
+        print(f"  股数   : {old_sh}  ->  {new_sh}  ({new_sh-old_sh:+d})")
+    print(f"  现金   : ¥{after['cash']:,.2f}  (不变 —— 现金请用「校准现金」单独改)")
+    print(f"  总资产 : ¥{before['equity']:,.2f}  ->  ¥{after['equity']:,.2f}"
+          + ("  (不变: 总资产不含成本价)" if new_sh == old_sh else "  (股数变了所以变)"))
+    if before["total_return_pct"] is not None and after["total_return_pct"] is not None:
+        print(f"  收益率 : {before['total_return_pct']:+.2f}%  ->  "
+              f"{after['total_return_pct']:+.2f}%")
+    _row = next((r for r in after["positions"] if r["code"][:6] == code), None)
+    if _row:
+        print(f"  该笔浮盈: {_row['pnl_pct']:+.2f}% (现价 {_row['last_close']:.3f})")
+    if args.note:
+        print(f"  备注   : {args.note}")
+    if bak:
+        print(f"  旧状态备份: {bak}")
+    save_state(st)
+
+
 def do_set_cash(st, kl, names):
     """现金校准: 把记录的现金改成券商 App 里的真实数字。
 
@@ -1174,6 +1271,9 @@ if args.cash_flow is not None:
     sys.exit(0)
 if args.drop_lot:
     do_drop_lot(state, kl, names)
+    sys.exit(0)
+if args.fix_lot:
+    do_fix_lot(state, kl, names)
     sys.exit(0)
 
 print(f"加载 {TRAIN_PATH.name} ...")

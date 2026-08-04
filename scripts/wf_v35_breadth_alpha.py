@@ -128,6 +128,12 @@ parser.add_argument("--min-pred", type=float, default=0.0,
                     help="建仓信号强度门槛: 只买 pred >= X 的候选(单位=预期5日超额收益,"
                     " 如 0.005 = 0.5%)。不达标的槽位留现金。需要 v2 缓存(带 pred_vals)。"
                     " 0 = 关闭(无条件买满)")
+parser.add_argument("--max-chase", type=float, default=0.0,
+                    help="追高上限: 执行日价格比信号日收盘价高出超过该比例就不买, "
+                         "且该槽位留现金不递补 (如 0.03 = 高开3%以上就放弃)。"
+                         "用来模拟实盘挂限价单的真实成交 —— 回测默认假设 100% 按"
+                         "执行日收盘价成交, 而实盘跳空高开的票打不到限价位。"
+                         "0 = 关闭(维持原假设)")
 parser.add_argument("--fill-daily", action="store_true",
                     help="空槽位逐日补买: 非换仓日若持仓 < TRANCHE_N 且当日有过门槛的候选,"
                     " 立即补买(新批次自带 5 日到期时钟)。与 --min-pred 搭配使用")
@@ -180,6 +186,7 @@ LOT_FLEX = args.lot_flex
 ROLL_RANK = args.roll_rank
 MIN_PRED = args.min_pred
 FILL_DAILY = args.fill_daily
+MAX_CHASE = args.max_chase
 SKIP_BOARDS = tuple(s.strip() for s in args.skip_boards.split(",") if s.strip())
 SKIP_CASH = args.skip_boards_mode == "cash"
 TARGET_POSITIONS = TRANCHE_N if PERIODIC else HOLD_DAYS * TRANCHE_N
@@ -885,6 +892,7 @@ n_lot_flex = 0               # 整手粒度救济触发次数 (--lot-flex)
 n_below_thresh = 0           # 因信号强度门槛留空的槽位次数 (--min-pred)
 n_daily_fill = 0             # 非换仓日补买成交笔数 (--fill-daily)
 n_board_skip = 0             # 因板块权限跳过的候选次数 (--skip-boards)
+n_chase_skip = 0             # 因涨太多放弃买入的槽位次数 (--max-chase)
 if MIN_PRED > 0 and daily_preds and daily_preds[0].get("pred_vals") is None:
     raise SystemExit("ERROR: --min-pred 需要带 pred_vals 的 v2 预测缓存, "
                      "当前缓存是旧格式(只存排名)")
@@ -1091,6 +1099,21 @@ for i, (dp, exec_date) in enumerate(sched):
                 rejected_buy += 1
                 rej["buy_limit_up"] += 1
                 continue
+            # 追高上限: 模拟"限价挂在信号日收盘价附近, 涨太多就买不到"的真实成交。
+            # 回测原本假设 100% 按执行日收盘价成交, 但实盘是挂限价单 ——
+            # 跳空高开的票根本打不到你的价位, 那个槽位就空着(不递补, 现金留下)。
+            # 实测这类漏掉的票买进去反而更差(平均 -0.15% vs 能买到的 +0.80%),
+            # 所以这未必是损失; 但空置的现金也有代价, 净效果需要实测。
+            if MAX_CHASE > 0:
+                # 此处 px 还是执行日的原始收盘价(滑点在下一行才加), 正好用来
+                # 和信号日收盘价比 —— 与"页面上的参考价"同一口径
+                _sig_px = get_px(klines, code, dp["date"], "close")
+                if _sig_px and (px / _sig_px - 1) > MAX_CHASE:
+                    n_chase_skip += 1
+                    alloc = remaining / (TRANCHE_N - bought)
+                    remaining -= alloc      # 预算留住, 不流给后面的槽位
+                    bought += 1             # 槽位算被占用: 不递补
+                    continue
             px = fill_px(px, "buy")
             alloc = remaining / (TRANCHE_N - bought)
             shares = int(alloc / (px * 100)) * 100
@@ -1259,7 +1282,7 @@ json.dump({
     "reversal_guard": args.reversal_guard,
     "lot_flex": LOT_FLEX,
     "roll_rank": ROLL_RANK,
-    "min_pred": MIN_PRED, "fill_daily": FILL_DAILY,
+    "min_pred": MIN_PRED, "fill_daily": FILL_DAILY, "max_chase": MAX_CHASE,
     "skip_boards": list(SKIP_BOARDS), "skip_boards_mode": args.skip_boards_mode,
     "features": len(features), "selected_features": features,
     "feat_select_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}",
@@ -1291,6 +1314,7 @@ json.dump({
         "n_below_thresh": n_below_thresh,
         "n_daily_fill": n_daily_fill,
         "n_board_skip": n_board_skip,
+        "n_chase_skip": n_chase_skip,
         "cash_days": n_cash_days,
         "cash_days_pct": round(100 * n_cash_days / n, 1) if n else 0.0,
         "beat_benchmark": bool(excess.mean() > 0),
