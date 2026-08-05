@@ -128,6 +128,13 @@ parser.add_argument("--min-pred", type=float, default=0.0,
                     help="建仓信号强度门槛: 只买 pred >= X 的候选(单位=预期5日超额收益,"
                     " 如 0.005 = 0.5%)。不达标的槽位留现金。需要 v2 缓存(带 pred_vals)。"
                     " 0 = 关闭(无条件买满)")
+parser.add_argument("--exclude-feats", default="",
+                    help="额外从候选池剔除的特征, 逗号分隔; 以 '*' 结尾表示前缀匹配"
+                         " (如 'revenue*,roe*' 剔除全部营收/ROE派生)。"
+                         "用途: 判断某一类数据到底有没有贡献 —— 在决定花钱买它的"
+                         "历史之前, 先把它排除掉看 IC 掉多少。"
+                         "有过教训: 12 个市场级特征入选了, 但剔掉后 IC 只掉 0.0024,"
+                         " 入选不等于有用")
 parser.add_argument("--max-chase", type=float, default=0.0,
                     help="追高上限: 执行日价格比信号日收盘价高出超过该比例就不买, "
                          "且该槽位留现金不递补 (如 0.03 = 高开3%以上就放弃)。"
@@ -648,8 +655,23 @@ df = df.merge(ovn_df[["date", "code"] + ovn_features], on=["date", "code"], how=
 # ── 改动 A: 只按日期 demean (保序, 与 raw 收益 corr=1.00) ──
 df[LABEL] = df.groupby("date")[LABEL_RAW].transform(lambda x: x - x.mean())
 
-all_cols = [c for c in df.columns if c not in SKIP_COLS and c not in EXCLUDED_FEATS and is_valid_feat(c)]
+_extra_excl = {x.strip() for x in args.exclude_feats.split(",") if x.strip()}
+_excl_exact = {x for x in _extra_excl if not x.endswith("*")}
+_excl_prefix = tuple(x[:-1] for x in _extra_excl if x.endswith("*"))
+
+
+def _is_excluded(c):
+    return (c in EXCLUDED_FEATS or c in _excl_exact
+            or (bool(_excl_prefix) and c.startswith(_excl_prefix)))
+
+
+all_cols = [c for c in df.columns
+            if c not in SKIP_COLS and not _is_excluded(c) and is_valid_feat(c)]
 all_features = [f for f in all_cols if f not in LEAKAGE_FEATS]
+if _extra_excl:
+    # 必须打出来: 排除了什么直接决定结论怎么解读, 事后从产物里也要能查到
+    _n_hit = sum(1 for c in df.columns if _is_excluded(c) and c not in EXCLUDED_FEATS)
+    print(f"  --exclude-feats {sorted(_extra_excl)} -> 命中并剔除 {_n_hit} 个特征")
 print(f"  {len(df)} 行, {df['code'].nunique()} 只, {len(all_features)} 个候选特征")
 
 all_dates = sorted(df["date"].unique())
@@ -1283,6 +1305,7 @@ json.dump({
     "lot_flex": LOT_FLEX,
     "roll_rank": ROLL_RANK,
     "min_pred": MIN_PRED, "fill_daily": FILL_DAILY, "max_chase": MAX_CHASE,
+    "exclude_feats": sorted(_extra_excl),
     "skip_boards": list(SKIP_BOARDS), "skip_boards_mode": args.skip_boards_mode,
     "features": len(features), "selected_features": features,
     "feat_select_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}",

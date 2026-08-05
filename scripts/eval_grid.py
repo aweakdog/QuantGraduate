@@ -45,6 +45,7 @@
 import argparse
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -53,7 +54,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 PROC = ROOT / "data" / "processed"
 LOGDIR = ROOT / "data" / "processed" / "eval_logs"
-PY = ".venv/bin/python"
+# 解释器不能硬编码 .venv/bin/python: 分布式跑任务时 eez040/042 上没有 .venv
+# (缺 python3-venv 且装它要 sudo, 改用了 pip --user), 硬编码会让子进程启动时
+# 报 FileNotFoundError。用当前解释器 —— 无论是 .venv 还是系统 python3 都对。
+PY = sys.executable
 
 # 实验数据源: 2019 起的矩阵 + 修复了退市股缺口的 PIT 池
 TRAIN_FILE = "training_data_pit_2019.parquet"
@@ -122,6 +126,45 @@ VARIANTS = {
                  "feat": "EVALFEAT_MBDMW", "cache": "preds_eval_mbdmw",
                  "ev": "EVMBDMW",
                  "desc": "仅主板 + 剔除截面无变异特征 (受控实验)"},
+
+    # ── 低覆盖率特征该不该用 (2026-08-05) ────────────────────────
+    # 发现: con_*(概念聚合) 与 tev_*(事件衰减) 在【任何年份】都只覆盖 10~17%
+    # 的样本行, 其余 83~90% 是 NaN 被 ffill().fillna(0) 填成 0。
+    #   con_amount:      2015年 10% -> 2026年 17%
+    #   tev_decay_bear:  2015年 11% -> 2026年 17%
+    # 也就是说这不是"早期缺失", 2026 年也一样缺。而上轮入选的 80 个里有 9 个
+    # con_* 和 2 个 tev_*。
+    #
+    # 危险在于: 模型可能学到的是"这只股票在不在这个数据源里", 而不是概念动量
+    # 本身。这和市场级特征是同一类病 —— 特征携带的信息不是它名义上代表的东西:
+    #   市场级特征   -> 实际在标记"日期"
+    #   低覆盖率特征 -> 实际在标记"这只股票在不在某个数据源里"
+    # 后者更隐蔽, 因为"在不在数据源里"往往与市值/流动性相关, 所以看起来有预测力。
+    #
+    # 在 mb_dmw 之上只加这一个改动, 所以差异可直接归因。
+    "mb_dmw_nocon": {"model": ["--skip-boards", "30,688",
+                               "--drop-market-wide", "0.01",
+                               "--exclude-feats", "con_*,tev_*"],
+                     "exec": ["--skip-boards", "30,688"],
+                     "feat": "EVALFEAT_MBNOCON", "cache": "preds_eval_mbnocon",
+                     "ev": "EVMBNOCON",
+                     "desc": "mb_dmw 再剔除低覆盖(10~17%)的 con_*/tev_*"},
+
+    # ── 财务特征该不该用 = 值不值得花钱买历史 ─────────────────────
+    # 财务数据来自 iFinD, 2018-05 才有; 2018 前是 0%, 2019 后也只有 64~70%
+    # (三成股票始终没有)。上轮入选 80 个里有 8 个财务特征。
+    # 买 2015-2018 的历史只能把那段从 0% 提到约 70%, 剩下 30% 买不到。
+    # 所以【先测有没有用, 再决定要不要买】—— 已有教训: 12 个市场级特征入选了,
+    # 但剔掉后窗口B 的 IC 只掉 0.0024, 入选不等于有用。
+    "mb_dmw_nofund": {"model": ["--skip-boards", "30,688",
+                                "--drop-market-wide", "0.01",
+                                "--exclude-feats",
+                                "revenue*,profit*,eps*,bps*,roe*,total_assets*,"
+                                "debt_ratio*,operate_cf*,gross_margin*,pe*,pb*"],
+                      "exec": ["--skip-boards", "30,688"],
+                      "feat": "EVALFEAT_MBNOFUND", "cache": "preds_eval_mbnofund",
+                      "ev": "EVMBNOFUND",
+                      "desc": "mb_dmw 再剔除全部财务特征 (判断值不值得买历史)"},
 }
 # 注意 mb 变体的一个已知口径问题: eval 阶段带 --load-preds 时 df 不再被板块过滤,
 # 所以产物里的 benchmark 仍是全市场等权, 而策略只买主板 -> excess/IR 不可直接

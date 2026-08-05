@@ -40,6 +40,30 @@ def test_orchestrator_is_watched():
     assert "scripts/expand_2015_overnight.py" in WATCHED
 
 
+def test_scripts_invoked_by_orchestrators_are_watched():
+    """编排脚本里调用的 scripts/*.py 必须都在同步清单里
+
+    2026-08-05 又踩一次同类坑: 新写的 dist_caches.py 忘了加进清单, 服务器上
+    根本没这个文件, 过夜链跑到那一步直接 "can't open file" 挂掉 —— 而
+    check_server_sync 报告"全部一致"。
+    人工维护清单必然会漏, 所以让测试从代码里反推。
+    """
+    import re
+    orchestrators = [f for f in (ROOT / "scripts").glob("*.py")
+                     if f.name.startswith(("expand_", "dist_"))]
+    assert orchestrators, "没找到编排脚本, 这条测试失去意义"
+    missing = {}
+    for o in orchestrators:
+        src = o.read_text(encoding="utf-8")
+        # 匹配 "scripts/xxx.py" 这种被当成命令行参数传出去的路径
+        for m in set(re.findall(r'scripts/([a-z0-9_]+\.py)', src)):
+            rel = f"scripts/{m}"
+            if (ROOT / rel).exists() and rel not in WATCHED:
+                missing.setdefault(o.name, []).append(rel)
+    assert not missing, (
+        f"这些脚本被编排调用但不在同步清单里, 服务器上可能根本没有: {missing}")
+
+
 def test_main_files_is_the_base_not_the_union():
     """MAIN_FILES 是人工维护的基础清单, WATCHED 才是并集。
     若有人把 WATCHED 改回手写清单, 这条会提醒并集关系已被破坏。"""

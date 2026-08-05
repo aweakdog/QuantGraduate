@@ -34,6 +34,9 @@ WORKER_FILES = [
     "pipeline/pull_fundflow_sina.py",
     "scripts/wf_v35_breadth_alpha.py",
     "scripts/eval_grid.py",
+    "scripts/dist_caches.py",        # 分布式建缓存, 主节点调度但工人也要有
+    "pipeline/feature_engine.py",
+    "pipeline/config.py",
 ]
 
 # 影响回测结论或线上行为的文件。新增同类文件请加进来。
