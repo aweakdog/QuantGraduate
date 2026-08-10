@@ -61,6 +61,12 @@ parser.add_argument("--portfolio-mode", type=str, default="staggered",
                     choices=["staggered", "periodic"],
                     help="staggered=每日开一档共HOLD_DAYS档(适合大资金); "
                          "periodic=每HOLD_DAYS天整体换仓, 仅持TRANCHE_N只(适合小资金)")
+parser.add_argument("--rebal-offset", type=int, default=0,
+                    help="periodic 模式下换仓日的相位偏移(0..HOLD_DAYS-1)。"
+                         "换仓日判定是 i %% HOLD_DAYS == offset, 所以不同 offset "
+                         "对应【完全不同的一组换仓日期】。改 HOLD_DAYS 会同时改变"
+                         "相位, 两者混在一起无法归因 —— 要比较持有天数必须把 "
+                         "offset 0..N-1 全跑一遍取平均")
 parser.add_argument("--no-roll", action="store_true",
                     help="关掉续持: 到期一律卖掉再买回, 即使它仍在目标名单里。"
                          "默认开启续持(省一次往返成本)。此开关仅用于 A/B 对照")
@@ -188,6 +194,7 @@ TEST_START, TEST_END = args.test_start, args.test_end
 TRAIN_START = pd.Timestamp(args.train_start) if args.train_start else None
 HOLD_DAYS, TRANCHE_N = args.hold_days, args.tranche_n
 PERIODIC = args.portfolio_mode == "periodic"
+REBAL_OFFSET = args.rebal_offset % HOLD_DAYS
 NO_ROLL = args.no_roll
 LOT_FLEX = args.lot_flex
 ROLL_RANK = args.roll_rank
@@ -897,7 +904,7 @@ mode_desc = {
     "t1open": "T日收盘信号 -> T+1日开盘成交 (可实盘)",
     "t1close": "T日收盘信号 -> T+1日尾盘成交 (可实盘, 持仓比t1open晚一个交易日起算)",
 }[args.exec_mode]
-pf_desc = (f"每{HOLD_DAYS}天整体换仓, 持仓 {TRANCHE_N} 只" if PERIODIC
+pf_desc = (f"每{HOLD_DAYS}天整体换仓(相位{REBAL_OFFSET}), 持仓 {TRANCHE_N} 只" if PERIODIC
            else f"{HOLD_DAYS}日分档轮动, 每档 {TRANCHE_N} 只 (共 {TARGET_POSITIONS} 只)")
 print(f"\n[执行] {pf_desc} | {mode_desc}")
 print(f"[成本] 佣金 {TRADE_COST*100:.3f}%/边(最低¥{MIN_FEE:.0f}) | "
@@ -957,7 +964,8 @@ for i, (dp, exec_date) in enumerate(sched):
         pos_size = 1.0 if np.isnan(v) else v
 
     # is_rebal 要在卖出之前就知道 —— 因为“该不该续持”取决于本次是否换仓
-    is_rebal = (not PERIODIC) or (i % HOLD_DAYS == 0) or (was_in_cash and not in_cash)
+    is_rebal = ((not PERIODIC) or (i % HOLD_DAYS == REBAL_OFFSET)
+                or (was_in_cash and not in_cash))
 
     # 换仓日的目标组合: ranked 里前 TRANCHE_N 个未被持禁的。
     # 已持仓且仍在目标里的, 到期也不卖 —— 卖了再买回要付一次往返
@@ -1293,7 +1301,8 @@ json.dump({
     "portfolio_mode": args.portfolio_mode,
     "neutralize_style": args.neutralize_style,
     "style_cols": style_cols if args.neutralize_style else [],
-    "hold_days": HOLD_DAYS, "tranche_n": TRANCHE_N, "target_positions": TARGET_POSITIONS,
+    "hold_days": HOLD_DAYS, "rebal_offset": REBAL_OFFSET,
+    "tranche_n": TRANCHE_N, "target_positions": TARGET_POSITIONS,
     "ic_timing": args.ic_timing, "vol_target": args.vol_target,
     "train_file": args.train_file, "pit_universe": args.pit_universe,
     "train_start": args.train_start,
