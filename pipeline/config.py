@@ -66,6 +66,19 @@ class Settings:
     def MACRO_DIR(self) -> Path:
         return self.DATA_DIR / "raw" / "macro"
 
+    @property
+    def TUSHARE_DIR(self) -> Path:
+        return self.DATA_DIR / "raw" / "tushare"
+
+    @property
+    def CJSC_DIR(self) -> Path:
+        """中信建投客户端导出的本地行情/财务/板块数据 (见 pipeline/decode_cjsc.py)
+
+        目录结构沿用导出包原样: {SH,SZ}/{60,300,86400}/{code}.DAT
+        分钟线只有约 1 年历史(2025-07 ~ 2026-07), 日线到 2001 年。
+        """
+        return self.DATA_DIR / "raw" / "cjsc"
+
     # ─── 供应链图谱路径 ────────────────────────────────────
     @property
     def SUPPLY_CHAIN_PATH(self) -> Path:
@@ -124,6 +137,11 @@ class Settings:
     @property
     def THS_PASSWORD(self) -> str:
         return os.environ.get("THS_PASSWORD", "")
+
+    # ─── Tushare Pro token ────────────────────────────────
+    @property
+    def TUSHARE_TOKEN(self) -> str:
+        return os.environ.get("TUSHARE_TOKEN", "")
 
     # ─── 评分权重 ──────────────────────────────────────────
     SCORE_WEIGHTS = {

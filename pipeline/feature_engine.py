@@ -41,6 +41,7 @@
 """
 import pandas as pd
 import numpy as np
+import glob
 import os
 import json
 import time
@@ -76,12 +77,194 @@ _fundflow_cache = None
 _margin_cache = None
 _events_cache = None
 
+TUSHARE_MONEYFLOW_DIR = os.path.join(DATA_DIR, "raw", "tushare", "moneyflow")
+
+# tushare moneyflow 的金额单位是万元, 旧源 fund_flow 是元。
+# 对账依据(1,501,457 重叠样本, 2019-01~2026-08): net_mf_amount 与旧源 fund_flow
+# 中位比值 10000.0028 / 相关 0.9996 / 同号率 99.8% —— 同一口径的单位换算, 无需拟合。
+TS_MONEYFLOW_TO_YUAN = 10000.0
+
+
+# 是否额外构造大单分级特征。默认【开】—— 已是线上配置 (2026-08-10)。
+# 依据: 窗口B 2022-09~2026-07, 20 个种子的配对检验(与不带大单特征的同一配置逐种子相减)
+#   收益     +41.3pp  t=+3.88  16/20 改善
+#   Sharpe   +0.28    t=+3.82  17/20
+#   信息比率  +0.30    t=+3.65  17/20
+#   最深回撤  反而浅 4.7pp  t=+3.95  17/20   <- 收益涨而回撤变浅, 不是加风险敞口换来的
+# 临界值 2.093(df=19), 四项全过。窗口A(2020-07~2022-08 困难期)未显著变差(t=-1.22)。
+#
+# 留着环境变量是为了能退回旧口径复现历史实验: TS_LG_FEATURES=0。
+#
+# 一个反直觉但重要的点: IC 几乎没变, 配对 t=-2.03 (临界 2.093), 也就是【边缘地下降】,
+# 13/20 个种子 IC 变差 —— 收益却涨了 41pp。原因是 IC 衡量全截面约 500 只的排序相关,
+# 而本策略只买最顶端 3 只。大单资金对识别最强势那几只信息量大, 对中间段几乎无用。
+# 结论: 别再拿 IC 当本策略的主要判据, 它对 top-3 的改善不敏感。
+TS_LG_FEATURES = os.environ.get("TS_LG_FEATURES", "1") == "1"
+
+_TS_COLS = ["ts_code", "trade_date", "net_mf_amount",
+            "buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount",
+            "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount"]
+
+
+def _derive_ts_lg(d: pd.DataFrame) -> pd.DataFrame:
+    """从分单等级的买卖双边金额构造大单特征
+
+    为什么值得单独做: 旧源(同花顺)只给一个净额标量, 而 tushare 给了小/中/大/特大
+    四档 × 买/卖两边共 8 个金额。净额是两边相减后的结果, 相减会丢掉"成交有多激烈"
+    这一维 —— 净额为 0 既可能是无人交易, 也可能是大单对砸得势均力敌, 两者含义完全不同。
+
+    ts_lg_net    大单+特大单净额(元)。对标已废弃的 dde_net: 与其相关 0.911、同号 90.7%,
+                 但覆盖 5100+ 只而非 243 只。注意比值 9105 非整数倍, 所以是"同类口径"
+                 而非"同一口径", 不能拿它去回填 dde_net 的历史。
+    ts_elg_net   仅特大单净额 —— 机构/游资的痕迹比"大单"更纯。
+    ts_lg_buy_pct 大单+特大单买入额占全部买入额的比例(%)。无量纲, 截面天然可比,
+                 不依赖 21 日滚动标准化就有意义。
+    ts_smlg_div  大单净额与小单净额的分歧, 除以当日总成交额归一(%)。散户与主力方向
+                 相反时绝对值大 —— 这是净额口径完全无法表达的维度。
+    """
+    buy_all = (d["buy_sm_amount"] + d["buy_md_amount"]
+               + d["buy_lg_amount"] + d["buy_elg_amount"])
+    sell_all = (d["sell_sm_amount"] + d["sell_md_amount"]
+                + d["sell_lg_amount"] + d["sell_elg_amount"])
+    lg_net = ((d["buy_lg_amount"] + d["buy_elg_amount"])
+              - (d["sell_lg_amount"] + d["sell_elg_amount"]))
+    sm_net = d["buy_sm_amount"] - d["sell_sm_amount"]
+    turnover = (buy_all + sell_all).replace(0, np.nan)
+
+    d["ts_lg_net"] = lg_net * TS_MONEYFLOW_TO_YUAN
+    d["ts_elg_net"] = (d["buy_elg_amount"] - d["sell_elg_amount"]) * TS_MONEYFLOW_TO_YUAN
+    d["ts_lg_buy_pct"] = ((d["buy_lg_amount"] + d["buy_elg_amount"])
+                          / buy_all.replace(0, np.nan)) * 100
+    d["ts_smlg_div"] = (lg_net - sm_net) / turnover * 100
+    return d
+
+
+TS_LG_COLS = ["ts_lg_net", "ts_elg_net", "ts_lg_buy_pct", "ts_smlg_div"]
+
+
+def _load_tushare_moneyflow(codes) -> Optional[pd.DataFrame]:
+    """读 tushare moneyflow, 返回 [code, date, fund_flow] (+ 大单列, 若已开启)
+
+    只取需要的列并限定在 codes 内 —— 全量分片有 682MB / 5100 余只股票, 而特征构建
+    是 8~10 进程并行, 每个进程都会各加载一份。
+    """
+    if not os.path.isdir(TUSHARE_MONEYFLOW_DIR):
+        return None
+    files = sorted(glob.glob(os.path.join(TUSHARE_MONEYFLOW_DIR, "*.parquet")))
+    if not files:
+        return None
+    cols = _TS_COLS if TS_LG_FEATURES else ["ts_code", "trade_date", "net_mf_amount"]
+    keep = set(codes)
+    parts = []
+    for f in files:
+        d = pd.read_parquet(f, columns=cols)
+        d["code"] = d["ts_code"].astype(str).str[:6]
+        d = d[d["code"].isin(keep)]
+        if len(d):
+            parts.append(d.drop(columns=["ts_code"]))
+    if not parts:
+        return None
+    ts = pd.concat(parts, ignore_index=True)
+    ts["date"] = pd.to_datetime(ts["trade_date"].astype(str))
+    ts["fund_flow"] = ts["net_mf_amount"].astype(float) * TS_MONEYFLOW_TO_YUAN
+    out = ["code", "date", "fund_flow"]
+    if TS_LG_FEATURES:
+        ts = _derive_ts_lg(ts)
+        out += TS_LG_COLS
+    return ts[out]
+
+
+TUSHARE_MARGIN_DIR = os.path.join(DATA_DIR, "raw", "tushare", "margin_detail")
+
+
+def _load_tushare_margin(codes) -> Optional[pd.DataFrame]:
+    """读 tushare margin_detail 的融资融券余额, 返回 [code, date, mtss_balance]
+
+    rzrqye = 融资余额 + 融券余额, 与旧源的 mtss_balance 是同一个量:
+    136 万重叠样本上比值的 1% 与 99% 分位都恰好是 1.000000 (不是"高度相关",
+    是逐位相同)。覆盖 5148 只 / 到最新交易日, 而旧源只有 870 只且停在 08-04。
+    """
+    if not os.path.isdir(TUSHARE_MARGIN_DIR):
+        return None
+    files = sorted(glob.glob(os.path.join(TUSHARE_MARGIN_DIR, "*.parquet")))
+    if not files:
+        return None
+    keep = set(codes)
+    parts = []
+    for f in files:
+        d = pd.read_parquet(f, columns=["ts_code", "trade_date", "rzrqye"])
+        d["code"] = d["ts_code"].astype(str).str[:6]
+        d = d[d["code"].isin(keep)]
+        if len(d):
+            parts.append(d[["code", "trade_date", "rzrqye"]])
+    if not parts:
+        return None
+    mg = pd.concat(parts, ignore_index=True)
+    mg["date"] = pd.to_datetime(mg["trade_date"].astype(str))
+    mg["mtss_balance"] = mg["rzrqye"].astype(float)
+    # 同一 (code, date) 理论上只有一行; 真出现重复取最后一条, 避免 merge 把行数放大
+    return (mg[["code", "date", "mtss_balance"]]
+            .drop_duplicates(subset=["code", "date"], keep="last"))
+
+
 def _load_fundflow() -> pd.DataFrame:
-    """加载 consolidated fundflow_history 并构建缓存"""
+    """加载 consolidated fundflow_history 并构建缓存
+
+    fund_flow 列改由 tushare moneyflow 供给 (2026-08-09)
+    ──────────────────────────────────────────────────
+    旧源(同花顺)的 fund_flow 只覆盖 243 只股票、且在 2026-06-30 停更, 而票池有 519 只
+    —— 也就是说超过一半的截面永远是缺失, 模型学到的分裂里混着"这只股有没有这个数据"
+    这种与收益无关的信息。tushare moneyflow 每日覆盖 5100+ 只并随日更前进。
+
+    整列**单一来源**, 不做"旧值优先、缺失才用 tushare"的拼接: 那样会在 2026-06-30
+    留下一个口径接缝, 模型会把换源当成资金行为突变。tushare 没有覆盖的区间(2019 年
+    以前)宁可留 NaN —— LightGBM 原生处理缺失, 而伪造连续性会造出假信号。
+
+    mtss_balance 改由 tushare margin_detail.rzrqye 供给 (2026-08-09)
+    ───────────────────────────────────────────────────────────
+    旧源同样停在 2026-08-04 且无人日更。mtss_balance 是存量列, 走 ffill(上限 10 个
+    交易日), 到期后会变 NaN, 届时 4 个 mtss_* 在用特征全部失效。
+
+    这里的处理与 fund_flow 有意不同: **允许用旧值补 tushare 未覆盖的 2019 年以前**。
+    依据是二者逐位相同 —— 136 万重叠样本上比值的 1% 与 99% 分位都恰好是 1.000000,
+    即同一个数, 拼接不产生任何口径接缝。而 fund_flow 与 net_mf_amount 的比值是
+    10000.0028(近似而非精确), 说明底层定义有细微差别, 所以那一列坚持不拼。
+    这个区别看着不一致, 其实判据是同一条: 只有能证明是同一个量时才敢接。
+    """
     global _fundflow_cache
     if _fundflow_cache is None:
         df = pd.read_parquet(FUNDFLOW_PATH)
         df["date"] = pd.to_datetime(df["date"])
+        codes = df["code"].unique()
+
+        ts = _load_tushare_moneyflow(codes)
+        if ts is None:
+            log.warning("tushare moneyflow 不可用, fund_flow 退回旧源(仅 243 只/已停更)")
+        else:
+            # 旧表可能缺少 tushare 已有的日期(旧源停更之后), 故用 outer 补行;
+            # 补进来的行只有 fund_flow 有值, 其余资金流列为 NaN —— 这是事实, 不填。
+            df = df.drop(columns=["fund_flow"]).merge(
+                ts, on=["code", "date"], how="outer")
+            log.info("fund_flow 改用 tushare moneyflow: 非空 %d 行 / %d 只%s",
+                     int(df["fund_flow"].notna().sum()),
+                     int(df.loc[df["fund_flow"].notna(), "code"].nunique()),
+                     "  (含大单特征)" if TS_LG_FEATURES else "")
+
+        mg = _load_tushare_margin(codes)
+        if mg is None:
+            log.warning("tushare margin_detail 不可用, mtss_balance 退回旧源(已停更)")
+        else:
+            _n0 = int(df["mtss_balance"].notna().sum())
+            df = df.merge(mg, on=["code", "date"], how="outer",
+                          suffixes=("_legacy", ""))
+            # tushare 优先, 缺失(2019 年以前)才回落旧值 —— 二者在重叠期逐位相同
+            df["mtss_balance"] = df["mtss_balance"].fillna(df["mtss_balance_legacy"])
+            df.drop(columns=["mtss_balance_legacy"], inplace=True)
+            _m = df["mtss_balance"].notna()
+            log.info("mtss_balance 改用 tushare margin_detail: 非空 %d -> %d 行 / %d 只, 末值日 %s",
+                     _n0, int(_m.sum()), int(df.loc[_m, "code"].nunique()),
+                     str(df.loc[_m, "date"].max())[:10])
+
         _fundflow_cache = df.sort_values(["code", "date"]).reset_index(drop=True)
     return _fundflow_cache
 
@@ -173,7 +356,11 @@ def read_fund_flow(code: str) -> Optional[pd.DataFrame]:
         sub = pool[pool["code"] == code].copy()
         if len(sub) == 0:
             return None
-        return sub[["date", "main_force_net", "main_force_pct", "dde_net", "mtss_balance", "fund_flow"]].reset_index(drop=True)
+        cols = ["date", "main_force_net", "main_force_pct", "dde_net",
+                "mtss_balance", "fund_flow"]
+        # 大单特征只在开关打开时存在, 用交集而不是硬编码 —— 否则关闭第二批实验时会 KeyError
+        cols += [c for c in TS_LG_COLS if c in sub.columns]
+        return sub[cols].reset_index(drop=True)
     except Exception as e:
         log.debug("读取资金流失败 %s: %s", code, e)
         return None
@@ -288,6 +475,42 @@ def calc_technical_features(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 
 # ─── 资金面特征 ──────────────────────────────────────────────
 
+# 存量列(level): 衡量“截至当日的余额”, 不是当日发生额。
+# 缺值时绝不能填 0 —— 那等于声称“融资余额一夜归零”, 会让 21 日 z-score
+# 全面变成巨大的假负值。存量的正确插补是前值填充(有上限), 超过上限就留 NaN。
+# 其余列都是流量(当日净流入/净量), 缺值填 0 是可接受的。
+LEVEL_COLS = {"mtss_balance", "rzye", "rqye", "rzrqye"}
+LEVEL_FFILL_LIMIT = 10   # 交易日; 再久就不该假装知道余额了
+
+
+def _impute(s: pd.Series, src: str) -> pd.Series:
+    """按列的经济含义选插补方式: 存量前值填充, 流量填 0(但尾部不填)。
+
+    流量列为什么必须区分"内部缺失"和"尾部缺失"
+    ─────────────────────────────────────────
+    内部散点缺失 -> 填 0 说得过去: 那天没有显著的主力净流入。
+    尾部缺失(最后一个有值日之后) -> 必须留 NaN: 那是"数据还没到", 不是"当天为 0"。
+
+    这个区分不是洁癖。资金流表停在 08-04 而 K 线走到 08-07 时, 无差别 fillna(0)
+    会把最近 3 天的主力净流入全部伪造成 0 —— 而这 3 天里就有出信号的那天。
+    截面上所有股票同时"净流入为 0", z-score 全变成同一个假值, 模型却拿有真值年代
+    学到的分裂点去切它。2026-08-05 那次事故就是同一类错误的极端版本(整列被填 0)。
+
+    前导缺失同理: tushare moneyflow 从 2019 年才有, 而资金流表从 2015 年起。若把
+    2015~2018 一并填 0, 窗口A(2019 年起训练)的 21 日滚动会回看到这段伪造的零值,
+    早期 z-score 全部失真。所以只填【首个有值日与末个有值日之间】的散点缺口。
+    """
+    s = s.astype(float)
+    if src in LEVEL_COLS:
+        return s.ffill(limit=LEVEL_FFILL_LIMIT)
+    first, last = s.first_valid_index(), s.last_valid_index()
+    if last is None:                 # 整列无值: 交给调用方跳过, 这里不该造值
+        return s
+    out = s.copy()
+    out.loc[first:last] = out.loc[first:last].fillna(0)
+    return out
+
+
 def calc_fund_features(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """资金流 → 资金面特征(支持新旧两种列名,含Z-score归一化)
 
@@ -306,18 +529,33 @@ def calc_fund_features(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     col_map = {"main_force_net": "mf_net", "main_force_pct": "mf_pct",
                "dde_net": "dde_net", "mtss_balance": "mtss", "fund_flow": "fund_flow",
                "超大单净流入-净额": "super_large", "大单净流入-净额": "large_net"}
+    # 大单分级特征(第二批): 走与其他资金流列完全相同的管道 —— 同样会得到 _1d/_z,
+    # 同样受"整列无值则不生成"和"尾部缺失留 NaN"保护, 不需要任何特例逻辑。
+    col_map.update({c: c for c in TS_LG_COLS})
 
     for src, dst in col_map.items():
         if src in df.columns:
-            s = df[src].fillna(0).astype(float)
+            # 源列存在但整列无值 ≠ 该股资金流为零。下面的 fillna(0) 只能用于
+            # 补散点缺失; 若整列都是空的还填 0, 就把"数据没有"伪造成了"值为0",
+            # 特征变成恒常量却不报错, 而模型依然拿当年学到的分裂点去切它。
+            # 2026-08-05 的事故就是这样把 11 个入选特征变成死常量的。
+            # 同时这也是截面偏差: 别的股有真值、这只填 0, 会被排到中间位置。
+            # 留 NaN 才是诚实的 —— LightGBM 本就原生处理缺失值。
+            if df[src].notna().sum() == 0:
+                continue
+            s = _impute(df[src], src)
             # 原始值
             feats[f"{dst}_1d"] = s
             # Z-score 归一化 (21日滚动)
             rolling_mean = s.rolling(21).mean()
             rolling_std = s.rolling(21).std().replace(0, np.nan)
-            feats[f"{dst}_z"] = ((s - rolling_mean) / rolling_std).fillna(0)
+            # fillna(0) 只该覆盖"21日窗口还没攒够"的预热期; 若源值本身缺失(尾部数据
+            # 未到), z 必须跟着缺失, 否则又把"不知道"伪造成"标准化后为 0"(即恰好等于
+            # 21日均值), 这在截面排序里是个很强的假信号。
+            z = ((s - rolling_mean) / rolling_std).fillna(0)
+            feats[f"{dst}_z"] = z.where(s.notna())
 
-    if "main_force_pct" in df.columns:
+    if "main_force_pct" in df.columns and df["main_force_pct"].notna().sum() > 0:
         pct = df["main_force_pct"].fillna(0).astype(float)
         feats["mf_signal"] = np.where(pct.abs() >= 1.0, pct * 2.5, 0)
 
@@ -351,21 +589,27 @@ def calc_margin_features(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if df is None or len(df) < 5:
         return None
     feats = df[["date"]].copy()
-    avail = {src for src, _ in MARGIN_FEATURES if src in df.columns}
+    avail = {src for src, _ in MARGIN_FEATURES
+             if src in df.columns and df[src].notna().sum() > 0}
     if len(avail) < 3:
         return None
 
     for src, dst in MARGIN_FEATURES:
         if src not in df.columns:
             continue
-        s = df[src].fillna(0).astype(float)
+        # 同 calc_fund_features: 整列无值时不得伪造为 0; 存量列用前值填充
+        if df[src].notna().sum() == 0:
+            continue
+        s = _impute(df[src], src)
         feats[f"{dst}_1d"] = s
         feats[f"{dst}_ma5"] = s.rolling(5).mean()
-        # z-score (21日滚动)
+        # z-score (21日滚动) —— 同 calc_fund_features: fillna(0) 只补预热期,
+        # 源值缺失处必须留 NaN
         r21 = s.rolling(21)
-        feats[f"{dst}_z"] = ((s - r21.mean()) / r21.std().replace(0, np.nan)).fillna(0)
+        _z = ((s - r21.mean()) / r21.std().replace(0, np.nan)).fillna(0)
+        feats[f"{dst}_z"] = _z.where(s.notna())
         # 日变动
-        feats[f"{dst}_chg"] = s.diff(1).fillna(0)
+        feats[f"{dst}_chg"] = s.diff(1).fillna(0).where(s.notna())
 
     # 净买入动量
     if "rzjme" in avail:

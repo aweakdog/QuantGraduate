@@ -129,9 +129,22 @@ def do_pull(args):
         print("\n本片没有任何数据", flush=True)
 
 
+# 旧源(thsdk/wencai)独有、新浪分片拿不到的列。合并时必须从旧表继承,
+# 否则整表覆盖会把它们抹成全 NaN, 而 feature_engine 的 fillna(0) 又会把
+# 全 NaN 伪造成常量 0 —— 两层静默叠加, 特征在整段历史上失效却不报错。
+# 2026-08-05 就是这么把 11 个入选特征变成死常量的。
+LEGACY_ONLY_COLS = ["dde_net", "mtss_balance", "fund_flow"]
+
+
 def do_merge(args):
-    """把各分片合并进 consolidated 表。缺片就报错退出 —— 少一片等于池子少三分之一,
-    这种残缺表一旦被特征引擎读进去, 那批股票的资金流特征会静默变 NaN。"""
+    """把各分片合并进 consolidated 表。
+
+    两条硬约束:
+      1. 缺片就报错退出 —— 少一片等于池子少三分之一, 这种残缺表一旦被特征引擎
+         读进去, 那批股票的资金流特征会静默变 NaN。
+      2. 必须【合并】而不是覆盖 —— 旧表有新浪源拿不到的独有列(见 LEGACY_ONLY_COLS),
+         整表覆盖会把它们连同历史一起抹掉。写盘前后各查一次非空率, 退化即拒绝。
+    """
     parts, missing = [], []
     for i in range(args.of):
         p = FF_DIR / f"shard_{i}of{args.of}.parquet"
@@ -150,6 +163,12 @@ def do_merge(args):
               .reset_index(drop=True))
 
     if CONS.exists():
+        old = pd.read_parquet(CONS)
+        old["date"] = pd.to_datetime(old["date"])
+        old["code"] = old["code"].astype(str).str.zfill(6)
+        new = _merge_with_old(new, old)
+        # 自检必须在改名之前: 校验不过就原样退出, 正表一动不动
+        _assert_no_regression(old, new)
         bak = CONS.with_name(f"fundflow_history_premerge_{time.strftime('%Y%m%d_%H%M%S')}.parquet")
         CONS.replace(bak)
         print(f"旧表已备份: {bak.name}")
@@ -161,6 +180,40 @@ def do_merge(args):
     print("  各年覆盖股票数:")
     for y, n in by_year.items():
         print(f"    {y}: {n}")
+
+
+def _merge_with_old(new, old):
+    """以分片数据为主, 但保留旧表独有列, 并保留旧表里分片没覆盖到的 (code,date)。"""
+    keys = ["code", "date"]
+    legacy = [c for c in LEGACY_ONLY_COLS if c in old.columns]
+    if legacy:
+        # 分片自带的这几列是 pd.NA 占位, 直接丢掉再从旧表接回, 避免 NA 覆盖真值
+        new = new.drop(columns=[c for c in legacy if c in new.columns])
+        new = new.merge(old[keys + legacy], on=keys, how="left")
+    # 旧表有、分片没拉到的行(例如已退市股票)不能凭空消失
+    only_old = old.merge(new[keys], on=keys, how="left", indicator=True)
+    only_old = only_old[only_old["_merge"] == "left_only"].drop(columns="_merge")
+    if len(only_old):
+        print(f"旧表独有 {len(only_old):,} 行 ({only_old['code'].nunique()} 只) 予以保留")
+        new = pd.concat([new, only_old.reindex(columns=new.columns)], ignore_index=True)
+    return (new.sort_values(keys)
+               .drop_duplicates(keys, keep="last")
+               .reset_index(drop=True))
+
+
+def _assert_no_regression(old, new):
+    """任何一列的非空行数都不允许比旧表少 —— 少了就说明这次合并在丢数据。"""
+    bad = []
+    for c in old.columns:
+        if c in ("code", "date") or c not in new.columns:
+            continue
+        o, n = int(old[c].notna().sum()), int(new[c].notna().sum())
+        if n < o:
+            bad.append(f"{c}: 非空 {o:,} -> {n:,} (少了 {o - n:,})")
+    if bad:
+        raise SystemExit("ERROR: 合并会丢数据, 已拒绝写盘:\n  - " + "\n  - ".join(bad)
+                         + "\n  旧表仍在原处(或已备份为 premerge_*), 请先查清再重试")
+    print("非空率自检通过: 没有任何列比旧表更空")
 
 
 def main():
