@@ -16,6 +16,9 @@ build/
 venv/
 .venv/
 *venv/
+# 注: 上面的 *venv/ 匹配不到 .venv-gpu/ (它不以 venv/ 结尾)。
+# eez041 上这个 torch+cu126 环境有 6.5G, 必须显式排除。
+.venv-gpu/
 
 # IDE
 .vscode/
