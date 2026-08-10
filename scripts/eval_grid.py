@@ -44,6 +44,7 @@
 """
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -79,6 +80,22 @@ DEFAULT_SEEDS = [42, 7, 123, 2024, 31337, 1, 2, 3, 5, 11,
 # 所有运行共享的模型层参数。改这里等于换模型, 缓存必须重建。
 MODEL_ARGS = ["--train-file", TRAIN_FILE, "--pit-universe", PIT_UNIVERSE,
               "--label", "5d", "--objective", "l2"]
+
+
+def model_args(variant):
+    """按变体解析出模型层参数 —— 主要是替换训练矩阵文件。
+
+    为什么不能只把 --train-file 放在变体的 "model" 列表里: eval 阶段的命令
+    【不带】v["model"](那时靠 --load-preds 跳过训练), 但 wf_v35 仍会把
+    train_file 纳入缓存 meta 的一致性校验, 于是 features/caches 阶段用了新矩阵、
+    eval 阶段却传回旧矩阵名, 直接报"预测缓存不匹配"。所以必须在这一层替换。
+    """
+    tf = VARIANTS[variant].get("train_file")
+    if not tf:
+        return list(MODEL_ARGS)
+    a = list(MODEL_ARGS)
+    a[a.index("--train-file") + 1] = tf
+    return a
 
 # ── 股票池变体 ──────────────────────────────────────────────
 # 线上 5 条线里有 4 条带 --skip-boards 30,688 (账户没开创业板/科创板权限)。
@@ -165,6 +182,28 @@ VARIANTS = {
                       "feat": "EVALFEAT_MBNOFUND", "cache": "preds_eval_mbnofund",
                       "ev": "EVMBNOFUND",
                       "desc": "mb_dmw 再剔除全部财务特征 (判断值不值得买历史)"},
+
+    # ── 融券余额特征 (2026-08-07) ─────────────────────────────────
+    # 16 张 tushare 表逐字段过 IC + top5 分层双关卡后, 唯一存活的是 rqye(融券余额)。
+    # 它是全场【唯一在窗口A 的 top5 超额为正】的因子(+0.316%, 按流通市值归一后),
+    # 而窗口A 正是我们唯一的堵点 —— 模型在那里的 top5 超额是 -0.164%。
+    #
+    # 诚实标注先验很弱: 独立采样(每5日, 消除5日前瞻重叠)的 t 值只有 A 1.3 / B 0.6,
+    # 低于事前定的 t>2。所以这一轮的目的是【证死或证实】, 不是期待它翻盘。
+    # 对照组已有的 daily_basic 全线否决(IC 两窗同号但 top5 全为零或负), 说明
+    # "IC 好看" 完全不足以推断 top5 能赚钱, 这次也一样要看端到端结果。
+    #
+    # 只加 2 列, 训练矩阵由 add_margin_features.py 在原矩阵上 merge 得到 ——
+    # 除这 2 列外与 mb_dmw 用的矩阵逐格相同, 所以差异可直接归因。
+    # 不走 feature_engine 全量重建是刻意的: 那会引入无关的重算漂移
+    # (见 diag_rebuild_drift.py), 把"加了特征"和"重算了一遍"混在一起。
+    "mb_dmw_rq": {"model": ["--skip-boards", "30,688",
+                            "--drop-market-wide", "0.01"],
+                  "exec": ["--skip-boards", "30,688"],
+                  "feat": "EVALFEAT_MBRQ", "cache": "preds_eval_mbrq",
+                  "ev": "EVMBRQ",
+                  "train_file": "training_data_pit_2019_rq.parquet",
+                  "desc": "mb_dmw + 融券余额2列 (rq_bal_mv, rq_bal_pct)"},
 }
 # 注意 mb 变体的一个已知口径问题: eval 阶段带 --load-preds 时 df 不再被板块过滤,
 # 所以产物里的 benchmark 仍是全市场等权, 而策略只买主板 -> excess/IR 不可直接
@@ -172,8 +211,30 @@ VARIANTS = {
 # 所以不影响结论; 但看 IR 时要记得这点。
 
 # 所有运行共享的执行层默认值 (与线上 BASE_PARAMS 对齐)
+#
+# 滑点 2026-08-06 从 0.002 改为 0.0005 —— 这不是调参, 是修一个高估了 4 倍的
+# 成本假设。实测 (mb_dmw, 3只, 20种子, 窗口B 收益中位):
+#     滑点 0.20%  +34.5%      滑点 0.10%  +65.2%
+#     滑点 0.05%  +86.5%      滑点 0      +104.2%
+# 0.2%/边 意味着往返 0.52%(含佣金印花税), 一年 48 次调仓 = -25%/年 的地板,
+# 比选股能力的影响大得多。而 0.2% 是把三个成分都按最坏情况叠加算出来的:
+#     价差    A股 tick 0.01元, 10~50元的股票半价差只有 0.01~0.05%
+#     冲击    5万元 / 1.28亿日成交额 = 0.04‰, 基本为 0
+#     时点偏差 尾盘成交 vs 按收盘价记账, 这部分【对称零均值】, 不是成本
+# 0.05% 是对前两项(真成本)的现实估计。保留 base3_slip0/slip10 两个对照配置,
+# 它们显式覆盖这个默认值, 用来随时复查这个假设的敏感性。
 EXEC_BASE = ["--hold-days", "5", "--portfolio-mode", "periodic",
-             "--exec-mode", "t1close", "--slippage", "0.002"]
+             "--exec-mode", "t1close", "--slippage", "0.0005"]
+
+# 改了 EXEC_BASE 就必须同步这里 —— 见 collect() 的陈旧结果校验。
+# ev_tag 里【不含】执行层参数, 所以改了 EXEC_BASE 却不重跑, 旧参数跑出来的结果
+# 文件会因文件名重合而被静默当成新结果。本轮已经踩过两次同类的坑(rsync 不同步
+# 导致整段实验静默失败、换仓相位混进持有天数对比), 所以这里做校验: 对不上的
+# 产物排除出判定并在报告末尾列出, 不允许"看起来有结果"。
+EXEC_EXPECT = {"slippage": 0.0005, "exec_mode": "t1close"}
+
+# collect() 发现的陈旧产物, 在报告末尾统一列出
+STALE_SEEN = []
 
 # ── 待评估的配置 ────────────────────────────────────────────
 # 只允许放【执行层】参数, 否则 --load-preds 会因缓存不匹配而拒绝运行
@@ -237,6 +298,104 @@ CONFIGS = {
     "g5_roll":   {"desc": "5只 + 卖出容忍(前10名续持)",
                   "args": ["--tranche-n", "5", "--initial-capital", "50000",
                            "--regime-filter", "off", "--roll-rank", "10"]},
+
+    # ── 第三轮: 量化"信号-执行延迟"值多少钱 ──
+    # 现状是 T 日收盘出信号 -> T+1 尾盘成交, 中间隔了一整个交易日, 信号衰减一天。
+    # 若改成 T 日 14:50 拿盘中快照出信号、当天 14:50-15:00 成交, 延迟就压到 ~10 分钟。
+    #
+    # 这里用 --exec-mode close (T日收盘价成交) 来近似那个方案。必须清楚它的性质:
+    #   * 特征仍是用【收盘价】算的, 而成交也在收盘 -> 严格说是同时性未来函数,
+    #     所以这个结果是【上界】, 不是可实现收益。
+    #   * 要把它变成可实盘, 前提是 14:50 用当时快照重算特征。14:50 价≈收盘价,
+    #     但尾盘 10 分钟的偏移、以及资金流/换手等当日未收口的特征, 都会打折。
+    # 用途: 与 base3/base5 对比, 差值就是"消除一天延迟"最多能拿回多少。
+    # 若差值很小, 就不必为 14:50 方案改造流水线(也不必买历史分钟数据)。
+    "t0close3": {"desc": "3只 + T日尾盘成交(14:50快照方案的上界, 含同时性)",
+                 "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                          "--regime-filter", "off", "--exec-mode", "close"]},
+    "t0close5": {"desc": "5只 + T日尾盘成交(同上, 5只版)",
+                 "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                          "--regime-filter", "off", "--exec-mode", "close"]},
+
+    # ── 持有天数扫描 (2026-08-06) ────────────────────────────
+    # 动机来自 diag_entry_path.py 的实测: 把 top3 选票在信号日之后的收益拆成
+    # 逐日单腿, 发现信号衰减【远比 5 天慢】—— 毛收益一直累到 t+18 才见顶,
+    # d22 才归零, 衰减周期约三周。而往返成本 0.46% 是每个周期固定付一次,
+    # 所以拉长持有 = 摊薄成本, 只要多出来那几天的毛收益还大于 0 就赚。
+    #
+    # 上界估算 (买入固定 close_t+1, 忽略涨停/停牌/整手约束):
+    #   持有天数   4      5(现状)   6      7      10     15
+    #   窗口B年化  +11.1%  +16.3%  +18.9% +20.7% +17.2% +18.1%
+    #   窗口A年化  -28.0%  -24.7%  -22.7% -20.9% -21.0% -19.7%
+    # 关键是【两个窗口同号】: A 从 -24.7 改善到 -20.9, B 从 +16.3 改善到 +20.7。
+    # 这是至今唯一一个 A/B 一致的改动方向 (vol-target/reversal-guard/14:50
+    # 全都是一窗好一窗坏)。而且 6~16 天是个 17~21% 的平台, 不是尖峰, 不像拟合。
+    #
+    # 旁证: --roll-rank(卖出容忍) 之前被测出有效, 它本质上就是在变相拉长持有期。
+    # 所以这里不叠加 roll-rank, 先单独量纯持有天数的效应, 避免归因混在一起。
+    "hold6_3":  {"desc": "3只, 持有6天 (现状5天; 摊薄往返成本)",
+                 "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                          "--regime-filter", "off", "--hold-days", "6"]},
+    "hold7_3":  {"desc": "3只, 持有7天 (上界估算的最优点)",
+                 "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                          "--regime-filter", "off", "--hold-days", "7"]},
+    "hold8_3":  {"desc": "3只, 持有8天 (验证最优点附近是平台还是尖峰)",
+                 "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                          "--regime-filter", "off", "--hold-days", "8"]},
+    "hold10_3": {"desc": "3只, 持有10天 (换仓降到年24次)",
+                 "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                          "--regime-filter", "off", "--hold-days", "10"]},
+    "hold15_3": {"desc": "3只, 持有15天 (接近信号衰减完的三周)",
+                 "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                          "--regime-filter", "off", "--hold-days", "15"]},
+    "hold4_3":  {"desc": "3只, 持有4天 (对齐label的t+1->t+5; 预期变差, 做反向对照)",
+                 "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                          "--regime-filter", "off", "--hold-days", "4"]},
+    "hold7_5":  {"desc": "5只, 持有7天 (最优持有期的5只版)",
+                 "args": ["--tranche-n", "5", "--initial-capital", "50000",
+                          "--regime-filter", "off", "--hold-days", "7"]},
+    # 若持有天数确实有效, 再看它与已验证的两个机制能不能叠加
+    "hold7_rg": {"desc": "3只, 持有7天 + breadth择时 (两个已验证机制叠加)",
+                 "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                          "--regime-filter", "breadth", "--regime-ma", "20",
+                          "--regime-breadth", "0.40", "--regime-confirm", "2",
+                          "--hold-days", "7"]},
+
+    # 持有天数 x 现实滑点: 两个独立的成本改善叠加, 是当前最有希望的候选。
+    # 拉长持有降低【付费次数】, 修正滑点假设降低【每次的单价】, 互不冲突。
+    "hold7_rg_slip05": {"desc": "3只 + 持有7天 + breadth择时 + 滑点0.05%/边 (成本双改善)",
+                        "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                                 "--regime-filter", "breadth", "--regime-ma", "20",
+                                 "--regime-breadth", "0.40", "--regime-confirm", "2",
+                                 "--hold-days", "7", "--slippage", "0.0005"]},
+    "hold7_slip05": {"desc": "3只 + 持有7天 + 滑点0.05%/边 (不带择时, 便于归因)",
+                     "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                              "--regime-filter", "off",
+                              "--hold-days", "7", "--slippage", "0.0005"]},
+
+    # ── 滑点敏感性: 0.2%/边 这个假设到底扛了多少锅 ──
+    # 滑点有三个成分, 只有前两个是真成本:
+    #   价差   永远不利, 但 A股 tick 0.01元, 10~50元的股票半价差只有 0.01~0.05%
+    #   冲击   永远不利, 但 5万元 / 1.28亿日成交额 = 0.04‰, 基本为 0
+    #   时点偏差 14:50 成交 vs 按收盘价记账, 这部分是【对称零均值】的, 不是成本
+    # 现行 --slippage 0.002 把三者都按最坏情况算, 往返 0.52%, 一年 48 次调仓
+    # 就是 -25%/年 —— 这个地板比选股能力的影响大得多, 必须先量清楚。
+    # 注意: 时点偏差零均值的前提是"下单时点与价格走势无关"。我们的模型偏好
+    # 短期强势股, 买入端可能有系统性不利偏移, 所以 slip0 是乐观上界而非真值。
+    "base3_slip0":  {"desc": "3只, 零滑点(只留佣金印花税) —— 成本上界的对照",
+                     "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                              "--regime-filter", "off", "--slippage", "0"]},
+    "base3_slip05": {"desc": "3只, 滑点0.05%/边 (半价差的现实估计)",
+                     "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                              "--regime-filter", "off", "--slippage", "0.0005"]},
+    "base3_slip10": {"desc": "3只, 滑点0.10%/边 (保守但不离谱)",
+                     "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                              "--regime-filter", "off", "--slippage", "0.001"]},
+    "g3_rg_slip05": {"desc": "3只 + breadth择时, 滑点0.05%/边 (最优配置的现实成本版)",
+                     "args": ["--tranche-n", "3", "--initial-capital", "50000",
+                              "--regime-filter", "breadth", "--regime-ma", "20",
+                              "--regime-breadth", "0.40", "--regime-confirm", "2",
+                              "--slippage", "0.0005"]},
 
     # ── 第三轮: 只组合"在两个窗口上都单独有效"的机制 ──
     # 第二轮结果: regime择时 与 min-pred 都在 A(少亏) 和 B(多赚) 两侧同向改善;
@@ -377,6 +536,56 @@ CONFIGS = {
                                      "--fill-daily"]},
 }
 
+# ── 换仓相位对照 (2026-08-06) ────────────────────────────────
+# 为什么需要这个: wf_v35 的换仓日判定是 `i % HOLD_DAYS == REBAL_OFFSET`,
+# 所以 periodic 模式下每个 (HOLD_DAYS, OFFSET) 组合对应【完全不同的一组
+# 换仓日期】。之前的持有天数扫描只跑了 offset=0, 等于每个持有天数只抽了
+# 一个相位样本 —— 结果 hold8 在窗口A 出现 +3.9%, 而它的两个邻居 hold7/hold10
+# 是 -38.2%/-46.9%, 一天之差跳 42pp, 且 A/B 两窗口好坏不相关。这是相位噪声
+# 的典型特征, 不是持有天数的效应。
+#
+# diag_entry_path.py 的上界估算是在【所有信号日】上取平均(等于平均了所有
+# 相位), 所以它预测的是平滑平台; 回测只取一个相位, 两者不可比。
+#
+# 这里做两件事:
+#   base3_ph1..ph4  —— 量【现有基线本身】的相位离散度。base3 是 5 个相位里
+#                      的 1 个, 如果 5 个相位之间摆动几十个点, 那我们所有
+#                      配置的绝对水位都带着这个未量化的运气成分。
+#                      (同相位配置之间的配对比较不受影响, 仍然有效)
+#   hold8_ph1..ph7  —— 判定 hold8 那个 +3.9% 是真效应还是抽到好相位。
+#                      若 8 个相位的中位数回落到邻居水平, 就是噪声。
+def _phase_cfgs():
+    out = {}
+    _rg = ["--regime-filter", "breadth", "--regime-ma", "20",
+           "--regime-breadth", "0.40", "--regime-confirm", "2"]
+    _c3 = ["--tranche-n", "3", "--initial-capital", "50000"]
+    _c5 = ["--tranche-n", "5", "--initial-capital", "50000"]
+    for hold, base_args, label in (
+        (5, _c3 + ["--regime-filter", "off"], "base3"),
+        (8, _c3 + ["--regime-filter", "off", "--hold-days", "8"], "hold8_3"),
+        # 上面两组已跑完, 结论: hold8 的优势是相位运气, base3 的 ph0 是最好相位。
+        #
+        # 下面是 5 只版的当前最佳候选(口径已从 3 只改为 5 只)。3只版的 ph0 数字
+        # (B窗夏普0.78/回撤最差-41.8%)是首次通过门槛的, 但 base3 实测五个相位在
+        # B 窗摆动 21pp、亏损种子数从 0/20 到 6/20, 所以必须相位平均才算数。
+        (7, _c5 + _rg + ["--hold-days", "7", "--slippage", "0.0005"],
+         "h7_rg_slip05_n5"),
+        (5, _c5 + _rg + ["--slippage", "0.0005"], "g5_rg_slip05"),
+    ):
+        for off in range(hold):
+            # off=0 用本名。base3/hold8_3 已在 CONFIGS 里跑过, 不覆盖也不重跑
+            name = label if off == 0 else f"{label}_ph{off}"
+            if name in CONFIGS:
+                continue
+            out[name] = {
+                "desc": f"{label} 换仓相位{off}/{hold} (量相位噪声)",
+                "args": base_args + ["--rebal-offset", str(off)],
+            }
+    return out
+
+
+CONFIGS.update(_phase_cfgs())
+
 # ── 验收门槛 ────────────────────────────────────────────────
 # 必须【两个窗口同时】满足。中位数看"典型情况", 最差种子看"运气不好时"——
 # 后者才是"不是偶发现象"的真正检验: 一个配置如果只有中位数好看但最差种子
@@ -396,6 +605,24 @@ CONFIGS = {
 #
 # 重点放在【最差种子】而非中位数: 中位数从 0.45 抬到 0.50 是锦上添花,
 # 把最差种子从 -0.06/-63.8% 收到 0.15/-50% 才是"能不能睡着觉"的区别。
+#
+# ── 2026-08-06 进展: 窗口B 已达标, 窗口A 确认无 alpha ──────────
+# g5_rg_slip05 (5只 + breadth择时 + 滑点0.05%), 5 个换仓相位 x 20 种子:
+#     窗口B 相位中位: 收益 +79.2%  夏普中位 0.77  夏普最差 0.58
+#                     回撤中位 -28.9%  回撤最差 -37.7%  亏损种子 0/20
+#     -> 五项门槛【全部通过】, 且 5 个相位每一个都单独通过, 不是挑相位挑出来的
+#     窗口A 相位中位: 收益 -16.4%, 亏损种子 3~20/20
+#
+# 关于上面那句"不存在夏普 1.4": 仍然成立, 但天花板要上修 —— 之前的水位是在
+# 滑点 0.2% 下测的, 而那个假设高估成本 4 倍。5只/0.05%滑点下 B 窗夏普中位 0.77,
+# 最好相位 0.92。所以门槛 0.50 现在偏松, 但【先别动】: 窗口A 还是 -16%,
+# 在两窗口都达标之前收紧门槛只会掩盖真正的问题。
+#
+# 窗口A 的失败已排除四类原因, 是该时段真实缺 alpha, 不是执行层或数据层缺失:
+#     不是成本      —— 零滑点下仍 -20.5%
+#     不是持有天数  —— 相位平均后 4~15 天无一致效应
+#     不是相位运气  —— 12 个相位全为负
+#     不是缺估值特征 —— daily_basic 全部字段在 A 窗 top5 为零或为负
 THRESHOLDS = {
     "sharpe_median": 0.50,   # 略高于现状 0.45, 低于天花板 0.61
     "sharpe_worst": 0.15,    # 稳健性核心: 20 个种子全部为正
@@ -483,7 +710,7 @@ def phase_features(args):
             continue
         # 不传 --features-from = 现场筛选, 且脚本内部只用首个出信号日之前的
         # 数据做筛选(见 wf_v35 里 select_features(..., FIRST_PRED)), 无未来函数
-        cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *MODEL_ARGS, *v["model"],
+        cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *model_args(args.variant), *v["model"],
                *win_args(win), *EXEC_BASE,
                "--n-features", "80", "--tranche-n", "3",
                "--initial-capital", "50000", "--regime-filter", "off",
@@ -513,7 +740,7 @@ def phase_caches(args):
         for seed in args.seeds:
             if (PROC / cache_name(win, seed, args.variant)).exists() and not args.force:
                 continue
-            cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *MODEL_ARGS, *v["model"],
+            cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *model_args(args.variant), *v["model"],
                    *win_args(win), *EXEC_BASE,
                    "--features-from", fj.name,
                    "--tranche-n", "3", "--initial-capital", "50000",
@@ -545,7 +772,7 @@ def phase_eval(args):
                 tag = ev_tag(cname, win, seed, args.variant)
                 if out_path_cap(tag, win, cap).exists() and not args.force:
                     continue
-                cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *MODEL_ARGS,
+                cmd = [PY, "-u", "scripts/wf_v35_breadth_alpha.py", *model_args(args.variant),
                        *win_args(win), *EXEC_BASE,
                        "--features-from", features_json(win, args.variant),
                        "--load-preds", cache.name, *cfg["args"], *v["exec"],
@@ -567,15 +794,54 @@ def _cap_of(arglist):
 
 
 # ── 汇总 ────────────────────────────────────────────────────
+def _expected_exec(cname):
+    """该配置最终生效的执行层参数 (配置自己的 args 覆盖 EXEC_BASE)"""
+    exp = dict(EXEC_EXPECT)
+    a = CONFIGS[cname]["args"]
+    if "--slippage" in a:
+        exp["slippage"] = float(a[a.index("--slippage") + 1])
+    if "--exec-mode" in a:
+        exp["exec_mode"] = a[a.index("--exec-mode") + 1]
+    exp["rebal_offset"] = (int(a[a.index("--rebal-offset") + 1])
+                           if "--rebal-offset" in a else 0)
+    return exp
+
+
 def collect(cname, win, seeds, variant):
+    """读回结果, 顺带校验产物里记录的执行层参数与当前配置一致。
+
+    ev_tag 里不含执行层参数, 所以改了 EXEC_BASE(比如滑点 0.002 -> 0.0005) 而
+    没重跑时, 旧参数的产物会因文件名重合被当成新结果 —— 那会得出一个完全错误
+    但看起来毫无异常的结论。这里把参数不符的产物【排除出判定】并大声警告,
+    而不是静默混用, 也不硬抛错(否则 0.002 时代的上千个历史产物全都读不出来)。
+    """
     cap = _cap_of(CONFIGS[cname]["args"])
-    rows = []
+    exp = _expected_exec(cname)
+    rows, stale = [], []
     for seed in seeds:
         p = out_path_cap(ev_tag(cname, win, seed, variant), win, cap)
         if not p.exists():
             continue
-        s = json.loads(p.read_text())["summary"]
-        rows.append(s)
+        d = json.loads(p.read_text())
+        bad = {}
+        for k, v in exp.items():
+            got = d.get(k)
+            # rebal_offset 是 2026-08-06 才加的字段, 老产物里没有 -> 视为 0
+            if got is None and k == "rebal_offset":
+                got = 0
+            if isinstance(v, float):
+                if got is None or abs(float(got) - v) > 1e-12:
+                    bad[k] = (got, v)
+            elif got != v:
+                bad[k] = (got, v)
+        if bad:
+            stale.append(bad)
+            continue
+        rows.append(d["summary"])
+    if stale:
+        det = "; ".join(f"{k}: 产物={a!r} 期望={b!r}"
+                        for k, (a, b) in stale[0].items())
+        STALE_SEEN.append(f"{cname}/{win}: {len(stale)}个 ({det})")
     return rows
 
 
@@ -652,12 +918,21 @@ def phase_report(args):
                 s["maxdd_worst"], f"{s['n_loss']}/{s['n_seeds']}", s["fee_median"]))
         print(f"  结论: {v}" + (f"  |  未达标项: {'; '.join(fails)}" if fails else ""))
     _print_cross_table(out, args)
+    _print_phase_table(out)
     suffix = "" if args.variant == "full" else f"_{args.variant}"
     dst = PROC / f"eval_grid_report{suffix}.json"
     dst.write_text(json.dumps({"thresholds": THRESHOLDS, "windows": WINDOWS,
                                "variant": args.variant, "seeds": args.seeds,
                                "results": out},
                               ensure_ascii=False, indent=2))
+    if STALE_SEEN:
+        print()
+        print("!" * 108)
+        print("以下产物的执行层参数与当前配置不符, 已【排除出判定】(不是缺数据):")
+        for s in STALE_SEEN:
+            print(f"  {s}")
+        print("要用这些配置就必须按当前参数重跑; 旧产物文件名会重合, 需先删除。")
+        print("!" * 108)
     print()
     print(f"报告已写入 {dst}")
 
@@ -700,6 +975,81 @@ def _print_cross_table(out, args):
     print("门槛: 夏普最差>=%.2f 夏普中位>=%.2f 回撤最差>=%.1f%% 亏损种子<=%.0f%%" % (
         THRESHOLDS["sharpe_worst"], THRESHOLDS["sharpe_median"],
         THRESHOLDS["maxdd_worst"], THRESHOLDS["max_loss_seeds_pct"]))
+
+
+PH_RE = re.compile(r"^(.*)_ph(\d+)$")
+
+
+def _print_phase_table(out):
+    """把同一配置的多个换仓相位聚合成【相位中位数】再判定。
+
+    为什么必须有这张表: wf_v35 的换仓日判定是 i %% HOLD_DAYS == REBAL_OFFSET,
+    每个 offset 对应完全不同的一组换仓日期。实测 base3 的 5 个相位在窗口B
+    收益从 +13.2% 到 +34.5%(摆动 21pp), 亏损种子数从 0/20 到 6/20 —— 而我们
+    长期只跑相位 0, 且相位 0 恰好是 5 个里最好的那个。hold8 在窗口A 那个
+    +3.9% 也是同样的假象(8 个相位中位数回落到 -32%)。
+
+    所以: 只跑了单相位的配置, 其数字一律视为【上界估计】而非结论。
+    """
+    groups = {}
+    for cname, r in out.items():
+        m = PH_RE.match(cname)
+        base = m.group(1) if m else cname
+        if base in out or not m:      # 有 ph0 本名的才成组, 否则自成一组
+            groups.setdefault(base, []).append((cname, r))
+    multi = {k: v for k, v in groups.items() if len(v) > 1}
+    if not multi:
+        single = [k for k in groups if k in out]
+        if single:
+            print()
+            print("[相位提醒] 以下配置只有单个换仓相位的数据, 其数字应视为上界"
+                  f"估计而非结论: {', '.join(sorted(single))}")
+            print("           相位噪声实测可达 21pp(窗口B收益), 要下结论请补跑 "
+                  "--rebal-offset 1..HOLD_DAYS-1")
+        return
+    print()
+    print("=" * 108)
+    print("相位中位数 (对同一配置的全部换仓相位取中位 —— 这才是可采信的数字)")
+    print("=" * 108)
+    print("%-20s %4s %3s %9s %9s %9s %9s %9s %9s" % (
+        "配置", "相位", "窗", "收益中位", "夏普中位", "夏普最差",
+        "回撤中位", "回撤最差", "亏损%"))
+    agg = {}
+    for base, items in sorted(multi.items()):
+        synth = {}
+        for win in ("A", "B"):
+            ss = [r[win] for _, r in items if r[win]]
+            if not ss:
+                continue
+            def med(k):
+                return float(np.median([s[k] for s in ss]))
+            synth[win] = {
+                "n_seeds": ss[0]["n_seeds"],
+                "ret_median": med("ret_median"), "ret_worst": med("ret_worst"),
+                "ret_best": med("ret_best"),
+                "sharpe_median": med("sharpe_median"),
+                "sharpe_worst": med("sharpe_worst"),
+                "maxdd_median": med("maxdd_median"),
+                "maxdd_worst": med("maxdd_worst"),
+                "fee_median": med("fee_median"),
+                "n_loss": float(np.median([s["n_loss"] for s in ss])),
+                "ic_median": med("ic_median"), "bench": med("bench"),
+                "ret_p25": med("ret_p25"), "ret_p75": med("ret_p75"),
+                "n_below_bench": ss[0]["n_below_bench"],
+            }
+            s = synth[win]
+            print("%-20s %4d %3s %9.1f %9.2f %9.2f %9.1f %9.1f %9.0f" % (
+                base, len(ss), win, s["ret_median"], s["sharpe_median"],
+                s["sharpe_worst"], s["maxdd_median"], s["maxdd_worst"],
+                s["n_loss"] / s["n_seeds"] * 100))
+        if len(synth) == 2:
+            v, fails = verdict(synth["A"], synth["B"])
+            agg[base] = (v, fails)
+            print(f"{'':<20} 相位中位判定: {v}"
+                  + (f"  |  未达标: {'; '.join(fails)}" if fails else ""))
+    print()
+    print("注: 亏损% 是各相位「亏损种子占比」的中位数。单个相位全 0/20 不算"
+          "稳健, 全部相位都 0/20 才算。")
 
 
 def main():
