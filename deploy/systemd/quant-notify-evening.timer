@@ -4,12 +4,17 @@
 Description=Quant evening reminder (new plan / confirm fills)
 
 [Timer]
-# 三轮都跟一次, 而不是只跟最后一轮: 第一轮就出计划时应当尽早通知, 但
-# 第一轮也可能因数据未到而跳过。脚本按【内容哈希】去重, 所以内容没变的
-# 后续轮次不会重复发, 变了(比如第二轮才真正出计划)才会补发。
-OnCalendar=Mon..Fri 18:15 Asia/Hong_Kong
-OnCalendar=Mon..Fri 20:15 Asia/Hong_Kong
-OnCalendar=Mon..Fri 22:15 Asia/Hong_Kong
+# 每 15 分钟试一次, 而不是赌流水线几点跑完。
+#
+# 原来写死 18:15/20:15/22:15, 但实测全链路要 27-33 分钟且波动很大(单是全市场
+# K 线就曾跑 32 分钟)。17:30 起跑的话 18:15 很可能正撞在重建中途 —— 那时
+# 各条线的信号是"改了一半"的状态。
+#
+# 改成轮询后由脚本自己把关, 两道闸门配合:
+#   pipeline_busy() —— 重建中直接退出, 绝不发残缺的计划
+#   内容哈希去重     —— 内容没变就不重复发, 所以一晚上轮 20 次也只发一条
+# 结果是: 流水线一跑完, 最迟 15 分钟内送达; 期间一条噪音都没有。
+OnCalendar=Mon..Fri 18..23:00/15 Asia/Hong_Kong
 # 触发的是同名的 quant-notify-evening.service (systemd 默认行为)
 
 # 盘后提醒补发是有意义的("你还欠一次成交确认"隔天仍然成立), 与尾盘提醒相反。

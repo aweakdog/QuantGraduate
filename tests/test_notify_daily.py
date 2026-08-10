@@ -150,6 +150,67 @@ def test_多条线合并成一条消息():
     assert txt.count("激进2万") == 1 and txt.count("激进10万") == 1
 
 
+# ── 与流水线的并发保护 ────────────────────────────────────────────────
+
+def _status_root(tmp, **kv):
+    """造一个只含 pipeline_status.json 的假 root。"""
+    import json
+    live = Path(tmp) / "data" / "live"
+    live.mkdir(parents=True, exist_ok=True)
+    (live / "pipeline_status.json").write_text(
+        json.dumps(kv, ensure_ascii=False), encoding="utf-8")
+    return Path(tmp)
+
+
+def test_流水线重建中必须判定为忙():
+    """重建是逐条线依次生成信号且无锁, 中途读到的是"改了一半"的状态。"""
+    import tempfile
+    m = _mod()
+    now = datetime(2026, 8, 10, 17, 50)
+    with tempfile.TemporaryDirectory() as td:
+        root = _status_root(td, started_at="2026-08-10T17:30:00", finished_at=None)
+        assert m.pipeline_busy(root, now) is True
+
+
+def test_流水线已完成后要放行():
+    import tempfile
+    m = _mod()
+    now = datetime(2026, 8, 10, 18, 30)
+    with tempfile.TemporaryDirectory() as td:
+        root = _status_root(td, started_at="2026-08-10T17:30:00",
+                            finished_at="2026-08-10T18:02:11", ok=True)
+        assert m.pipeline_busy(root, now) is False
+
+
+def test_流水线失败退出后也要放行():
+    """失败路径同样会写 finished_at。不放行就等于故障时连提醒一起哑掉。"""
+    import tempfile
+    m = _mod()
+    now = datetime(2026, 8, 10, 18, 30)
+    with tempfile.TemporaryDirectory() as td:
+        root = _status_root(td, started_at="2026-08-10T17:30:00",
+                            finished_at="2026-08-10T17:41:02", ok=False)
+        assert m.pipeline_busy(root, now) is False
+
+
+def test_进程被杀后不能永久静默():
+    """SIGKILL(OOM/超时)时 except 块来不及跑, finished_at 永远为空。
+    不加时限就会一次崩溃换来永久沉默 —— 那正是最该避免的失效方式。"""
+    import tempfile
+    m = _mod()
+    with tempfile.TemporaryDirectory() as td:
+        root = _status_root(td, started_at="2026-08-10T17:30:00", finished_at=None)
+        assert m.pipeline_busy(root, datetime(2026, 8, 11, 9, 0)) is False
+
+
+def test_状态文件缺失时不阻断发送():
+    """看不懂状态就选择永久沉默, 比偶尔发错危险得多。"""
+    import tempfile
+    m = _mod()
+    with tempfile.TemporaryDirectory() as td:
+        assert m.pipeline_busy(Path(td), datetime(2026, 8, 10, 18, 0)) is False
+
+
 # ── 运维告警要与操作提醒分开 ──────────────────────────────────────────
 
 def test_流水线故障走独立告警而不混进操作提醒():
@@ -168,6 +229,68 @@ def test_等确认导致的落后不算流水线故障():
 
 
 # ── 通道层 ────────────────────────────────────────────────────────────
+
+def test_尾盘催单必须艾特所有人():
+    """错过尾盘就是这一轮换仓没执行, 值得把人从别的事里拽出来。"""
+    m = _mod()
+    items = [_item(action="trade", rel="today", phase="before", buy=[_ROW])]
+    assert m.is_urgent("preclose", items) is True
+
+
+def test_新计划预告不该艾特所有人():
+    """天天 @all 的下场是被人关掉群提醒, 那时真紧急的也送不到了。"""
+    m = _mod()
+    items = [_item(action="trade", rel="tomorrow", buy=[_ROW])]
+    assert m.is_urgent("signal", items) is False
+
+
+def test_确认提醒仅在逾期时才艾特所有人():
+    m = _mod()
+    normal = [_item(awaiting={"exec_date": "2026-08-10"}, can_confirm=True, overdue=None)]
+    late = [_item(awaiting={"exec_date": "2026-08-05"}, can_confirm=True, overdue=3)]
+    assert m.is_urgent("confirm", normal) is False, "当天正常待确认, 晚上有的是时间"
+    assert m.is_urgent("confirm", late) is True, "逾期意味着整条线已停摆"
+
+
+def _wecom():
+    try:
+        import notify_channels
+        return notify_channels
+    except ImportError as e:                     # pragma: no cover
+        raise _Skip(f"导入 notify_channels 失败: {e}")
+
+
+def test_紧急消息用text类型才能艾特所有人():
+    """企业微信 markdown 类型【不支持】@所有人, mentioned_list 对它无效 ——
+    所以紧急消息必须换成 text 类型, 否则 @ 会静默失效。"""
+    nc = _wecom()
+    ch = nc.WecomChannel("https://example.invalid/webhook")
+    p = ch._payload("**尾盘提醒**\n卖 600276", urgent=True)
+    assert p["msgtype"] == "text", "紧急消息必须用 text, markdown 无法 @所有人"
+    assert p["text"]["mentioned_list"] == ["@all"]
+    assert "**" not in p["text"]["content"], "text 不渲染 markdown, 星号会原样显示"
+
+
+def test_非紧急消息用markdown保留格式():
+    nc = _wecom()
+    ch = nc.WecomChannel("https://example.invalid/webhook")
+    p = ch._payload("**新计划**\n买 000725", urgent=False)
+    assert p["msgtype"] == "markdown"
+    assert "**新计划**" in p["markdown"]["content"]
+
+
+def test_超长消息按字节截断且必须提示未显示完整():
+    """少一笔卖单而当事人不知道, 比消息难看严重得多 —— 截断必须说出来。"""
+    nc = _wecom()
+    ch = nc.WecomChannel("https://example.invalid/webhook")
+    long_text = "卖 600276 恒瑞医药 100股\n" * 400
+    p = ch._payload(long_text, urgent=True)
+    body = p["text"]["content"]
+    assert len(body.encode("utf-8")) <= nc.WECOM_TEXT_LIMIT, "必须压到字节上限内"
+    assert "未显示完整" in body, "截断了却不说, 人会以为看到的就是全部"
+    # 截断点必须落在合法 utf8 边界, 否则整条消息编码损坏发不出去
+    body.encode("utf-8").decode("utf-8")
+
 
 def test_未知通道名必须报错而不是悄悄退回stdout():
     """配置写错却"看起来在正常运行", 是这类系统最容易漏掉的故障。"""

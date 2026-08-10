@@ -123,8 +123,47 @@ class QueueChannel(Channel):
         return n
 
 
+# 企业微信群机器人的硬限制(官方文档): content 均为 utf8 字节数, 超出会被服务端
+# 拒绝或截断。催单消息被截掉一笔卖单就是事故, 所以必须由我们自己显式处理。
+WECOM_TEXT_LIMIT = 2048
+WECOM_MARKDOWN_LIMIT = 4096
+
+
+def _fit_bytes(text, limit, notice):
+    """按 utf8 字节裁到 limit 以内, 并在结尾留下明确的"还有内容"提示。
+
+    两个要点:
+      - 必须按字节裁而不是按字符 —— 中文一个字 3 字节, 按字符算会超。
+      - 裁切点不能落在多字节字符中间, 否则整条消息编码损坏发不出去。
+      - 宁可显式说"未显示完整", 也不能让人以为看到的就是全部 —— 少一笔
+        卖单而当事人不知道, 比消息难看严重得多。
+    """
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    keep = limit - len(notice.encode("utf-8"))
+    cut = raw[:max(0, keep)]
+    # 退到合法的 utf8 边界
+    while cut and (cut[-1] & 0xC0) == 0x80:
+        cut = cut[:-1]
+    if cut and cut[-1] >= 0xC0:
+        cut = cut[:-1]
+    return cut.decode("utf-8", errors="ignore") + notice
+
+
 class WecomChannel(Channel):
-    """企业微信群机器人。一个 webhook URL, POST 一段 JSON 即可。"""
+    """企业微信群机器人。一个 webhook URL, POST 一段 JSON 即可。
+
+    【为什么要分两种消息类型】
+    实测与官方社区确认: markdown 类型【不支持 @所有人】—— mentioned_list 对它
+    无效, 只能用 <@userid> 点名具体成员。只有 text 类型支持 mentioned_list
+    ["@all"]。而 14:35 的催单最需要的恰恰是把人从别的事里拽出来。
+
+    所以按紧急程度分流:
+      urgent=True  -> text 类型 + @所有人。牺牲格式换强提醒, 对催办值得。
+      urgent=False -> markdown 类型。预告和回填提醒不必每次都轰炸所有人,
+                      天天 @all 的下场是被屏蔽, 那就前功尽弃了。
+    """
 
     name = "wecom"
 
@@ -133,16 +172,29 @@ class WecomChannel(Channel):
             raise ValueError("wecom 通道需要配置 wecom_webhook")
         self.webhook = webhook
 
+    def _payload(self, text, urgent):
+        if urgent:
+            # text 类型不渲染 markdown, 留着 ** 只会显示成一堆星号
+            plain = text.replace("**", "")
+            plain = _fit_bytes(plain, WECOM_TEXT_LIMIT,
+                               "\n…内容过长未显示完整, 请打开网页查看全部操作。")
+            return {"msgtype": "text",
+                    "text": {"content": plain, "mentioned_list": ["@all"]}}
+        md = _fit_bytes(text, WECOM_MARKDOWN_LIMIT,
+                        "\n…内容过长未显示完整, 请打开网页查看全部操作。")
+        return {"msgtype": "markdown", "markdown": {"content": md}}
+
     def send(self, text, meta=None):
-        body = json.dumps({"msgtype": "markdown", "markdown": {"content": text}},
-                          ensure_ascii=False).encode("utf-8")
+        payload = self._payload(text, bool((meta or {}).get("urgent")))
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             self.webhook, data=body,
             headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
                 resp = json.loads(r.read().decode("utf-8"))
-            # 企业微信 HTTP 200 也可能是业务失败(errcode != 0), 只看状态码会误判成功
+            # HTTP 200 也可能是业务失败(errcode != 0)。只看状态码会把
+            # "webhook key 失效"这类问题当成发送成功, 于是静默失效。
             if resp.get("errcode") != 0:
                 print(f"[notify] 企业微信返回错误: {resp}")
                 return False

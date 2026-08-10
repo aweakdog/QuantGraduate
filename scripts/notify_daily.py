@@ -28,7 +28,7 @@ import argparse
 import hashlib
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +58,41 @@ def _save_sent(d):
     tmp = SENT_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(SENT_PATH)
+
+
+def pipeline_busy(root, now=None, max_run_hours=4):
+    """流水线是否正在重建。正在跑的时候【一个字都不能发】。
+
+    daily_rebuild 是逐条线依次生成信号的(live_signal_xxx 一条约 11-14 秒),
+    整个流程 27-33 分钟, 而且**没有任何并发锁**。如果提醒恰好在中途跑起来,
+    就会读到"前两条线已更新、后两条还是昨天"的状态, 发出一条残缺的计划;
+    等流水线跑完, 下一次触发内容变了又发一条不一样的。
+
+    对跟单提醒来说, "第一条是残的"比"晚十五分钟收到"糟得多 —— 人照着残缺
+    清单下单会漏掉某几笔, 而且从此不再相信这个提醒。
+
+    判据: started_at 有值而 finished_at 为空。正常完成、跳过(非交易日)、
+    抛异常失败三条路径都会写 finished_at, 所以为空就是真的还在跑。
+
+    例外: 进程被 SIGKILL(OOM 或 systemd 超时)时 except 块来不及执行,
+    finished_at 会永远为空。所以加一个时限 —— 否则一次崩溃就让提醒永久沉默,
+    而这恰恰是最该避免的失效方式。
+    """
+    now = now or datetime.now()
+    p = Path(root) / "data" / "live" / "pipeline_status.json"
+    try:
+        st = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # 读不到状态就不阻断发送。看不懂状态而选择永久沉默, 比偶尔发错更危险。
+        return False
+    started, finished = st.get("started_at"), st.get("finished_at")
+    if not started or finished:
+        return False
+    try:
+        t0 = datetime.fromisoformat(str(started))
+    except ValueError:
+        return False
+    return (now - t0) < timedelta(hours=max_run_hours)
 
 
 def _rows_text(rows, side):
@@ -177,6 +212,26 @@ def compose(slot, items, now=None):
     raise ValueError(f"未知时点 {slot!r}")
 
 
+def is_urgent(slot, items):
+    """这条提醒值不值得 @所有人。
+
+    企业微信的 markdown 消息【不支持 @所有人】, 只有 text 类型可以。所以
+    "要不要 @" 同时决定了消息用什么格式发, 不是个纯装饰的选择。
+
+    判据是"错过的代价", 不是"事情大小":
+      尾盘催单     —— 错过就是这一轮换仓没执行, 必须打断人。
+      逾期未确认   —— 整条线已经停摆(不记账也不出新信号), 越拖越歪。
+      当天正常待确认/新计划预告 —— 晚上有的是时间, @all 属于滥用。
+
+    天天 @所有人的下场是被人关掉群提醒, 那时连真正紧急的也送不到了。
+    """
+    if slot == "preclose":
+        return True
+    if slot == "confirm":
+        return any(x["awaiting"] and x["can_confirm"] and x["overdue"] for x in items)
+    return False
+
+
 def admin_alert(items):
     """流水线真的挂了时的告警。与给跟单者的提醒分开 ——
 
@@ -212,6 +267,13 @@ def main():
             print(f"[notify] {now.date()} 非交易日, 跳过")
             return 0
 
+    # 流水线重建中就退出, 让下一次触发来发。唯一的例外是尾盘催单:
+    # 下单窗口只有 14:50-15:00 这 10 分钟, 等不起下一轮; 而那个时点
+    # 流水线本来也不该在跑(它只在盘后 17:30 之后启动)。
+    if args.slot != "preclose" and pipeline_busy(ROOT, now):
+        print("[notify] 流水线正在重建, 本轮跳过(避免发出残缺的计划)")
+        return 0
+
     items = collect(ROOT, now)
     slots = SLOTS if args.slot == "all" else (args.slot,)
 
@@ -234,8 +296,10 @@ def main():
             print(f"[notify] {slot}: 内容与已发的相同, 跳过")
             continue
 
-        ok = channel.send(text, meta={"slot": slot, "date": today})
-        print(f"[notify] {slot}: 经 {channel.name} 发送 {'成功' if ok else '失败'}")
+        urgent = is_urgent(slot, items)
+        ok = channel.send(text, meta={"slot": slot, "date": today, "urgent": urgent})
+        print(f"[notify] {slot}: 经 {channel.name} 发送 {'成功' if ok else '失败'}"
+              f"{' (@所有人)' if urgent else ''}")
         if ok and not args.dry_run:
             sent.setdefault(today, {})[slot] = {
                 "hash": h, "at": now.isoformat(timespec="seconds"),
