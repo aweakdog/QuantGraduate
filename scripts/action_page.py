@@ -257,6 +257,40 @@ def list_profiles():
             for k, v in PROFILES.items()]
 
 
+def _quote_map(plan):
+    """从计划里取每只持仓股的最新参考价。
+
+    必须同时看 hold 和 sell: 换仓日到期的持仓会从 plan.hold 挪进 plan.sell,
+    但在卖单真正成交之前它们仍然在 state.lots 里持有着。只查 hold 就会
+    查不到行情, 市值退回成本价, 当天总资产凭空少掉一笔浮盈 ——
+    对于浮盈接近本金的账户, 看上去就像被重置回本金了。
+    (2026-08-07 激进2万两笔同时到期, 页面显示 19,999.92 而实际 22,855.82)
+    """
+    m = {}
+    for grp in ("hold", "sell"):
+        for r in ((plan or {}).get(grp) or []):
+            c6 = str(r.get("code"))[:6]
+            if c6 not in m or (r.get("ref_close") and not m[c6].get("ref_close")):
+                m[c6] = r
+    return m
+
+
+def _equity_of(state, plan):
+    """总资产 = 现金 + Σ(股数 x 最新参考价)。拿不到行情才退回成本价。
+
+    现金和持仓一律取 state —— plan 是出信号那一刻的快照, 之后的现金校准/
+    出入金/删持仓只写 state。plan 只用来提供行情。
+    """
+    st = state or {}
+    q = _quote_map(plan)
+    mv = 0.0
+    for lot in (st.get("lots") or []):
+        c6 = str(lot.get("code"))[:6]
+        px = (q.get(c6) or {}).get("ref_close") or lot.get("buy_price") or 0
+        mv += (lot.get("shares") or 0) * px
+    return float(st.get("cash") or 0) + mv
+
+
 def build_recommend(root: Path, pid=None):
     """每日推荐看板: 模型当天打分最高的股票。
 
@@ -275,9 +309,10 @@ def build_recommend(root: Path, pid=None):
     rec = list((plan or {}).get("recommend") or [])
     # 每只预算决定"买不买得起", 必须用当前真实总资产, 否则存取现金后
     # 这里还按旧数字标"买不起", 会误导人。
+    # 用市值而不是成本价: 按成本价算会把浮盈排除在预算外, 涨了一波之后
+    # 反而报"买不起"。
     st = state or {}
-    equity = float(st.get("cash") or 0) + sum(
-        (l.get("shares") or 0) * (l.get("buy_price") or 0) for l in (st.get("lots") or []))
+    equity = _equity_of(st, plan)
     if equity <= 0:
         equity = (plan or {}).get("equity") or capital_of(pid)
     n = prof["tranche-n"]
@@ -347,7 +382,9 @@ def build_today(root: Path, pid=None):
     # plan 是出信号那一刻的快照, 而删除持仓/对账只改 state。若用 plan,
     # 状态里存在但计划里没有的持仓就不会显示, 用户也就没法删它。
     # 计划里的同一只股票只用来补展示字段(名称/参考价/盈亏/已持天数)。
-    plan_hold = {str(h.get("code"))[:6]: h for h in ((plan or {}).get("hold") or [])}
+    # 包含 sell 分组: 换仓日到期的持仓已被挪进 sell, 但卖单成交前仍在持有中,
+    # 只查 hold 会拿不到行情、市值退回成本价 (详见 _quote_map)。
+    plan_hold = _quote_map(plan)
     # 名称在多处出现, 都拿来当字典用, 尽量别让界面上只剩一串代码
     name_src = {}
     for grp in ("hold", "sell", "buy", "alternates", "recommend"):
@@ -400,6 +437,10 @@ def build_today(root: Path, pid=None):
             "name": ph.get("name") or name_src.get(c6, ""),
             "shares": lot.get("shares") or 0,
             "ref_close": ref,
+            # ref_close 在拿不到行情时回落成成本价(为了不把市值算成 0),
+            # 所以必须把"这个价到底是不是真行情"告诉前端 —— 否则页面上会
+            # 出现"成本 12.34 → 现 12.34", 看起来像真的持平了。
+            "quote_ok": bool(ph.get("ref_close")),
             "pnl_pct": pnl,
             # 两个天数回答不同问题, 所以都给:
             #   held_days   -> 什么时候会动它 (到期时钟, 续持归零)
@@ -460,6 +501,7 @@ def build_today(root: Path, pid=None):
             "name": r.get("name") or "",
             "shares": sh,
             "ref_price": round(px, 3) if px else None,
+            "quote_ok": r.get("quote_ok", True),
             "amount": round(sh * px, 0) if px else None,
             "pnl_pct": r.get("pnl_pct"),
             "held_days": r.get("held_days"),
@@ -829,6 +871,10 @@ function saveFill(id){
 
 const money = v => v == null ? '--' : '¥' + Number(v).toLocaleString('zh-CN',{maximumFractionDigits:0});
 
+// 价格一律 2 位小数 —— 后台给的是 round(,3), 直接展示会出现 12.3 和 12.345
+// 混在一起, 两列对不齐。报价本身就是分精度, 2 位不丢信息。
+const px2 = v => (v == null || v === 0) ? '--' : Number(v).toFixed(2);
+
 // 操作行有三种形态, 取决于记账方式:
 //   纸面模式        -> 只读, 不给打勾。打勾不影响账目, 给了勾反而误导
 //   实盘 + 等确认   -> 打勾 = 记入系统, 勾上后可改真实股数与成交价
@@ -965,6 +1011,8 @@ function holdRow(r){
   return `<div class="hold-row">
     <div style="flex:1;min-width:0">
       <div class="nm">${esc(r.name||r.code)} <span style="color:#6f7889;font-size:12px">${r.code}</span></div>
+      <div class="meta">成本 ${px2(r.buy_price)} → 现 ${r.quote_ok === false
+        ? '<span style="color:#a1662f">无行情</span>' : px2(r.ref_price)}</div>
       <div class="meta">${holdMeta(r)}</div></div>
     <div class="${cls}" style="text-align:right;font-weight:600">${sign}${p==null?'--':p+'%'}
          <div class="meta">${money(r.amount)}</div></div>
