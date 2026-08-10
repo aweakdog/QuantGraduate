@@ -1,0 +1,15 @@
+[Unit]
+# 尾盘下单提醒。与 timer 同名, 所以 timer 里不需要写 Unit= 指向它。
+# (原本用的是模板单元 quant-notify 加实例名, 但那个写法里的 @ 会被
+#  当成邮箱地址改写掉, 反而更脆; 两份小文件比一个易碎的模板划算。)
+Description=Quant pre-close order reminder (slot=preclose)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/quant-strategy
+ExecStart=%h/quant-strategy/.venv/bin/python -u %h/quant-strategy/scripts/notify_daily.py --slot preclose
+# 提醒卡住比发不出去更糟 —— systemd 会跳过下一次触发, 而且没人会察觉
+TimeoutStartSec=300
+StandardOutput=append:%h/quant-strategy/data/live/notify.log
+StandardError=append:%h/quant-strategy/data/live/notify.log

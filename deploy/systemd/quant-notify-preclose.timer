@@ -1,0 +1,19 @@
+[Unit]
+# 尾盘下单提醒。这是整套提醒里最要紧的一条:
+# 执行窗口是 14:50-15:00 (exec_mode=t1close), 而在此之前系统【没有任何
+# 盘中定时任务】—— 只有 17:30/19:30/21:30 三个盘后时点。忘记下单就发生在
+# 这个没人看着的空档里。
+Description=Quant pre-close order reminder (14:35)
+
+[Timer]
+# 提前 15 分钟。再早人还没准备、再晚来不及打开券商 App。
+OnCalendar=Mon..Fri 14:35 Asia/Hong_Kong
+# 触发的是同名的 quant-notify-preclose.service (systemd 默认行为)
+
+# 必须为 false。Persistent=true 会在错过后补触发 —— 机器 16:00 才开机时,
+# 补发一条"距离下单窗口还有 15 分钟"是纯粹的误导。脚本内部也会按
+# exec_window.phase 再挡一次, 但配置层面就不该埋这个雷。
+Persistent=false
+
+[Install]
+WantedBy=timers.target

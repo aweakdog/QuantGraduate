@@ -1,0 +1,19 @@
+[Unit]
+# 盘后提醒: 预告下一个交易日要做什么 + 催回填成交。
+# 时点卡在三轮流水线 (17:30/19:30/21:30) 之后 —— 计划得先生成出来才有的可发。
+Description=Quant evening reminder (new plan / confirm fills)
+
+[Timer]
+# 三轮都跟一次, 而不是只跟最后一轮: 第一轮就出计划时应当尽早通知, 但
+# 第一轮也可能因数据未到而跳过。脚本按【内容哈希】去重, 所以内容没变的
+# 后续轮次不会重复发, 变了(比如第二轮才真正出计划)才会补发。
+OnCalendar=Mon..Fri 18:15 Asia/Hong_Kong
+OnCalendar=Mon..Fri 20:15 Asia/Hong_Kong
+OnCalendar=Mon..Fri 22:15 Asia/Hong_Kong
+# 触发的是同名的 quant-notify-evening.service (systemd 默认行为)
+
+# 盘后提醒补发是有意义的("你还欠一次成交确认"隔天仍然成立), 与尾盘提醒相反。
+Persistent=true
+
+[Install]
+WantedBy=timers.target

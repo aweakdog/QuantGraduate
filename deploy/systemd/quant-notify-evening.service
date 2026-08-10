@@ -1,0 +1,14 @@
+[Unit]
+# 盘后提醒: 预告下一个交易日要做什么 + 催回填成交。与 timer 同名。
+Description=Quant evening reminder (slot=all)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/quant-strategy
+# 用 all: 盘后时点尾盘窗口早已过, preclose 分支会自行返回"无待办",
+# 真正会命中的是 signal(预告) 和 confirm(催确认)。
+ExecStart=%h/quant-strategy/.venv/bin/python -u %h/quant-strategy/scripts/notify_daily.py --slot all
+TimeoutStartSec=300
+StandardOutput=append:%h/quant-strategy/data/live/notify.log
+StandardError=append:%h/quant-strategy/data/live/notify.log
