@@ -42,6 +42,11 @@ logs/
 *.csv
 *.b64
 
+# 上线时留下的回滚备份 (如 live_config.py.bak_20260810_144034)。
+# 主节点纳入 git 后, 这些文件会让 git status 一直不干净。
+# 注: 有了 git 历史后备份本身已是冗余, 保留只是为了不改动现有上线脚本。
+*.bak_*
+
 # ── 数据: 凡是能通过 pipeline/ scripts/ 联网拉取或计算重建的, 一律不入库 ──
 # data/raw       : 行情/公告/财务/资金流, 由 update_kline_akshare.py 等重新拉取
 # data/processed : 训练集/特征/回测结果, 由 build_training_*.py + wf_v35_*.py 重建
