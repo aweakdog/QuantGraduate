@@ -340,6 +340,19 @@ def main():
             log(f"WARN {_iface} 日更失败(不中断, 数据将停在上一次成功日): {e}")
             stage(f"pull_{_iface}", ok=False, error=str(e)[:300])
 
+    # ── 2.6 宏观数据日更 (SOX/商品指数/中债/美债/汇率) ──
+    # 2026-08-13 上线: 旧 iFinD 系宏观 parquet 从来没进过日更(和资金流同一类根因),
+    # SOX/USDCNH 等停在 7 月初, FB 特征集的 13 个宏观特征在最新日全 NaN。
+    # 现改由 tushare(汇率/美债) + akshare(SOX/商品指数/中债) 供给,
+    # 全部源与旧值 2024 年后逐日对账通过(见 pipeline/pull_macro.py 头注)。
+    # 同样 try 兜住: 拉取失败只是宏观停在昨天(calc_commodity_features 对齐交易日时
+    # ffill limit=5, 断供 5 个交易日后宏观特征才开始变 NaN, 有缓冲窗口), 不能拖垮管线。
+    try:
+        run([PY, "-u", "-m", "pipeline.pull_macro"], "pull_macro", timeout=900)
+    except Exception as e:
+        log(f"WARN 宏观日更失败(不中断, 宏观特征将沿用前值): {e}")
+        stage("pull_macro", ok=False, error=str(e)[:300])
+
     # ── 3. 重建特征 -> 临时训练集 ──
     run([PY, "-u", "-m", "pipeline.feature_engine",
          "--no-incremental" if a.force else "--incremental",

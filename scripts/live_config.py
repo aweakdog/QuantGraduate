@@ -104,7 +104,19 @@ BASE_PARAMS = {
 #
 # 附带收益: 在用特征里的恒常量从 11 个降到 0 个 (daily_rebuild 的零方差体检实测),
 # 即模型名义 71 特征、实际有效也是 71 个。
-FEATURES_FROM = "wf_daily_F7_s42_ts2022-09-01_te2026-07-27_cap50000.json"
+#
+# 2026-08-13 换成 FBTR (75 特征)。相比 F7/F1B, 这是"剔前视+剔死源"的终态口径:
+#   1. 排除全部静态映射特征 con_*/tev_*/leader_*/has_leader —— 三个映射文件
+#      (watchlist_216/watchlist/supply_chain_map) 都是 2026 年的认知快照套全历史,
+#      构成前视。20 种子同窗配对实测: 剔除后策略仍有超额(见 FBTR 系列 JSON)。
+#   2. 排除 dde_net*/mf_* —— 源已死且无前向替代品(main_force_net 与任何 tushare
+#      口径相关最高 0.59, 不能回填), 留着只会让模型切 NaN 列。
+#   3. 保留 fund_flow/mtss(tushare moneyflow/margin_detail 日更供给) 与 13 个宏观
+#      特征 —— 宏观源 2026-08-13 起由 pipeline.pull_macro 日更(tushare 汇率/美债 +
+#      akshare SOX/商品指数/中债), 全部源与旧 iFinD 值逐日对账通过, 断供已修复。
+# 动机是结构性的: F7 特征集里仍有前视源(con_*/tev_*)与死列(dde/mf), 前者夸大
+# 回测成绩, 后者随时间腐烂。FBTR 的 75 列全部"活的 + 无前视 + 有日更管线"。
+FEATURES_FROM = "wf_daily_FBTR_s42_ts2022-09-01_te2026-07-27_cap100000.json"
 
 # ── 四条并行线 ─────────────────────────────────────
 # 持仓数不能自由选 —— 回测引擎买不起一手(100股)时会直接跳过该股换下一名
