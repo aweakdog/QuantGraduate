@@ -57,6 +57,16 @@ def main():
     if "--matrix" in sys.argv:
         mpath = Path(sys.argv[sys.argv.index("--matrix") + 1])
 
+    # 手工解析 sys.argv 会静默忽略未知参数, 而这里的默认矩阵恰好是个"看起来对"
+    # 的值, 于是错误会伪装成检查结果。实测踩过: 传 --train-file(本脚本只认
+    # --matrix) 被当空气, 检查跑在默认矩阵上, 10 个逐笔列被判成"真缺失",
+    # 误报"不可部署"。宁可拒绝启动, 也不能输出一个基于错输入的结论。
+    _known = {"--matrix"}
+    _unknown = [a for a in sys.argv[2:] if a.startswith("--") and a not in _known]
+    if _unknown:
+        sys.exit(f"ERROR: 无法识别的参数 {_unknown} —— 本脚本只认 {sorted(_known)}。"
+                 f"\n若想指定矩阵请用: --matrix data/processed/<file>.parquet")
+
     fs = sorted(glob.glob(str(BASE / f"wf_daily_{tag}_s*.json")))
     if not fs:
         sys.exit(f"没有 {tag} 的结果")
