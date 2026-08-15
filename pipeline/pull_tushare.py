@@ -362,6 +362,10 @@ BY_DATE = {
     "moneyflow": ("trade_date", None, "资金流(分单等级)"),
     "margin_detail": ("trade_date", None, "融资融券明细"),
     "top_list": ("trade_date", None, "龙虎榜"),
+    "top_inst": ("trade_date", None, "龙虎榜机构席位明细"),
+    "hk_hold": ("trade_date", None, "北向(沪深股通)个股持股"),
+    "block_trade": ("trade_date", None, "大宗交易"),
+    "share_float": ("ann_date", None, "限售解禁(按公告日, 天然PIT)"),
     "index_dailybasic": ("trade_date", None, "指数估值"),
     "moneyflow_hsgt": ("trade_date", None, "北向资金"),
     "forecast": ("ann_date", None, "业绩预告(按公告日)"),
@@ -369,13 +373,16 @@ BY_DATE = {
 }
 
 # 按股票循环的接口
-BY_CODE = ["fina_indicator", "income", "balancesheet", "cashflow"]
+BY_CODE = ["fina_indicator", "income", "balancesheet", "cashflow",
+           "stk_holdernumber"]
 
 # 全量回填顺序: 越靠前越重要 —— 万一半夜断了, 先保住最有价值的
 ALL_ORDER = ["stock_basic", "sw_member", "index_daily", "daily_basic",
              "adj_factor", "daily", "stk_limit", "suspend_d",
              "fina_indicator", "forecast", "express", "moneyflow",
-             "margin_detail", "moneyflow_hsgt", "index_dailybasic", "top_list"]
+             "margin_detail", "moneyflow_hsgt", "index_dailybasic", "top_list",
+             "top_inst", "hk_hold", "block_trade", "share_float",
+             "stk_holdernumber"]
 
 
 def main():
