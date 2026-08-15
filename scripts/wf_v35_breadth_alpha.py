@@ -788,12 +788,26 @@ if args.load_preds:
                ("label", args.label), ("train_start", args.train_start),
                ("test_start", TEST_START), ("test_end", TEST_END),
                ("neutralize_style", args.neutralize_style),
-               ("n_features", len(features)),
                ("feat_cutoff", f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}")]
     if "model" not in meta:
         _checks.append(("objective", args.objective))
     else:
         print(f"  外部模型缓存: model={meta['model']} (跳过 objective 校验)")
+    # n_features 校验的坑: 候选池被 exclude 剪到选不满目标数时, 实选数受
+    # LightGBM 多线程非确定影响会 ±2~3 抖动(同一口径两次跑 68 vs 71),
+    # 拿它做硬校验会误杀。新缓存改存稳定的目标数 + exclude 口径;
+    # 旧缓存(无 exclude_feats 键)对实选数给 3 个名额的抖动容差。
+    if "exclude_feats" in meta:
+        _checks.append(("n_features", args.n_features))
+        _checks.append(("exclude_feats", args.exclude_feats or ""))
+    else:
+        _n = meta.get("n_features") or 0
+        if abs(_n - len(features)) > 3:
+            raise SystemExit(f"ERROR: 预测缓存不匹配 (n_features: 缓存={_n} "
+                             f"当前实选={len(features)}, 差距>3)")
+        if _n != len(features):
+            print(f"  旧缓存 n_features={_n} vs 当前实选 {len(features)}: "
+                  f"候选池不满时的 LGB 非确定抖动, 按同口径放行")
     for k, v in _checks:
         if meta.get(k) != v:
             raise SystemExit(f"ERROR: 预测缓存不匹配 ({k}: 缓存={meta.get(k)} 当前={v})")
@@ -871,7 +885,11 @@ if args.save_preds:
             "train_start": args.train_start,
             "test_start": TEST_START, "test_end": TEST_END,
             "neutralize_style": args.neutralize_style,
-            "n_features": len(features),
+            # 存目标数而非实选数: 实选数在候选池不满时受 LGB 多线程非确定
+            # 影响会抖动, 口径的真正标识是目标数 + exclude 列表
+            "n_features": args.n_features,
+            "exclude_feats": args.exclude_feats or "",
+            "n_selected": len(features),
             "feat_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}"}
     # v2 格式: 多存 pred_vals (与 ranked 对齐的预测值)。没有它就无法做
     # "信号强度门槛/离散度择时"一类实验 —— 旧 v1 缓存只存了排名。
