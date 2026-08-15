@@ -849,7 +849,25 @@ _CONCEPT_FEATS_CACHE: Optional[dict] = None  # {theme: DataFrame}
 
 
 def _load_watchlist_theme_map() -> dict:
-    """加载 watchlist_216.json 中股票的 theme 归属 (code6 → theme)."""
+    """加载 watchlist_216.json 中股票的 theme 归属 (code6 → theme).
+
+    ⚠ 由本映射派生的 con_* / tev_* 列构成一条【事后选股偏差掩码】
+
+    watchlist_216.json 是 2026-07-18 手工按题材挑的 216 只概念股, 只有它们有 theme,
+    所以 con_*/tev_* 对池子里其余股票全是 NaN。LightGBM 能用"是否为 NaN"这个切分
+    把选股范围锁进这批手挑票, 而这批票是用后见之明挑的 —— 向前看没有任何理由继续跑赢。
+
+    2026-08-14 在线上矩阵 training_data_pit_v24(519只) 上实测:
+      tev_* 有值的 127 只 (100% 属于 watchlist_216)
+                        2022-09~2026-08 等权 +181.1% (年化+31.5%, 夏普1.10)
+      tev_* 无值的 392 只                    +42.6% (年化 +9.9%, 夏普0.62)
+      -> 年化差 +20.4%, IR 1.18; 2023起逐年跑赢(2025差47.1pp, 2026差25.5pp)
+    这与旧资金流源(iFinD 只覆盖同一份名单)造成的 fund_flow_* 掩码是同一个病:
+    FBTR +27.1% 已被证明全部来自那个掩码。复现: scripts/coverage_bias_test.py
+
+    要用 theme 特征就必须让 theme 映射覆盖全池 (例如换成申万行业/概念板块的
+    全市场成分), 否则只能用 tev_all_* 那类全市场聚合列(覆盖 519/519, 无掩码)。
+    """
     path = os.path.join(DATA_DIR, "universe", "watchlist_216.json")
     if not os.path.exists(path):
         path = os.path.join(DATA_DIR, "universe", "watchlist.json")
