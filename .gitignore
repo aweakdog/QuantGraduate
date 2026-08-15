@@ -103,3 +103,4 @@ scripts/_dbg_*.py
 scripts/_audit_*.py
 scripts/fix_kline_columns.py
 data/processed/wf_daily_v15*.json
+download/
