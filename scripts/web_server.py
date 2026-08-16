@@ -1178,6 +1178,26 @@ async def page_backtest():
     return BACKTEST_HTML
 
 
+@app.get("/api/score")
+async def api_score(code: str = ""):
+    """任意股票的模型当日评分 (读 preds_cache, 秒回)。
+
+    例: /api/score?code=000725 或 /api/score?code=000725,600519
+    登录(view 角色)即可查 —— 只读, 不碰任何状态。
+    """
+    codes = [c.strip() for c in code.replace("，", ",").split(",") if c.strip()]
+    if not codes or any(not c[:6].isdigit() or len(c.strip()) < 6 for c in codes):
+        return JSONResponse({"error": "参数应为6位股票代码, 可逗号分隔多个"},
+                            status_code=400)
+    if len(codes) > 20:
+        return JSONResponse({"error": "一次最多查 20 只"}, status_code=400)
+    try:
+        from score_stock import score_codes
+        return score_codes(codes)
+    except Exception as e:
+        return JSONResponse({"error": f"评分查询失败: {e}"}, status_code=500)
+
+
 @app.get("/api/history")
 async def api_history():
     st = _state()
