@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -186,6 +187,11 @@ def validate_new_train(new_path, old_path, require_advance=True):
         nan_cols = set(last.columns[last.isna().all(axis=0)])
         all_nan = len(nan_cols)
         used = live_used_features()
+        # tk_* 逐笔列不在基础 v24 矩阵里 —— 它们由 §4.5 的 build_tick_augmented
+        # 基于本矩阵另行加列, 存在性/覆盖率在 §4.5 里检。在这里要求会误拦
+        # (2026-08-16 彩排实拍: 切 V24PUT 后本校验报"在用特征缺列 11 个 tk_*")。
+        if used is not None:
+            used = [c for c in used if not c.startswith("tk_")]
         if used is None:
             if all_nan > len(new.columns) * 0.3:
                 problems.append(f"最新日全NaN列过多: {all_nan}/{len(new.columns)}")
@@ -385,6 +391,43 @@ def main():
     tmp_path.replace(train_path)
     stage("swap_train", ok=True, path=str(train_path))
     log(f"训练集已更新 -> {info['max_date']}")
+
+    # ── 4.5 逐笔增广矩阵 (线上全部条线的输入, 2026-08-16 起) ──
+    # 逐笔特征面板由 eez040 抽取后 rsync 到本机 data/processed/tick_micro/
+    # (链路见 scripts/tick_daily_extract.py 头注), 这里在干净的 v24 之上加列,
+    # 产出 training_data_pit_v24_tick1.parquet。
+    # 2026-08-16 全线切 V24PUT(逐笔 lag1 + 剔 qfq 价格列)后这一步是硬失败:
+    # tick1 建不出来/末日不对齐 => 当晚宁可没信号, 也不用陈旧矩阵出错信号。
+    # --require-fresh 3: 供应商断供 3 个交易日内用 ffill 兜(回测证过 lag5 仍有
+    # 正超额), 超限则拒绝更新 —— 停更被下面的末日对齐检查拦成硬失败。
+    run([PY, "-u", "scripts/build_tick_augmented.py", "--lag", "1",
+         "--require-fresh", "3"], "build_tick1", timeout=1800)
+    tick1_path = PROC / "training_data_pit_v24_tick1.parquet"
+    t1_max = pd.read_parquet(tick1_path, columns=["date"])["date"].max()
+    if pd.Timestamp(t1_max) != pd.Timestamp(info["max_date"]):
+        stage("build_tick1", ok=False,
+              error=f"tick1 末日 {t1_max} != v24 末日 {info['max_date']}")
+        raise RuntimeError(
+            f"tick1 矩阵末日 {t1_max} 与 v24 末日 {info['max_date']} 不对齐 ——\n"
+            "  多半是逐笔面板断供超过 --require-fresh 限度。去查 eez040 的\n"
+            "  ~/logs/tickfeat_*.log 与供应商 123 盘更新; 或临时回滚 live_config\n"
+            "  到 V24B(无逐笔)再手动重跑本脚本。")
+    used_tk = [c for c in (live_used_features() or []) if c.startswith("tk_")]
+    if used_tk:
+        t1_cols = set(pq.read_schema(tick1_path).names)
+        tk_missing = [c for c in used_tk if c not in t1_cols]
+        have = [c for c in used_tk if c in t1_cols]
+        t1_last = pd.read_parquet(tick1_path, columns=["date"] + have)
+        t1_last = t1_last[t1_last["date"] == t1_max]
+        tk_dead = [c for c in have if t1_last[c].isna().all()]
+        if tk_missing or tk_dead:
+            stage("build_tick1", ok=False,
+                  error=f"在用逐笔列 缺{tk_missing[:4]} 末日全空{tk_dead[:4]}")
+            raise RuntimeError(
+                f"tick1 在用逐笔列异常: 缺列 {tk_missing} / 末日全NaN {tk_dead} ——\n"
+                "  多半是面板断供或 build_tick_augmented 回归, 当晚宁可无信号。")
+    stage("build_tick1", ok=True, max_date=str(t1_max), tk_used=len(used_tk))
+    log(f"tick1 矩阵已对齐 -> {t1_max}, 在用逐笔列 {len(used_tk)} 个末日全有值")
 
     # ── 5. 逐条线出信号 ──
     # 四条线用同一份行情/训练集, 但各自一份状态与计划文件。
