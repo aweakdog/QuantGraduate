@@ -34,7 +34,7 @@ parser = argparse.ArgumentParser(description="WF v35 breadth + alpha vs benchmar
 parser.add_argument("--test-start", type=str, default="2022-09-01")
 parser.add_argument("--test-end", type=str, default="2026-07-16")
 parser.add_argument("--initial-capital", type=float, default=100000.0)
-parser.add_argument("--label", type=str, default="5d", choices=["1d", "5d"],
+parser.add_argument("--label", type=str, default="5d", choices=["1d", "2d", "5d"],
                     help="预测目标: 1d=次日收益, 5d=5日收益(与5日持有对齐)")
 parser.add_argument("--hold-days", type=int, default=5, help="持有天数(分档数)")
 parser.add_argument("--tranche-n", type=int, default=2, help="每档买入只数; 总仓位=hold_days*tranche_n")
@@ -166,9 +166,9 @@ DATA_DIR = settings.DATA_DIR
 TRAIN_PATH = DATA_DIR / "processed" / args.train_file
 KLINE_DIR = DATA_DIR / "raw" / "kline"
 
-LABEL_RAW = "fwd_1d_ret" if args.label == "1d" else "fwd_5d_ret"
+LABEL_RAW = {"1d": "fwd_1d_ret", "2d": "fwd_2d_ret", "5d": "fwd_5d_ret"}[args.label]
 LABEL = "y_target"
-LABEL_HORIZON = 1 if args.label == "1d" else 5
+LABEL_HORIZON = {"1d": 1, "2d": 2, "5d": 5}[args.label]
 
 LEAKAGE_FEATS = {"ret_1d", "ret_2d", "ret_5d", "ret_21d"}
 SKIP_COLS = {"date", "code", "group", LABEL,
