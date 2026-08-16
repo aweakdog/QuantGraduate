@@ -35,6 +35,7 @@ MICRO = PROC / "tick_micro"
 DROP = {"code", "date", "close", "vwap", "prev_close", "day_amt"}
 WIN = 3.0        # 横截面 z 的截尾
 MA = 5           # 平滑窗口, 与 feature_engine 的 min_periods=window 惯例一致
+EDGE_MAX = 3     # 每股最多补几个"基矩阵有、逐笔面板还没有"的尾部交易日
 
 
 def load_micro():
@@ -54,6 +55,10 @@ def main():
     ap.add_argument("--lag", type=int, default=1,
                     help="1=用 d-1 的逐笔(不依赖交付时效); 0=用 d 当日")
     ap.add_argument("--output", default=None)
+    ap.add_argument("--require-fresh", type=int, default=0, metavar="N",
+                    help="基矩阵末日相对逐笔面板末日的陈旧度(交易日)超过 N 则退出码 2; "
+                         "0=不检查(回测用)。日更管线传 3: 断供 3 天后宁可不更新矩阵, "
+                         "也不把更陈的观测当新值写进去")
     a = ap.parse_args()
     out = PROC / (a.output or a.source.replace(".parquet", f"_tick{a.lag}.parquet"))
 
@@ -74,23 +79,47 @@ def main():
     z = pd.DataFrame(zs, index=micro.index)
     z["c6"], z["date"] = micro["c6"], micro["date"]
 
-    # ---------- 2. 平滑 + 滞后 ----------
+    # ---------- 2. 平滑 ----------
     z = z.sort_values(["c6", "date"])
     gz = z.groupby("c6", sort=False)
     for c in [f"tk_{f}_xz" for f in feats]:
         z[c + f"_ma{MA}"] = gz[c].transform(
             lambda s: s.rolling(MA, min_periods=MA).mean())
     tk_cols = [c for c in z.columns if c.startswith("tk_")]
+
+    base = pd.read_parquet(PROC / a.source)
+    base["date"] = pd.to_datetime(base["date"])
+    base["c6"] = base["code"].astype(str).str.extract(r"(\d{6})")[0]
+
+    # ---------- 2.5 活缘补行 + 滞后 ----------
+    # 线上语境: 逐笔包 T+1 早晨到货, 17:30 重建时基矩阵已含当日 d 行, 而逐笔面板只到
+    # d-1。shift 后按 (c6,date) 精确 merge 会让行 d 的 tk_* 全 NaN(11/80=13.75%,
+    # 超过在用特征 10% 拦截线, 当晚直接没信号)。lag>0 的语义是"最近一个已知观测",
+    # 所以把每股超出面板末日的尾部基矩阵日期(至多 EDGE_MAX 个)先补成空行再 shift:
+    # 空行会从真实行领到正确的滞后值(对任意 lag 都成立); 供应商断供时再用
+    # ffill(limit=EDGE_MAX) 兜底, 且只动补行 —— 历史行为逐字节不变。
+    edge = pd.DataFrame()
     if a.lag > 0:
-        # 在逐笔面板自己的交易日序列上后移, 等价于"取最近一个已知的逐笔观测"
+        last = z.groupby("c6", sort=False)["date"].max()
+        tail = base[["c6", "date"]].merge(last.rename("last_micro"), on="c6")
+        tail = tail[tail["date"] > tail["last_micro"]]
+        tail = tail.sort_values(["c6", "date"]).groupby("c6").head(EDGE_MAX)
+        if len(tail):
+            edge = tail[["c6", "date"]].copy()
+            z = pd.concat([z, edge], ignore_index=True).sort_values(["c6", "date"])
         z[tk_cols] = z.groupby("c6", sort=False)[tk_cols].shift(a.lag)
+        if len(edge):
+            emask = z.set_index(["c6", "date"]).index.isin(
+                edge.set_index(["c6", "date"]).index)
+            filled = z.groupby("c6", sort=False)[tk_cols].ffill(limit=EDGE_MAX)
+            z.loc[emask, tk_cols] = filled.loc[emask, tk_cols]
+            print(f"活缘补行: {len(edge)} 行 "
+                  f"({edge['date'].min().date()}~{edge['date'].max().date()}, "
+                  f"{edge['c6'].nunique()} 只), 用面板内最近观测按 lag={a.lag} 对齐")
     print(f"逐笔派生列: {len(tk_cols)} 个 (xz {len(feats)} + xz_ma{MA} {len(feats)}), "
           f"滞后 {a.lag} 天")
 
     # ---------- 3. 并进矩阵 ----------
-    base = pd.read_parquet(PROC / a.source)
-    base["date"] = pd.to_datetime(base["date"])
-    base["c6"] = base["code"].astype(str).str.extract(r"(\d{6})")[0]
     dup = [c for c in tk_cols if c in base.columns]
     if dup:
         base = base.drop(columns=dup)
@@ -116,6 +145,20 @@ def main():
               f"{' ...' if len(bad) > 8 else ''}")
     else:
         print("覆盖期内无整日缺失 ✓")
+
+    # ---------- 4. 新鲜度体检 ----------
+    # 陈旧度 = 基矩阵末日之前(含)有多少个基矩阵交易日 > 逐笔面板末日。
+    # 正常日更 = 1 (重建日当天的包要明天才到); >1 说明供应商延迟或同步链断了。
+    bdates = np.sort(base["date"].unique())
+    stale = int((bdates > np.datetime64(micro.date.max())).sum())
+    last_row = m[m["date"] == m["date"].max()]
+    last_cov = last_row[tk_cols].notna().mean().median()
+    print(f"新鲜度: 基矩阵末日 {pd.Timestamp(bdates[-1]).date()}, "
+          f"逐笔面板末日 {micro.date.max().date()}, 陈旧 {stale} 个交易日; "
+          f"末日逐笔列非空率中位 {last_cov:.1%}")
+    if a.require_fresh and stale > a.require_fresh:
+        print(f"✗ 陈旧 {stale} > 阀值 {a.require_fresh}, 不写出 (旧矩阵保持原样)")
+        raise SystemExit(2)
 
     tmp = out.with_suffix(".tmp.parquet")
     m.to_parquet(tmp, index=False)

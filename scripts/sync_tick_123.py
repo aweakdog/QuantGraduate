@@ -228,9 +228,14 @@ def local_paths(month, name):
 
 
 def local_ok(month, name, size):
-    for p in local_paths(month, name):
-        if os.path.exists(p) and os.path.getsize(p) == size:
-            return p
+    p123, pbd = local_paths(month, name)
+    if os.path.exists(p123) and os.path.getsize(p123) == size:
+        return p123
+    # 百度树是另一渠道打的包, 压缩参数不同导致大小天然不等 (34/86 天不一致,
+    # 见 findings 2026-08-16 §3)。按精确大小判会把这些天误判为缺失, 每次
+    # 同步重复拉 ~100GB。百度版是完整口径, 存在且非空即视为已有。
+    if os.path.exists(pbd) and os.path.getsize(pbd) > 0:
+        return pbd
     return None
 
 
