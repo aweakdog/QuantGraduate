@@ -86,25 +86,49 @@ def _view_password():
     return os.environ.get("QUANT_VIEW_PASSWORD") or ""
 
 
+def _view_ro_password():
+    """只读查看口令: 能登录能看, 但任何非 GET 请求都被中间件拦掉。
+
+    未设置时只读通道关闭, 不影响主口令。"""
+    return os.environ.get("QUANT_VIEW_RO_PASSWORD") or ""
+
+
 def _view_sign(exp: int) -> str:
     key = ("view:" + _view_password()).encode()
     return hmac.new(key, str(exp).encode(), hashlib.sha256).hexdigest()[:32]
 
 
-def _view_ok(req: Request) -> bool:
-    if not _view_password():
-        return False
+def _view_sign_ro(exp: int) -> str:
+    # 密钥掺入不同用途字符串且签名消息含角色:
+    # 只读 token 无法伪造成完整权限 token, 反之亦然。
+    key = ("view-ro:" + _view_ro_password()).encode()
+    return hmac.new(key, f"{exp}.ro".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _view_role(req: Request):
+    """返回 "full" / "ro" / None。
+
+    两种 token 格式: 完整权限沿用 "exp.sig"(旧 cookie 不失效),
+    只读为 "exp.ro.sig"。"""
     tok = req.cookies.get(VIEW_COOKIE, "")
-    if "." not in tok:
-        return False
-    exp_s, sig = tok.rsplit(".", 1)
+    parts = tok.split(".")
     try:
-        exp = int(exp_s)
-    except ValueError:
-        return False
+        exp = int(parts[0])
+    except (ValueError, IndexError):
+        return None
     if exp < time.time():
-        return False
-    return hmac.compare_digest(sig, _view_sign(exp))
+        return None
+    if len(parts) == 2 and _view_password():
+        if hmac.compare_digest(parts[1], _view_sign(exp)):
+            return "full"
+    elif len(parts) == 3 and parts[1] == "ro" and _view_ro_password():
+        if hmac.compare_digest(parts[2], _view_sign_ro(exp)):
+            return "ro"
+    return None
+
+
+def _view_ok(req: Request) -> bool:
+    return _view_role(req) is not None
 
 
 def _client_ip(req: Request) -> str:
@@ -142,10 +166,18 @@ async def _view_gate(request: Request, call_next):
     "拿到一坨 HTML"这种难查的现象, 也容易和前端路由绕成循环。
     """
     path = request.url.path
-    authed = _view_ok(request)
+    role = _view_role(request)
+    authed = role is not None
     public = path in VIEW_PUBLIC
     try:
-        if public or authed:
+        if role == "ro" and request.method not in ("GET", "HEAD", "OPTIONS") \
+                and path not in ("/api/view/login", "/api/view/logout"):
+            # 只读账户的硬保证在这一处集中拦截: 所有变更都是 POST,
+            # 连各家 */login 也拦掉 —— 即使知道改账口令也无法在只读
+            # 会话里提权。想改账就用完整口令重新登录。
+            resp = JSONResponse({"error": "只读账户, 不能进行任何修改",
+                                 "readonly": True}, status_code=403)
+        elif public or authed:
             resp = await call_next(request)
         elif not _view_password():
             # 未配置口令 -> 关站, 而不是放行。与改账口令同一个取舍:
@@ -178,7 +210,11 @@ async def api_view_login(req: Request):
             status_code=429)
     body = await req.json()
     got = str(body.get("password", ""))
-    if not hmac.compare_digest(got, pw):
+    # 两个口令都比一遍(不短路), 命中哪个发哪个角色的 token
+    ro = _view_ro_password()
+    ok_full = hmac.compare_digest(got, pw)
+    ok_ro = bool(ro) and hmac.compare_digest(got, ro)
+    if not (ok_full or ok_ro):
         _login_fail(ip)
         await asyncio.sleep(LOGIN_FAIL_DELAY)
         n = _login_fails.get(ip, (0, 0))[0]
@@ -189,8 +225,11 @@ async def api_view_login(req: Request):
         return JSONResponse({"error": msg}, status_code=403)
     _login_fails.pop(ip, None)
     exp = int(time.time()) + VIEW_TTL
-    r = JSONResponse({"ok": True})
-    r.set_cookie(VIEW_COOKIE, f"{exp}.{_view_sign(exp)}", max_age=VIEW_TTL,
+    role = "full" if ok_full else "ro"
+    tok = (f"{exp}.{_view_sign(exp)}" if ok_full
+           else f"{exp}.ro.{_view_sign_ro(exp)}")
+    r = JSONResponse({"ok": True, "role": role})
+    r.set_cookie(VIEW_COOKIE, tok, max_age=VIEW_TTL,
                  httponly=True, samesite="lax", path="/")
     return r
 
@@ -204,7 +243,9 @@ async def api_view_logout():
 
 @app.get("/api/view/status")
 async def api_view_status(req: Request):
-    return {"authed": _view_ok(req), "configured": bool(_view_password())}
+    role = _view_role(req)
+    return {"authed": role is not None, "role": role,
+            "configured": bool(_view_password())}
 
 
 LOGIN_HTML = """<!DOCTYPE html><html lang="zh-CN"><head>
