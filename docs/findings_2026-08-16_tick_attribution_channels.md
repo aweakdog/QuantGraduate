@@ -62,9 +62,9 @@ S 族特征（委托规模/撤单）在线上与历史口径可能漂移 → 见
 | 事项 | 状态 |
 |---|---|
 | V24PU 双臂（剔 12 个前复权价格单位列，见方法论 §3.3 第八条） | **完成，剔除组大胜，见 §5** |
-| V24L5/V24L10（逐笔特征延迟 5/10 天，断供鲁棒性） | 矩阵已建，排在 PU 后自动接力 |
+| V24L5/V24L10（逐笔特征延迟 5/10 天，断供鲁棒性） | **完成，alpha 减半，见 §7** |
 | 0713 渠道行级对比 | **已定案，123 日更版可证不完整（见 §3）** |
-| PIT 后复权迁移（新 K 线源，append-only + 回归测试进 deploy gate） | 计划，随源迁移落地 |
+| PIT 后复权迁移（新 K 线源，append-only + 回归测试进 deploy gate） | **库已建成，见 §9**；管线迁移待做 |
 | 日更质检（新增，待做）：每只票"早盘/午盘委托条数比"对历史分布 z-score（坏日全市场集体异常，比委托号比对便宜得多） | 待实现，进日更管线 |
 | 反馈供应商：7/9~7/21 的 123 日更包委托文件缺约 1/3（证据即 §3 数字） | 待用户转发 |
 
@@ -79,14 +79,134 @@ S 族特征（委托规模/撤单）在线上与历史口径可能漂移 → 见
 
 配对：PUT>T1 在 **16/20** seed（中位 +5.7pp）；PUB>B 在 **17/20**（+9.7pp）。
 12 个 qfq 污染列不止弱泄漏，是纯拖累（价格量纲截面近噪声 + 挤占 80 名额）。
-**决策：永久剔除；V24PUT 成为新部署候选**，待 lag 臂 + 标准 deploy gate 后切换。
+**决策：永久剔除；V24PUT 成为新部署候选**，deploy gate 已过（见 §8）。
 
-## 6. 复盘命令
+### 5.1 V24PUT 全貌（20 seed 中位）
+
+总收益 **+81.35%**（2.85 年）/ 年化 **24.35%** / 夏普 **0.97** / 回撤 **-18.15%** /
+超额年化 **+17.30%** / IR **0.71** / **0/20 亏损种子**（V24 系列首个全正臂）。
+
+分年（策略中位% / 池基准% / 超额中位pp / 负超额种子）：
+
+| 年 | 策略 | 池基准 | 超额pp | 负超额 | 空仓% |
+|---|---:|---:|---:|---:|---:|
+| 2023(残) | -0.1 | -3.3 | +3.2 | 4/20 | 58.2 |
+| 2024 | +24.3 | +19.6 | +4.7 | 9/20 | 52.5 |
+| 2025 | +19.0 | +34.0 | **-15.0** | **20/20** | 31.3 |
+| 2026 | +31.7 | +0.6 | +31.1 | 0/20 | 55.9 |
+
+**保留意见**：2025 大牛市 20/20 种子跑输池基准（空仓 31% 拖累），alpha 主要来自
+2026 震荡市与 2024 的选股；这是"择时保守"的结构性代价，牛市里它就是会跑输。
+对照 V24B 同期分年（-5.1 / +3.1 / +14.7 / +16.4）：PUT 每一年都更好。
+
+## 7. 逐笔延迟臂：alpha 随 staleness 减半，日更管线是生产关键件
+
+| | V24T1 (d-1) | V24L5 (d-5) | V24L10 (d-10) |
+|---|---:|---:|---:|
+| 总收益% | 60.15 | 28.80 | 32.15 |
+| 超额年化% | 12.55 | 4.45 | 5.25 |
+| IR | 0.52 | 0.19 | 0.23 |
+
+lag5/lag10 跌回 V24B 基线水平（超额 5.0%）—— **逐笔增量几乎全部来自最近几天的
+微观结构**。含义：(a) 123 日更同步（§2）不是 nice-to-have，是 V24PUT 的生产依赖；
+(b) 断供 5 天后逐笔列约等于失效，日更管线需要配监控告警（进日更质检，§4）。
+
+## 8. V24PUT deploy gate：4/4 全过 ✓
+
+`check_deploy_gate.py V24PUT --matrix data/processed/training_data_pit_v24_tick1.parquet`
+- 一致性：20 seed 特征集完全相同（1 种），80 列 = 矩阵 72 + 运行时现算 8
+- 无覆盖掩码 / 无零方差 / 覆盖率达标；入选列非空率中位 100%、最低 98.4%
+- 已写出 `data/processed/features_V24PUT.json`
+- 入选逐笔列 **11 个，全是 `_xz_ma5` 平滑版**（amihud/avg_trd_amt/cxl_rate_b/
+  depth_imb_1/kyle_lambda/n_trd/ord_amt_ratio/ord_net_l/rv_5m/spread_bp/trd_xl_share），
+  price-unit 残留 **0**。
+- 上线前尚缺：~~每日逐笔特征增量链~~；~~早盘委托质检~~；~~steady5w 臂~~（均已落地，见 §10/§11）。
+- **V24PUT5W（50000/n5，默认线操作点）：总收益中位 +97.35% / 年化 28.30% /
+  夏普 1.28 / 回撤 -13.75% / 超额年化 +19.35% / IR 0.94 / 0/20 亏损，最差种子 +44.9%**，
+  比 10万/n3 操作点全面更好；gate 4/4 过（features_V24PUT5W.json）。
+
+## 9. PIT 后复权 K 线库已建成
+
+`scripts/build_kline_pit.py` → `data/processed/kline_pit.parquet`（417 MB）+ manifest：
+- 源：百度盘 `19910101至上月底07月31日A股日k线.zip`（sha256 已入 manifest）
+- **5546 只 / 1679 万行 / 1990-12-19 ~ 2026-07-31**；后复权校验 tol=2%
+- 371 条错误 → 去重后 50 只（B股 900xxx/200xxx、北交所 920xxx、退市壳），
+  **与 519∪630 universe 交集 = 0**，对我们零影响
+- 下一步：K 线源从 akshare-qfq 切到本库（raw OHLC + 复权因子现算），日更走
+  百度盘日 K 包 append-only，进 deploy gate 回归测试
+
+## 10. 每日逐笔特征增量链（当日 12:05 落地，端到端验证过）
+
+```
+123云盘(T+1早晨) ─sync─> eez040 ~/tickdata123 ─symlink─> 百度树布局
+  ─tick_micro_features(幂等)─> tick_micro/<d>.parquet ─rsync─> eez041
+  ─daily_rebuild §4.5─> build_tick_augmented --lag 1 --require-fresh 3
+  ─> training_data_pit_v24_tick1.parquet
+```
+
+- **eez040** `scripts/tick_daily_extract.py`，cron `40 7,12,16 * * *`（16:40 是 17:30
+  重建前最后补漏班），日志 `~/logs/tickfeat_YYYYMM.log`。sync 失败不挡抽取，
+  推送失败退出码非零。
+- **eez041** `daily_rebuild.py` 新增 4.5 步（非致命：V24B 线不依赖 tk_*；
+  切 V24PUT 时改硬失败）。
+- **活缘补行**（`build_tick_augmented.py` §2.5）：重建时基矩阵已含当日 d 行而面板
+  只到 d-1，原 shift+精确 merge 会让行 d 的 tk_* 全 NaN（11/80=13.75% 超 10%
+  拦截线，当晚没信号）。现把每股超出面板末日的尾部日期（≤ 3）补空行再 shift，
+  断供时 ffill 兜底；`--require-fresh 3` 超限宁可不更新。历史值逐字节不变
+  （`tests/test_tick_edge_fill.py` 4 项，本地/040/041 三处全过）。
+- 首次全量：957 天面板已推 eez041，tick1 矩阵在 041 上重建验证：新鲜度 0、
+  末日非空率 100%。周一 17:30 起自动运行。
+
+### 早盘委托质检（`tick_qc_early.py`，抽取前置闸，同日落地）
+
+- 每包等距采样 124 只票只读委托文件的时间列，`share_pre10` =
+  10 点前委托行数占比的截面中位，对历史做稳健 z（MAD）；z<-5 或
+  <0.6×基线判坏 → **跳过抽取不产毒特征**，staleness 由矩阵端
+  `--require-fresh 3` 兜。记录库 `data/processed/tick_qc_early.parquet`（eez040）。
+- 基线 24 天（2026-06~08 隔日）：好日 med 0.30±0.03，自然波动 |z|≤3.6。
+- 验证：123 版 0713 坏包 **med 0.095 / z=-9.4 → 拦截**；同日百度版完整包
+  z=-0.7 通过（坐实“渠道问题非当日市况”）；**当前在用的 123 日更
+  0810/0813/0814 全部健康通过**。
+- 提醒：7/9~7/21 的已抽历史特征用的是百度完整版，**没有被污染**；
+  供应商修不好只影响未来日更，坏日会被本闸拦住并在日志里喊人。
+
+## 11. 上线记录（2026-08-16 16:10，全部 7 条线切 V24PUT）
+
+- `live_config.py`：`FEATURES_FROM` → `wf_daily_V24PUT_s42_...cap100000.json`（旧值 V24B_s42
+  留在注里）；`BASE_PARAMS["train-file"]` → `training_data_pit_v24_tick1.parquet`。
+- **指纹迁移**：train_file 在 FINGERPRINT_KEYS 里，对全部 state 先备份
+  （data/live/backup/*_fpmigrate_20260816_160923）再改 config.train_file，
+  持仓/现金/日历不动；7 条线共 22 笔持仓保留。
+- `daily_rebuild.py` §4.5 改硬失败 + tick1/v24 末日强制对齐检查（断供超
+  `--require-fresh 3` → 当晚宁可无信号）。
+- 验收：041 全套测试 192 passed；steady5w/aggr10w/base5w_steady 三线 dry-run
+  全过（tick1 矩阵、80 特征、指纹接受、周六保持挂单不重出）。
+- 回滚预案：改回 FEATURES_FROM/train-file 两行 + 用 fpmigrate 备份还原 state；
+  或仅改两行再跑一次迁移脚本（方向反过来）。
+- 当日彩排（`daily_rebuild --force`）抓到并修掉两只上线雷：
+  1. **validate_new_train 误拦 tk_\***：基础 v24 矩阵本来就没有 tk_ 列（§4.5 才加），
+     切 V24PUT 后"在用特征缺列 11 个"直接把重建打死（周一晚会全线无信号）。
+     修复 = 基础矩阵校验剔除 tk_ 前缀，tk_ 的存在性/末日覆盖移到 §4.5 硬检。
+  2. **同日卖买同一只（aggr2w 京东方实拍）**：roll_set（续持判定）按纯排名取前 N，
+     而买入按资金可行性过滤——前两名一手超预算时真实目标下移，到期持仓被卖又
+     原样买回，白付往返成本。修复 = 计划装配收敛成不动点循环（卖∩买 → 并入
+     续持集合全量重算）。**wf_v35 回测的 roll_set 同样是纯排名口径，方向是
+     多付成本（保守偏差），后续对齐但不影响已得结论。**
+- 应用户要求周六提前重出：7 条线作废周五 V24B 挂单（备份 _replan_20260816_162220）
+  用 V24PUT 重出 0814 计划；副作用 = 所有线换仓周期同步锚定在 0814（以后周一
+  换仓），用户已接受。终扫 7 线卖买零重叠。
+- 首次实盘执行：周一尾盘按新计划。周一 17:30 重建 = 新链首次带真数据运行，
+  当晚监控点：build_tick1 对齐、各线信号行。
+
+## 12. 复盘命令
 
 ```bash
-# 归因/PU/lag 汇总（跑完后）
-./.venv/bin/python scripts/summarize_tags.py V24B V24T1 V24PUB V24PUT
+# 归因/PU/lag 汇总
+./.venv/bin/python scripts/summarize_tags.py V24B V24PUB V24T1 V24PUT
 ./.venv/bin/python scripts/summarize_tags.py V24T1 V24L5 V24L10
+./.venv/bin/python scripts/summarize_tags.py V24T1 V24TS V24TC
+# deploy gate
+./.venv/bin/python scripts/check_deploy_gate.py V24PUT --matrix data/processed/training_data_pit_v24_tick1.parquet
 # 同步状态
 ~/venv123/bin/python scripts/sync_tick_123.py --check
 tail -50 ~/logs/sync123_$(date +%Y%m).log

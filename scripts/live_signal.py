@@ -1510,78 +1510,101 @@ if PERIODIC and is_rebal and not in_cash:
             continue
         roll_set.add(code)
 
-sell_plan, keep_plan = [], []
-for lot in state["lots"]:
-    _held = held_days(all_dates, lot, SIGNAL_DATE)
-    matured = _held >= HOLD_DAYS
-    ref = kl.px(lot["code"], SIGNAL_DATE, "close") or lot["buy_price"]
-    row = {"code": lot["code"], "name": names.get(str(lot["code"])[:6], ""),
-           "shares": lot["shares"], "buy_price": round(lot["buy_price"], 3),
-           "ref_close": round(ref, 3), "open_date": lot.get("open_date"),
-           "held_days": _held,
-           # 真实持有时长与累计续持次数: 续持会把 held_days 归零, 光看它
-           # 会以为是刚买的。两个都给前端, 各自回答不同的问题。
-           "tenure_days": tenure_days(all_dates, lot, SIGNAL_DATE),
-           "n_rolled": int(lot.get("rolled", 0)),
-           "first_open_date": lot.get("first_open_signal_date") or lot.get("open_signal_date"),
-           "pnl_pct": round((ref / lot["buy_price"] - 1) * 100, 2)}
-    rolled = matured and not in_cash and str(lot["code"])[:6] in roll_set
-    if rolled:
-        # 续持: 不产生交易, 也不让用户做任何操作
-        row["rolled"] = True
-        row["reason"] = "到期但仍在前列, 续持不动"
-        keep_plan.append(row)
-    elif matured or in_cash:
-        row["reason"] = "持满到期" if matured else (
-            "切换策略前排空" if drain else "大盘转弱清仓")
-        row["est_proceeds"] = round(lot["shares"] * fill_px(ref, "sell") * (1 - TRADE_COST), 2)
-        sell_plan.append(row)
-    else:
-        keep_plan.append(row)
+def _assemble_plan(roll_codes):
+    """由 roll_codes(续持集合) 生成 卖/留/买/候补 四个计划段。
 
-cash_after_sell = state["cash"] + sum(r["est_proceeds"] for r in sell_plan)
-buy_plan, alt_plan = [], []
-if not in_cash and is_rebal:
-    equity = cash_after_sell + sum(r["shares"] * r["ref_close"] for r in keep_plan)
-    denom = 1 if PERIODIC else HOLD_DAYS
-    remaining = min(equity / denom, cash_after_sell)
-    held = {str(r["code"])[:6] for r in keep_plan}
-    # 从已持仓数起算: 续持的那几只已经占着仓位, 不从 0 起算会超配
-    bought = len(keep_plan)
-    for code in ranked["code"]:
-        if bought >= TRANCHE_N and len(alt_plan) >= args.alternates:
-            break
-        if code in held or code in blocked:
-            continue
-        ref = kl.px(code, SIGNAL_DATE, "close")
-        if ref is None:
-            continue
-        px = fill_px(ref, "buy")
-        if bought < TRANCHE_N:
-            alloc = remaining / (TRANCHE_N - bought)
-            shares = int(alloc / (px * 100)) * 100
-            if shares <= 0:
-                # 整手粒度救济: 计划与结算必须同一口径, 否则挂单和入账会对不上
-                if LOT_FLEX > 0 and px * 100 <= alloc * (1 + LOT_FLEX):
-                    shares = 100
-                else:
-                    alt_plan.append({"code": code, "name": names.get(code, ""),
+    独立成函数是为了下面的不动点循环: 排名靠前但一手都买不起的股票会被
+    买入环节跳过, 真实买入目标顺位下移 —— 用纯排名算的 roll_set 就会和
+    真实目标不一致, 出现"同日卖出又买回同一只"(2026-08-16 aggr2w 实拍:
+    前两名 ¥406/¥205 一手超预算, 真实目标落到第 3 名京东方, 而它恰好
+    持满到期, 被卖掉又原样买回, 白付一次往返成本)。
+    """
+    sells, keeps = [], []
+    for lot in state["lots"]:
+        _held = held_days(all_dates, lot, SIGNAL_DATE)
+        matured = _held >= HOLD_DAYS
+        ref = kl.px(lot["code"], SIGNAL_DATE, "close") or lot["buy_price"]
+        row = {"code": lot["code"], "name": names.get(str(lot["code"])[:6], ""),
+               "shares": lot["shares"], "buy_price": round(lot["buy_price"], 3),
+               "ref_close": round(ref, 3), "open_date": lot.get("open_date"),
+               "held_days": _held,
+               # 真实持有时长与累计续持次数: 续持会把 held_days 归零, 光看它
+               # 会以为是刚买的。两个都给前端, 各自回答不同的问题。
+               "tenure_days": tenure_days(all_dates, lot, SIGNAL_DATE),
+               "n_rolled": int(lot.get("rolled", 0)),
+               "first_open_date": lot.get("first_open_signal_date") or lot.get("open_signal_date"),
+               "pnl_pct": round((ref / lot["buy_price"] - 1) * 100, 2)}
+        rolled = matured and not in_cash and str(lot["code"])[:6] in roll_codes
+        if rolled:
+            # 续持: 不产生交易, 也不让用户做任何操作
+            row["rolled"] = True
+            row["reason"] = "到期但仍在前列, 续持不动"
+            keeps.append(row)
+        elif matured or in_cash:
+            row["reason"] = "持满到期" if matured else (
+                "切换策略前排空" if drain else "大盘转弱清仓")
+            row["est_proceeds"] = round(lot["shares"] * fill_px(ref, "sell") * (1 - TRADE_COST), 2)
+            sells.append(row)
+        else:
+            keeps.append(row)
+
+    cash_after = state["cash"] + sum(r["est_proceeds"] for r in sells)
+    buys, alts = [], []
+    if not in_cash and is_rebal:
+        equity = cash_after + sum(r["shares"] * r["ref_close"] for r in keeps)
+        denom = 1 if PERIODIC else HOLD_DAYS
+        remaining = min(equity / denom, cash_after)
+        held = {str(r["code"])[:6] for r in keeps}
+        # 从已持仓数起算: 续持的那几只已经占着仓位, 不从 0 起算会超配
+        bought = len(keeps)
+        for code in ranked["code"]:
+            if bought >= TRANCHE_N and len(alts) >= args.alternates:
+                break
+            if code in held or code in blocked:
+                continue
+            ref = kl.px(code, SIGNAL_DATE, "close")
+            if ref is None:
+                continue
+            px = fill_px(ref, "buy")
+            if bought < TRANCHE_N:
+                alloc = remaining / (TRANCHE_N - bought)
+                shares = int(alloc / (px * 100)) * 100
+                if shares <= 0:
+                    # 整手粒度救济: 计划与结算必须同一口径, 否则挂单和入账会对不上
+                    if LOT_FLEX > 0 and px * 100 <= alloc * (1 + LOT_FLEX):
+                        shares = 100
+                    else:
+                        alts.append({"code": code, "name": names.get(code, ""),
                                      "ref_close": round(ref, 3), "pred": round(pred_map[code], 6),
                                      "note": "预算不足一手"})
-                    continue
-            gross = shares * px
-            fee = max(gross * TRADE_COST, MIN_FEE)
-            remaining -= gross + fee
-            bought += 1
-            buy_plan.append({"code": code, "name": names.get(code, ""),
+                        continue
+                gross = shares * px
+                fee = max(gross * TRADE_COST, MIN_FEE)
+                remaining -= gross + fee
+                bought += 1
+                buys.append({"code": code, "name": names.get(code, ""),
                              "shares": shares, "ref_close": round(ref, 3),
                              "est_price": round(px, 3), "est_cost": round(gross + fee, 2),
                              "pred": round(pred_map[code], 6),
                              "budget": round(alloc, 2)})
-        else:
-            alt_plan.append({"code": code, "name": names.get(code, ""),
+            else:
+                alts.append({"code": code, "name": names.get(code, ""),
                              "ref_close": round(ref, 3), "pred": round(pred_map[code], 6),
                              "note": "候补"})
+    return sells, keeps, buys, alts
+
+
+# 不动点循环: 若某只股票同时出现在卖出与买入里, 说明它其实就在真实买入
+# 目标中 —— 并入续持集合重算(卖/买两腿都消掉, 现金数学全量重算)。
+# roll_set 只会单调变大且上限为持仓数, 最多迭代 len(lots)+1 次必收敛。
+for _ in range(len(state["lots"]) + 1):
+    sell_plan, keep_plan, buy_plan, alt_plan = _assemble_plan(roll_set)
+    _churn = ({str(r["code"])[:6] for r in sell_plan}
+              & {str(r["code"])[:6] for r in buy_plan})
+    if not _churn:
+        break
+    roll_set |= _churn
+cash_after_sell = state["cash"] + sum(r["est_proceeds"] for r in sell_plan)
 
 # ── 打印 ──
 mv = sum(r["shares"] * r["ref_close"] for r in keep_plan + sell_plan)
