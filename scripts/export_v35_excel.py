@@ -84,6 +84,64 @@ SELL_REASON = {"matured": "持满到期", "end": "回测期末清仓",
                "roll_trim": "连任减持(超出新预算部分)", "regime_exit": "大盘转弱清仓"}
 
 
+def cash_regime_chart(daily: pd.DataFrame, out: Path, title: str) -> Path | None:
+    """大图: 基准(池内等权)与策略净值走势 + 灰色阴影标出空仓时段。
+
+    用户要求的标准交付件 (2026-08-16): 每次导出都附这张图,
+    PNG 存在 xlsx 旁边 + 嵌进工作簿“空仓走势图”页。画不出来(缺
+    matplotlib 等)只警告不阻断导出。
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        matplotlib.rcParams["font.sans-serif"] = [
+            "PingFang SC", "Heiti TC", "Arial Unicode MS", "Noto Sans CJK SC", "SimHei"]
+        matplotlib.rcParams["axes.unicode_minus"] = False
+    except Exception as e:  # pragma: no cover
+        print(f"  [警告] 画不了空仓走势图: {e}")
+        return None
+
+    d = daily.copy()
+    d["dt"] = pd.to_datetime(d["date"])
+    in_cash = d["in_cash"].astype(bool).values if "in_cash" in d.columns else np.zeros(len(d), bool)
+
+    # 连续空仓段 [起, 止]
+    spans, start = [], None
+    for i, c in enumerate(in_cash):
+        if c and start is None:
+            start = d["dt"].iloc[i]
+        elif not c and start is not None:
+            spans.append((start, d["dt"].iloc[i]))
+            start = None
+    if start is not None:
+        spans.append((start, d["dt"].iloc[-1]))
+
+    fig, ax = plt.subplots(figsize=(22, 10), dpi=150)
+    for j, (a, b) in enumerate(spans):
+        ax.axvspan(a, b, color="0.82", zorder=0,
+                   label="空仓期" if j == 0 else None)
+    ax.plot(d["dt"], d["基准净值"], color="#888888", lw=1.8, label="大盘(池内等权买入持有)")
+    ax.plot(d["dt"], d["策略净值"], color="#c0392b", lw=2.4, label="策略净值")
+    ax.axhline(1.0, color="0.6", lw=0.8, ls="--")
+
+    pct = in_cash.mean() * 100
+    ax.set_title(f"{title}\n灰色阴影 = 空仓时段 (共 {len(spans)} 段, 占 {pct:.0f}% 交易日) — 空仓时策略净值走平, 大盘照常涨跌",
+                 fontsize=15, pad=14)
+    ax.legend(loc="upper left", fontsize=13, framealpha=0.9)
+    ax.grid(alpha=0.3)
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    fig.autofmt_xdate()
+    ax.margins(x=0.01)
+    fig.tight_layout()
+    png = out.with_name(out.stem + "_空仓走势图.png")
+    fig.savefig(png)
+    plt.close(fig)
+    return png
+
+
 def build_operations(trades, names, concepts, pv_by_date):
     """FIFO 配对 买入 -> 卖出, 生成一行一笔完整操作。
 
@@ -312,7 +370,18 @@ def export(src: Path, out: Path):
         tr.to_excel(w, sheet_name="交易明细", index=False)
         stk.to_excel(w, sheet_name="个股统计", index=False)
         sec.to_excel(w, sheet_name="板块统计", index=False)
+    png = cash_regime_chart(daily, out, out.stem)
     format_workbook(out, len(ops))
+    if png is not None:
+        from openpyxl import load_workbook as _lw
+        from openpyxl.drawing.image import Image as _XLImage
+        book = _lw(out)
+        ws = book.create_sheet("空仓走势图", 1)
+        img = _XLImage(str(png))
+        img.width, img.height = 1650, 750   # 大图, 打开就能看
+        ws.add_image(img, "A1")
+        book.save(out)
+        print(f"  空仓走势图: {png.name} (已嵌入工作簿第2页)")
     print(f"已生成: {out}")
     print(f"  回测区间 {res['period']} | 操作 {len(ops)} 笔 (已完成 {len(done)}) | 成交 {len(tr)} 笔")
 
