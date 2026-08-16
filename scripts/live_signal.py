@@ -1554,6 +1554,7 @@ def _assemble_plan(roll_codes):
         equity = cash_after + sum(r["shares"] * r["ref_close"] for r in keeps)
         denom = 1 if PERIODIC else HOLD_DAYS
         remaining = min(equity / denom, cash_after)
+        cash_left = cash_after
         held = {str(r["code"])[:6] for r in keeps}
         # 从已持仓数起算: 续持的那几只已经占着仓位, 不从 0 起算会超配
         bought = len(keeps)
@@ -1580,6 +1581,15 @@ def _assemble_plan(roll_codes):
                         continue
                 gross = shares * px
                 fee = max(gross * TRADE_COST, MIN_FEE)
+                # 与回测 wf_v35 的 buy_no_cash 闸同口径: 整手救济只能宽容槽位预算,
+                # 不能花超过手里现金的钱 (2026-08-16 aggr2w 实拍: 现金 1.2 万却
+                # 挂出 1.5 万的买单, 周一根本成交不了)。
+                if gross + fee > cash_left:
+                    alts.append({"code": code, "name": names.get(code, ""),
+                                 "ref_close": round(ref, 3), "pred": round(pred_map[code], 6),
+                                 "note": "现金不足一手"})
+                    continue
+                cash_left -= gross + fee
                 remaining -= gross + fee
                 bought += 1
                 buys.append({"code": code, "name": names.get(code, ""),
