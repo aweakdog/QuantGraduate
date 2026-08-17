@@ -37,8 +37,11 @@ def stock_oi(code6: str) -> pd.DataFrame | None:
     p = KL / f"{code6}.parquet"
     if not p.exists():
         return None
-    k = pd.read_parquet(p, columns=["时间", "开盘价", "收盘价"]).rename(
+    k = pd.read_parquet(p).rename(
         columns={"时间": "date", "开盘价": "open", "收盘价": "close"})
+    if not {"date", "open", "close"}.issubset(k.columns):
+        return None
+    k = k[["date", "open", "close"]]
     k["date"] = pd.to_datetime(k["date"]).dt.strftime("%Y-%m-%d")
     k = k.sort_values("date")
     o = pd.to_numeric(k["open"], errors="coerce")
