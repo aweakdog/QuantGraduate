@@ -19,6 +19,7 @@ Walk-Forward v35: 最小验证版 —— 只改两件事, 检验能否跑赢等�
 强制输出与【等权买入持有】基准的对比: 超额 / IR / beta / alpha
 """
 import pandas as pd, numpy as np, json, warnings, argparse
+import os
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -207,6 +208,10 @@ TARGET_POSITIONS = TRANCHE_N if PERIODIC else HOLD_DAYS * TRANCHE_N
 MIN_TRAIN_DAYS = 250
 
 _tag = args.tag or f"v35_{args.label}_hold{HOLD_DAYS}_n{TARGET_POSITIONS}"
+# 种子强制进文件名(幂等: 旧约定 tag 里已带 _s<seed> 则不重复), 根治多种子互相覆盖
+_seed_sfx = f"_s{args.lgb_seed}"
+if not _tag.endswith(_seed_sfx):
+    _tag = f"{_tag}{_seed_sfx}"
 _out = f"wf_daily_{_tag}_ts{TEST_START}_te{TEST_END}_cap{int(INIT_CAPITAL)}"
 OUT_PATH = DATA_DIR / "processed" / f"{_out}.json"
 
@@ -1372,5 +1377,7 @@ json.dump({
     },
     "stability": halves,
     "daily": daily_records, "trades": trade_log,
-}, open(OUT_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2, default=str)
+}, open(_tmp_out := OUT_PATH.with_suffix(".json.part"), "w", encoding="utf-8"),
+    ensure_ascii=False, indent=2, default=str)
+os.replace(_tmp_out, OUT_PATH)   # 原子落盘, 杀进程不留半截 JSON
 print(f"\n已保存: {OUT_PATH}")
