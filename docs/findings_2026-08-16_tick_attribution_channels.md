@@ -309,6 +309,20 @@ tick级精算 (612笔卖出 = 固定5种子并集, 74个调仓日, 3s快照, 买
 +365bp —— tick 级重放必须在 tick 尺度内自比(触发价 vs tick收盘价)。
 复现: /tmp/{sell,buy}_timing_tick.py, 事件表 /tmp/{sell,buy}_timing_events.parquet (040)。
 
+## 12.9 OI 隔夜/日内特征: 无增益, 弃 (2026-08-17 晚, 5种子)
+
+§12.8 执行研究的副产品转特征 (oi_on/id/gap/fade 截面z, 6列): 总收益 74.7% vs 基线
+103%, 回撤 -28.5% vs -13.6% (翻倍), IR 0.56 vs 1.00。配对: 中位 +13.2pp 但均值
+-16.9pp (尾部 -85pp), 3/5 种子更好 —— 不可分带内且风险显著恶化, **弃**。
+解读: 隔夜/日内结构的信息大概率已被动量/tick 时段特征涵盖, 增量是噪声+尾部风险。
+
+## 12.10 实盘链首跑成功 (2026-08-17 17:30)
+
+quant-daily.service (041 systemd) 17:30:37 → 17:56:41, 26min, CPU 1h11m, 干净退出。
+K线→特征→训练集→tick增广(lag1, require-fresh 3)→信号 全链无人工干预。
+(注: 041 无 crontab, 全链在 systemd user timer 上 —— quant-daily/notify-preclose/
+notify-evening 三个 timer, 排障先查 systemctl --user list-timers。)
+
 ⚠ 运维教训 (今晨): 批脚本内嵌 "while pgrep xargs" 等待循环, 多次取消/补发后
 42 个等待者互相复活批任务; pkill 模式三次自匹配杀掉自己的 ssh 会话
 (教训: pkill 与同命令行内任何文本不得有正则重叠, 用 "breadth_alpha[.]py" 这类
