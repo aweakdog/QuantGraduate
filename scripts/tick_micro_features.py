@@ -51,7 +51,7 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parents[1]
 TICK = Path(os.environ.get(
     "TICK_DIR", "/home/yliog/tickdata/----逐笔委托成交行情-明细---"))
-OUT = ROOT / "data/processed/tick_micro"
+OUT = ROOT / Path(os.environ.get("TM_OUT", "data/processed/tick_micro"))
 PDIV = 10000.0
 
 F_ORD, F_TRD, F_QUO = "逐笔委托.csv", "逐笔成交.csv", "行情.csv"
@@ -325,9 +325,12 @@ def main():
     start, end = sys.argv[1], sys.argv[2]
 
     # 取所有 universe 的并集: 线上池 519 只与实验池 630 只并不互相包含,
-    # 一次抽完省得为第二个矩阵重跑一遍
-    ups = [ROOT / "data/universe/universe_pit.parquet",
-           ROOT / "data/universe/universe_pit_2019.parquet"]
+    # 一次抽完省得为第二个矩阵重跑一遍。TM_UNIVERSE 可整体覆盖 (逗号分隔, 扩池用)
+    if os.environ.get("TM_UNIVERSE"):
+        ups = [ROOT / p for p in os.environ["TM_UNIVERSE"].split(",")]
+    else:
+        ups = [ROOT / "data/universe/universe_pit.parquet",
+               ROOT / "data/universe/universe_pit_2019.parquet"]
     ups = [p for p in ups if p.exists()]
     if not ups:
         sys.exit("找不到 universe 文件")
