@@ -19,7 +19,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 ROOT = Path(__file__).resolve().parents[1]
-DESKTOP_ROOT = Path.home() / "Desktop" / "量化操作表"
+DESKTOP_ROOT = Path.home() / "Desktop" / "l量化操作表"
 
 
 def default_output(src: Path) -> Path:
