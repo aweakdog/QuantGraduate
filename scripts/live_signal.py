@@ -58,6 +58,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+try:  # htop 低调化: 显示题名而非完整命令行 (见 scripts/proctitle.py)
+    from proctitle import lowkey
+    lowkey("mltask/task")
+except Exception:
+    pass
+
 import lightgbm as lgb  # noqa: E402
 from pipeline.config import settings  # noqa: E402
 
@@ -109,6 +115,16 @@ ap.add_argument("--features-from",
                      "设为 none 则现场重新筛选。默认与 live_config.FEATURES_FROM 一致 "
                      "(修复 drop_market_wide 后的干净 80 特征); 旧的 fundfix 58 特征集"
                      "含 8 个市场级日历假象特征, 不要再用")
+ap.add_argument("--gate-ma60", action="store_true",
+                help="GF1-G1 门控融合 (2026-08-22 过 20 种子 gate): 全市场等权指数 < 自身"
+                     " MA60(带确认滞回)判弱势态, 当天改用 CGO 模型(锁定特征+6列行为因子)"
+                     "排名; 强势态用原特征集。择时过滤器不受影响(叠在外层)。回测证据:"
+                     " 窗A +9.5pp/窗B +7.65pp/窗B 20种子 0 亏损, 见 experiment_board"
+                     " 2026-08-22。需矩阵含 CGO 列(build_cgo_augmented.py)。不进指纹:"
+                     " 与 features-from 同类, 不影响持仓记账, 开关切换无需 --init")
+ap.add_argument("--gate-confirm", type=int, default=3,
+                help="门控态切换的确认天数(双向滞回)。回测用 3, 别随意改 —— 改了就不是"
+                     "被验证过的那个策略")
 ap.add_argument("--capital", type=float, default=20000.0, help="初始本金 (仅 --init 时使用)")
 ap.add_argument("--init", action="store_true", help="重置状态文件, 用 --capital 作为起始现金")
 ap.add_argument("--state", default="state.json", help="状态文件名 (data/live/ 下)")
@@ -135,6 +151,31 @@ ap.add_argument("--preds-cache", default=None,
                 help="预测结果缓存路径。四条线的模型完全相同(特征/标签/训练集/超参都不"
                      "依赖 tranche_n 与本金), 各训一遍是 4 倍浪费。指定同一个缓存文件, "
                      "则当天第一条线训练并写入, 其余直接读取。输入指纹不符会自动重训")
+ap.add_argument("--fill-daily", action="store_true",
+                help="闲钱日补: 非换仓日只要有空槽位且现金够一手, 就出补买建议; "
+                     "到期批次也每天过续持判定(而非硬卖后空等到换仓日)。与回测 "
+                     "wf_v35 --fill-daily 同义。每笔仓自带独立到期时钟, 不影响记账, "
+                     "故不进指纹; 开关切换不需要 --init")
+ap.add_argument("--roll-rank", type=int, default=0,
+                help="到期宽续持: 持满到期时只要仍在排名前 M 就续持(默认只看前 "
+                     "tranche_n)。卖出门槛比买入宽, 省掉排名噪声区的往返成本。与回测 "
+                     "wf_v35 --roll-rank 同义。0=关。注意: 与 2026-08-04 那条“别叠 "
+                     "roll-rank”警告里的旧旗标不是同一个东西——那个是买入侧过滤(压低部 "
+                     "署率), 这个只放宽卖出, 部署率只升不降。不进指纹")
+ap.add_argument("--ind-cap", type=int, default=0,
+                help="行业集中度上限: 组合内每个申万一级行业最多持 N 只。0=不限。"
+                     "买入与续持同尺度: 超限候选顺位递补下一名(不同行业), 已持仓超限的"
+                     "到期不续持。与回测 wf_v35 --ind-cap 同义(IND1 实验, 2026-08-22)。"
+                     "纯执行层不进指纹, 开关切换不需要 --init")
+ap.add_argument("--ind-map", type=str,
+                default="raw/tushare/sw_member/sw_member.parquet",
+                help="申万行业 PIT 成分表路径(相对 data/ 或绝对), 需含"
+                     " ts_code/l1_name/in_date/out_date; 按信号日判归属")
+ap.add_argument("--min-pred", type=float, default=0.0,
+                help="信号强度门槛: 预测收益低于该值的候选不买, 且不沿排名递补 —— "
+                     "留空槽位持现金(第二层择时: 模型没信心的日子宁可不买)。只管新买入, "
+                     "不影响续持。与回测 wf_v35 --min-pred 同义(MP1c 采纳, 2026-08-22)。"
+                     "纯执行层不进指纹, 开关切换不需要 --init")
 ap.add_argument("--status", action="store_true",
                 help="只打印当前持仓/现金/待执行计划, 不跑模型 (秒级)")
 ap.add_argument("--sync", default=None,
@@ -234,6 +275,52 @@ SLIPPAGE = args.slippage
 LOT_FLEX = args.lot_flex
 HOLD_DAYS, TRANCHE_N = args.hold_days, args.tranche_n
 PERIODIC = args.portfolio_mode == "periodic"
+# 执行层开关 (FDRR8, 2026-08-18 上线): 20 种子官方 +73.5%/夏普1.00 vs 基线
+# +32.8%/0.61 (50000/n5/20bp)。两个都不进指纹: 只改交易建议的生成, 不改记账
+# 语义(每笔仓的到期时钟本就独立), 开关来回切不会弄坏已有持仓。
+# 协同关系: roll-rank 单用无增益, 必须与 fill-daily 同开才有 FDRR8 的数字。
+FILL_DAILY = args.fill_daily
+ROLL_RANK = args.roll_rank
+ROLL_LIMIT = max(TRANCHE_N, ROLL_RANK) if ROLL_RANK else TRANCHE_N
+
+# ── --ind-cap: 申万一级行业 PIT 查询表 (与回测 wf_v35 同构) ──
+# 区间表小(每股 1~3 段), 线性扫描 + 全量缓存足够快。归属按信号日判定:
+# in_date 是公告日口径, 信号日已知, 无未来函数。
+IND_CAP = args.ind_cap
+MIN_PRED = args.min_pred
+_ind_intervals: dict = {}
+_ind_cache: dict = {}
+if IND_CAP > 0:
+    _imp = Path(args.ind_map)
+    if not _imp.is_absolute():
+        _imp = DATA_DIR / _imp
+    _sw = pd.read_parquet(_imp)
+    _sw["c6"] = _sw["ts_code"].astype(str).str[:6]
+    _sw["in_date"] = pd.to_datetime(_sw["in_date"], errors="coerce")
+    _sw["out_date"] = pd.to_datetime(_sw["out_date"], errors="coerce").fillna(
+        pd.Timestamp("2099-12-31"))
+    _sw = _sw.dropna(subset=["l1_name", "in_date"])
+    for _r in _sw.itertuples():
+        _ind_intervals.setdefault(_r.c6, []).append(
+            (_r.in_date, _r.out_date, _r.l1_name))
+    del _sw
+
+
+def ind_of(code, d):
+    """申万一级行业归属 (PIT, 按日期 d); 查不到返 None"""
+    c6 = str(code)[:6]
+    key = (c6, d)
+    hit = _ind_cache.get(key, "\x00")
+    if hit != "\x00":
+        return hit
+    r = None
+    dd = pd.Timestamp(d)
+    for _i, _o, _nm in _ind_intervals.get(c6, ()):
+        if _i <= dd <= _o:
+            r = _nm
+            break
+    _ind_cache[key] = r
+    return r
 TARGET_POSITIONS = TRANCHE_N if PERIODIC else HOLD_DAYS * TRANCHE_N
 MIN_TRAIN_DAYS = 250
 EXEC_FIELD = "open" if args.exec_mode == "t1open" else "close"
@@ -382,8 +469,10 @@ def compute_market_features():
     feats = [c for c in m.columns if c.startswith("mkt_")]
     for c in feats:
         m[c] = pd.to_numeric(m[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    regime_src = m[["date", "mkt_close", f"mkt_ma{args.regime_ma}",
-                    "breadth_above_ma", "breadth_up"]].copy()
+    _rs_cols = list(dict.fromkeys(
+        ["date", "mkt_close", f"mkt_ma{args.regime_ma}", "mkt_ma60",
+         "breadth_above_ma", "breadth_up"]))
+    regime_src = m[_rs_cols].copy()
     return m[["date"] + feats], feats, regime_src
 
 
@@ -449,6 +538,29 @@ def select_features(df, all_features, cutoff):
                 dropped.add(c)
     print(f"    保留 {len(selected)} 个")
     return selected
+
+
+def build_gate_series(regime_src):
+    """GF1-G1 门控态序列: True = 弱势(用 CGO 模型), False = 强势(用 base)。
+
+    规则与回测拼接(gf1_041.sh 的 G1 臂)逐字一致: 全市场等权指数 < 自身 MA60,
+    双向连续 gate_confirm 天确认才切换。只用截至当日收盘信息, 无前视。
+    注意它与择时过滤器(breadth)必须保持变量独立 —— 同参门控只在空仓态
+    触发, 结构性无效(2026-08-22 G2 哑弹教训)。
+    """
+    r = regime_src.set_index("date").sort_index()
+    raw = (r["mkt_close"] < r["mkt_ma60"]).fillna(False)
+    k = max(1, args.gate_confirm)
+    turn_on = raw.rolling(k).min().fillna(0) == 1
+    turn_off = (~raw).rolling(k).min().fillna(0) == 1
+    state, out = False, {}
+    for d in r.index:
+        if not state and bool(turn_on.loc[d]):
+            state = True
+        elif state and bool(turn_off.loc[d]):
+            state = False
+        out[d] = state
+    return pd.Series(out)
 
 
 def build_regime_series(regime_src):
@@ -643,11 +755,13 @@ def settle(st, pending, exec_date, kl, names, cal):
     # ── 0. 目标组合 ──
     # 到期但仍在目标名单里的就续持, 不卖了再买回 —— 一次往返要付
     # (佣金+滑点)*2, 白付这笔钱却回到同样的持仓。与回测 roll_set 一致。
+    # fill-daily 下非换仓日也建 (到期批次天天有); roll-rank 把续持门槛从
+    # 前 tranche_n 放宽到前 ROLL_LIMIT (卖出门槛比买入宽)。
     roll_set = set()
-    if PERIODIC and pending["is_rebal"] and not in_cash:
+    if PERIODIC and (pending["is_rebal"] or FILL_DAILY) and not in_cash:
         _blocked = set(pending.get("blocked", []))
         for code in pending["ranked"]:
-            if len(roll_set) >= TRANCHE_N:
+            if len(roll_set) >= ROLL_LIMIT:
                 break
             c6 = str(code)[:6]
             if c6 in _blocked:
@@ -696,7 +810,8 @@ def settle(st, pending, exec_date, kl, names, cal):
     st["lots"] = keep
 
     # ── 2. 买入 ──
-    if not in_cash and pending["is_rebal"]:
+    # fill-daily: 非换仓日只要有空槽位且现金够, 也买 (与回测同义)。
+    if not in_cash and (pending["is_rebal"] or FILL_DAILY):
         equity = st["cash"] + sum(
             l["shares"] * (kl.px(l["code"], exec_date, EXEC_FIELD) or l["buy_price"])
             for l in st["lots"])
@@ -1327,6 +1442,22 @@ if mkt_last > pd.Timestamp(SIGNAL_DATE) and not args.as_of:
 print(f"  {len(df):,} 行, {df['code'].nunique()} 只 | 信号日 {pd.Timestamp(SIGNAL_DATE).date()}")
 features = select_features(df, all_features, args.feat_cutoff)
 
+# ── GF1-G1 门控: 弱势态用 CGO 模型(锁定特征+6列), 强势态用 base ──
+# 回测语义: 信号日当天的门控态决定当天用哪套排名(与 gf1 拼接重放一致)。
+GATE_CGO_COLS = ["cgo_rec", "cgo_60", "cgo_250", "ovh_120", "cgo_delta_5d", "mkt_cgo"]
+gate_weak = False
+if args.gate_ma60:
+    _missing_cgo = [c for c in GATE_CGO_COLS if c not in df.columns]
+    if _missing_cgo:
+        raise SystemExit(
+            f"ERROR: 开了 --gate-ma60 但训练矩阵缺 CGO 列 {_missing_cgo}。\n"
+            f"  先跑: python scripts/build_cgo_augmented.py --source {args.train_file}\n"
+            f"  (daily_rebuild §4.2 会每晚自动加列; 手工重建矩阵后也要补跑这步)")
+    gate_series = build_gate_series(regime_src)
+    gate_weak = bool(gate_series.get(pd.Timestamp(SIGNAL_DATE), False))
+features_used = features + [c for c in GATE_CGO_COLS if c not in features] \
+    if (args.gate_ma60 and gate_weak) else features
+
 # ── 结算上一次的挂单 ──
 pending = state.get("pending")
 if pending:
@@ -1402,7 +1533,7 @@ if args.preds_cache:
     _cache_key = hashlib.sha1(json.dumps({
         "signal_date": str(SIGNAL_DATE), "cutoff": str(cutoff),
         "train_file": args.train_file, "pit_universe": args.pit_universe,
-        "label": LABEL, "features": list(features),
+        "label": LABEL, "features": list(features_used),
         "params": {k: str(v) for k, v in sorted(LOCKED_PARAMS.items())},
         "seeds": ENSEMBLE_SEEDS,
         "skip_boards": list(SKIP_BOARDS),
@@ -1427,10 +1558,12 @@ if _cache_key:
 
 if ranked is None:
     print(f"\n[训练] 样本 < {pd.Timestamp(cutoff).date()} | "
-          f"{train_df['date'].nunique()} 天 {len(train_df):,} 行 {len(features)} 特征 | "
-          f"{len(ENSEMBLE_SEEDS)} 种子集成")
-    X = train_df.groupby("code")[features].transform(lambda c: c.ffill().fillna(0))
-    Xt = df.loc[tm, features].fillna(0)
+          f"{train_df['date'].nunique()} 天 {len(train_df):,} 行 {len(features_used)} 特征 | "
+          f"{len(ENSEMBLE_SEEDS)} 种子集成"
+          + (f" | 门控: {'弱势态→CGO模型' if gate_weak else '强势态→base模型'}"
+             if args.gate_ma60 else ""))
+    X = train_df.groupby("code")[features_used].transform(lambda c: c.ffill().fillna(0))
+    Xt = df.loc[tm, features_used].fillna(0)
     # 多种子集成: 同数据同超参, 只换 random_state, 预测取普通平均(保留收益率量纲)。
     # 前3名选股对训练噪声极度敏感(两两种子 top3 重合率仅 75%), 平均后方差抵消。
     # 回测验证: plain-mean 与 z-mean top3 重合 99.3%, 集成 IC 与单种子持平。
@@ -1501,13 +1634,23 @@ is_rebal = ((not PERIODIC)
 # 目标组合: ranked 里前 TRANCHE_N 个未被持禁的。已持仓且仍在目标里的,
 # 到期也不卖 —— 卖了再买回要付一次往返 (佣金+滑点)*2, 白付这笔钱
 # 却回到同样的持仓。与回测 wf_v35 的 roll_set 逻辑一致。
+# fill-daily 下非换仓日也建; roll-rank 把续持门槛放宽到前 ROLL_LIMIT。
 roll_set = set()
-if PERIODIC and is_rebal and not in_cash:
+if PERIODIC and (is_rebal or FILL_DAILY) and not in_cash:
+    # --ind-cap: 续持名单也按行业限额填 —— 否则超配行业的持仓永远在
+    # 前 M 名里续持, 上限就永远收不到目标水位。同一把尺子量买入与续持。
+    _ind_cnt_roll: dict = {}
     for code in ranked["code"]:
-        if len(roll_set) >= TRANCHE_N:
+        if len(roll_set) >= ROLL_LIMIT:
             break
         if code in blocked:
             continue
+        if IND_CAP > 0:
+            _il = ind_of(code, SIGNAL_DATE)
+            if _il is not None:
+                if _ind_cnt_roll.get(_il, 0) >= IND_CAP:
+                    continue
+                _ind_cnt_roll[_il] = _ind_cnt_roll.get(_il, 0) + 1
         roll_set.add(code)
 
 def _assemble_plan(roll_codes):
@@ -1550,7 +1693,9 @@ def _assemble_plan(roll_codes):
 
     cash_after = state["cash"] + sum(r["est_proceeds"] for r in sells)
     buys, alts = [], []
-    if not in_cash and is_rebal:
+    _assemble_plan.mp_cut = 0   # --min-pred 断链时留空的槽位数(仅供打印说明)
+    # fill-daily: 非换仓日有空槽位且现金够一手时也出补买建议 (与回测同义)。
+    if not in_cash and (is_rebal or FILL_DAILY):
         equity = cash_after + sum(r["shares"] * r["ref_close"] for r in keeps)
         denom = 1 if PERIODIC else HOLD_DAYS
         remaining = min(equity / denom, cash_after)
@@ -1558,11 +1703,30 @@ def _assemble_plan(roll_codes):
         held = {str(r["code"])[:6] for r in keeps}
         # 从已持仓数起算: 续持的那几只已经占着仓位, 不从 0 起算会超配
         bought = len(keeps)
+        # --ind-cap: 从留下的持仓(含刚续持的)起算各行业占用额度,
+        # 与回测 wf_v35 买入段同构: 行业满额→递补下一名(不同行业)。
+        # 递补而非留现金: 目标是把钱分散到别的行业, 而不是减仓。
+        _ind_cnt: dict = {}
+        if IND_CAP > 0:
+            for r in keeps:
+                _il = ind_of(r["code"], SIGNAL_DATE)
+                if _il is not None:
+                    _ind_cnt[_il] = _ind_cnt.get(_il, 0) + 1
         for code in ranked["code"]:
             if bought >= TRANCHE_N and len(alts) >= args.alternates:
                 break
+            # --min-pred: ranked 按 pred 降序, 第一个不达标之后全都不达标 —— 整段断,
+            # 空槽位不递补, 候补也同断(候补顶上也是买入, 弱信号一样不要)。
+            # 与回测 wf_v35 买入段同构: 那正是要避免的"买弱信号"。
+            if MIN_PRED > 0 and pred_map.get(code, -1.0) < MIN_PRED:
+                _assemble_plan.mp_cut = max(0, TRANCHE_N - bought)
+                break
             if code in held or code in blocked:
                 continue
+            if IND_CAP > 0 and bought < TRANCHE_N:
+                _il_buy = ind_of(code, SIGNAL_DATE)
+                if _il_buy is not None and _ind_cnt.get(_il_buy, 0) >= IND_CAP:
+                    continue
             ref = kl.px(code, SIGNAL_DATE, "close")
             if ref is None:
                 continue
@@ -1592,6 +1756,9 @@ def _assemble_plan(roll_codes):
                 cash_left -= gross + fee
                 remaining -= gross + fee
                 bought += 1
+                if IND_CAP > 0 and _il_buy is not None:
+                    # 买入占额: 与回测同构, 下一名同行业候选将被递补
+                    _ind_cnt[_il_buy] = _ind_cnt.get(_il_buy, 0) + 1
                 buys.append({"code": code, "name": names.get(code, ""),
                              "shares": shares, "ref_close": round(ref, 3),
                              "est_price": round(px, 3), "est_cost": round(gross + fee, 2),
@@ -1630,7 +1797,12 @@ print(f"  总资产   : ¥{equity_now:,.0f}  (现金 ¥{state['cash']:,.0f} + �
 print(f"  大盘     : 均价 {mkt_c:.2f} vs MA{args.regime_ma} {mkt_ma:.2f} | "
       f"广度 {breadth*100:.1f}% (阈值 {args.regime_breadth*100:.0f}%)")
 print(f"  择时     : {'空仓 (清掉全部持仓, 不开新仓)' if in_cash else '持仓'}"
-      f" | 今日{'是' if is_rebal else '非'}换仓日")
+      f" | 今日{'是' if is_rebal else '非'}换仓日"
+      f"{' | 闲钱日补+宽续持' + (f'前{ROLL_RANK}' if ROLL_RANK else '') if FILL_DAILY else ''}")
+if args.gate_ma60:
+    _ma60 = float(_r["mkt_ma60"].iloc[0]) if len(_r) and "mkt_ma60" in _r else float("nan")
+    print(f"  门控     : {'弱势态 → CGO 防守模型' if gate_weak else '强势态 → base 模型'}"
+          f" (指数 {mkt_c:.2f} vs MA60 {_ma60:.2f}, 确认{args.gate_confirm}天)")
 
 print(f"\n  ── 卖出 ({len(sell_plan)}) ──")
 if sell_plan:
@@ -1647,9 +1819,14 @@ if buy_plan:
         print(f"    {i}. {r['code']} {r['name']:<8} x{r['shares']:>6} 参考 {r['ref_close']:>8.2f} "
               f"约 ¥{r['est_cost']:>9,.0f}  pred={r['pred']:+.4f}")
     print(f"    合计约 ¥{sum(r['est_cost'] for r in buy_plan):,.0f} / 可用 ¥{cash_after_sell:,.0f}")
+    if getattr(_assemble_plan, "mp_cut", 0) > 0:
+        print(f"    (信号门槛 {MIN_PRED:g}: 余下候选 pred 不达标, "
+              f"{_assemble_plan.mp_cut} 个槽位留现金不递补)")
+elif getattr(_assemble_plan, "mp_cut", 0) > 0:
+    print(f"    无 (信号门槛 {MIN_PRED:g}: 全部候选 pred 不达标, 持现金等强信号)")
 elif in_cash:
     print("    无 (大盘弱势, 空仓等待)")
-elif not is_rebal:
+elif not is_rebal and not FILL_DAILY:
     print("    无 (非换仓日, 继续持有)")
 else:
     print("    无")
@@ -1700,6 +1877,11 @@ plan = {
     "ranked": list(ranked["code"].head(60)),
     "recommend": recommend,
     "blocked": sorted(blocked),
+    "min_pred": MIN_PRED,
+    "gate": ({"enabled": True, "weak": gate_weak,
+              "model": "cgo" if gate_weak else "base",
+              "rule": f"close<MA60 confirm{args.gate_confirm}"}
+             if args.gate_ma60 else {"enabled": False}),
     "config": fingerprint(),
     "generated_at": datetime.now().isoformat(timespec="seconds"),
 }

@@ -84,7 +84,9 @@ def _sec(t):
 
 def _rd(fp: Path, use):
     """编码不统一: 多数天是 GBK, 但实测 20241127/20250827 是 UTF-8 带 BOM。
-    编码猜错时列名解不出来, usecols 匹配为空, 会静默丢掉一整天, 所以必须逐个试。"""
+    编码猜错时列名解不出来, usecols 匹配为空, 会静默丢掉一整天, 所以必须逐个试。
+    2018-07~2019-05 供应商批次的列头逗号后带空格 (" 成交价格"), 精确匹配会静默
+    丢整天 (2026-08-19 回填 2017 时 136 天全军覆没查出来的), 所以匹配前先 strip。"""
     if not fp.exists():
         return None
     try:
@@ -95,12 +97,13 @@ def _rd(fp: Path, use):
     encs = ("utf-8-sig",) if bom == b"\xef\xbb\xbf" else ("gbk", "utf-8")
     for e in encs:
         try:
-            df = pd.read_csv(fp, encoding=e, usecols=lambda c: c in use,
+            df = pd.read_csv(fp, encoding=e,
+                             usecols=lambda c: c.strip() in use,
                              on_bad_lines="skip")
         except Exception:
             continue
         if len(df.columns):
-            return df
+            return df.rename(columns=lambda c: c.strip())
     return None
 
 
@@ -365,4 +368,9 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # htop 低调化 (见 scripts/proctitle.py)
+        from proctitle import lowkey
+        lowkey("mltask/feat")
+    except Exception:
+        pass
     main()

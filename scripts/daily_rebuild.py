@@ -56,6 +56,16 @@ USED_FEAT_NAN_LIMIT = 0.10
 # 注意: 这份名单与 live_signal 里的实现存在漂移风险, 改那边记得同步这里。
 RUNTIME_FEAT_PREFIXES = ("ovn_", "overnight_", "intraday_", "mkt_")
 
+# 增广层列: feature_engine 不产、由 §4.2/§4.3 在矩阵替换后每晚重加。
+# 新建的 tmp 矩阵必然没有这些列, 缺列校验要豁免, 否则第二晚起每晚误拦。
+AUGMENT_COLS = {
+    # §4.2 build_cgo_augmented (GF1 门控已于 08-27 关闭, 列建而不用, 留复开接口)
+    "cgo_rec", "cgo_60", "cgo_250", "ovh_120", "cgo_delta_5d", "mkt_cgo",
+    # §4.3 build_t1_augmented (T1A/T1B 分点分配, 2026-08-31 起)
+    "t1a_big_buy_ma5", "t1a_long_buy_ma5", "t1a_big_sell_ma5", "t1a_long_sell_ma5",
+    "t1b_ovn20", "t1b_ovn60", "t1b_intra20", "t1b_intra60",
+}
+
 # 已知的"死特征": 在整个训练集上恒为常量, 毫无信息量。
 # 成因: dde_net / mtss_balance / fund_flow 三列原本来自 thsdk(同花顺), 该源停后
 # feature_engine 的 fillna(0) 把"源列不存在"静默变成了"值为0", 于是整段历史被抹平。
@@ -135,17 +145,25 @@ def train_max_date(path):
 
 
 def live_used_features():
-    """读线上模型实际使用的特征列表 (FEATURES_FROM 里的 selected_features)。
+    """读线上模型实际使用的特征并集 (全局 FEATURES_FROM ∪ 各线 features-from)。
 
-    取不到就返回 None, 调用方退回到"全表 NaN 比例"的旧口径, 宁可粗糙也不能不校验。
+    2026-09-01 分点分配后部分线用自己的特征表(T1A/T1B 增广列), 校验口径必须是
+    全部在用特征的并集 —— 只看全局表会漏掉增广列, §4.3 的"在用则硬失败"
+    布防会失效。全部表都读不到才返回 None(调用方退回"全表 NaN 比例"旧口径);
+    个别表读失败只记日志 —— 那条线自己会在信号时刻响亮地死(live_signal 找不到
+    特征源直接 SystemExit), 不会静默出错信号。
     """
-    try:
-        d = json.loads((PROC / FEATURES_FROM).read_text(encoding="utf-8"))
-        feats = d.get("selected_features")
-        return list(feats) if feats else None
-    except Exception as e:
-        log(f"警告: 读取特征集 {FEATURES_FROM} 失败 ({e}), 退回全表NaN口径")
-        return None
+    files = [FEATURES_FROM] + sorted(
+        {p["features-from"] for p in PROFILES.values() if p.get("features-from")})
+    feats = []
+    for f in files:
+        try:
+            d = json.loads((PROC / f).read_text(encoding="utf-8"))
+            feats += [c for c in (d.get("selected_features") or [])
+                      if c not in feats]
+        except Exception as e:
+            log(f"警告: 读取特征集 {f} 失败 ({e})")
+    return feats or None
 
 
 def validate_new_train(new_path, old_path, require_advance=True):
@@ -173,7 +191,7 @@ def validate_new_train(new_path, old_path, require_advance=True):
         if new["code"].nunique() < old["code"].nunique() * 0.95:
             problems.append(f"股票数缩水: {new['code'].nunique()} < 旧{old['code'].nunique()}")
         old_cols = set(pd.read_parquet(old_path).columns)
-        missing = old_cols - set(new.columns)
+        missing = old_cols - set(new.columns) - AUGMENT_COLS
         if missing:
             problems.append(f"缺列 {len(missing)} 个: {sorted(missing)[:8]}")
 
@@ -190,8 +208,10 @@ def validate_new_train(new_path, old_path, require_advance=True):
         # tk_* 逐笔列不在基础 v24 矩阵里 —— 它们由 §4.5 的 build_tick_augmented
         # 基于本矩阵另行加列, 存在性/覆盖率在 §4.5 里检。在这里要求会误拦
         # (2026-08-16 彩排实拍: 切 V24PUT 后本校验报"在用特征缺列 11 个 tk_*")。
+        # t1a_*/t1b_* 同理: 由 §4.3 的 build_t1_augmented 加列并自检末日覆盖率,
+        # 本校验跑在 §4.3 之前, 在这里要求同样会误拦。
         if used is not None:
-            used = [c for c in used if not c.startswith("tk_")]
+            used = [c for c in used if not c.startswith(("tk_", "t1a_", "t1b_"))]
         if used is None:
             if all_nan > len(new.columns) * 0.3:
                 problems.append(f"最新日全NaN列过多: {all_nan}/{len(new.columns)}")
@@ -268,14 +288,16 @@ def main():
     if not a.skip_kline:
         if a.full_market:
             # scope=all 已是 519 池的超集, 不必再单独拉一遍
+            # --start 必须 >= update_kline_akshare.START_DATE 的历史保留线,
+            # 全量重拉覆盖机制下写 20190101 会抹掉 2017-18 回填段 (2026-08-19 扩窗)
             run([PY, "-u", "scripts/update_kline_akshare.py",
-                 "--scope", "all", "--start", "20190101",
+                 "--scope", "all", "--start", "20161201",
                  "--procs", str(a.procs), "--timeout", "25"],
                 "kline_full_market", timeout=7200)
         else:
             run([PY, "-u", "scripts/update_kline_akshare.py",
                  "--scope", "universe", "--watchlist", WATCHLIST,
-                 "--start", "20190101", "--procs", str(a.procs), "--timeout", "25"],
+                 "--start", "20161201", "--procs", str(a.procs), "--timeout", "25"],
                 "kline_universe", timeout=3600)
     else:
         stage("kline", ok=True, skipped=True)
@@ -392,6 +414,41 @@ def main():
     stage("swap_train", ok=True, path=str(train_path))
     log(f"训练集已更新 -> {info['max_date']}")
 
+    # ── 4.2 CGO 行为特征增广 (GF1-G1 门控融合的数据层, 2026-08-22 起) ──
+    # feature_engine 每晚从头重建矩阵, 会丢掉增广列, 所以这里每晚重加。
+    # 加在 §4.5 之前: build_tick_augmented 原样保留 source 列, tick1 自动继承。
+    # 失败策略: 只有存在开了 gate-ma60 的条线才硬失败(当晚宁可无信号也不让门控线
+    # 拿缺列矩阵出错信号); 没人用门控时失败只记 stage —— 不能让新增功能拖垮全线。
+    _gate_users = [pid for pid, p in PROFILES.items() if p.get("gate-ma60")]
+    try:
+        run([PY, "-u", "scripts/build_cgo_augmented.py", "--source", TRAIN_FILE],
+            "build_cgo", timeout=3600)
+    except Exception as e:
+        if _gate_users:
+            raise RuntimeError(
+                f"CGO 增广失败而 {_gate_users} 开着 gate-ma60, 当晚宁可无信号: {e}")
+        log(f"WARN CGO 增广失败(当前无条线用门控, 不中断): {e}")
+        stage("build_cgo", ok=False, error=str(e)[:300])
+
+    # ── 4.3 T1A/T1B 增广 (分点分配的数据层, 2026-08-31 起) ──
+    # 同 §4.2 的道理: 加在 §4.5 之前, build_tick_augmented 原样保留 source 列,
+    # tick1 自动继承。T1A 四列源头在 eez040 的 t1a_daily 面板(随逐笔日更链
+    # rsync 过来), T1B 四列只靠本机 qfq kline。
+    # 失败策略与 §4.2 同构但自动化: 看在用的特征里有没有这些列, 而不是看
+    # 某个开关 —— 分点分配一旦把某条线切到 T1A/T1B 特征表, 硬失败就自动上膜,
+    # 不靠人记得回来改这里。目前(列建而不用)失败只记 stage。
+    _t1_used = sorted(c for c in (live_used_features() or [])
+                      if c.startswith(("t1a_", "t1b_")))
+    try:
+        run([PY, "-u", "scripts/build_t1_augmented.py", "--source", TRAIN_FILE],
+            "build_t1", timeout=3600)
+    except Exception as e:
+        if _t1_used:
+            raise RuntimeError(
+                f"T1 增广失败而线上在用 {_t1_used[:4]}, 当晚宁可无信号: {e}")
+        log(f"WARN T1 增广失败(当前无条线在用这些列, 不中断): {e}")
+        stage("build_t1", ok=False, error=str(e)[:300])
+
     # ── 4.5 逐笔增广矩阵 (线上全部条线的输入, 2026-08-16 起) ──
     # 逐笔特征面板由 eez040 抽取后 rsync 到本机 data/processed/tick_micro/
     # (链路见 scripts/tick_daily_extract.py 头注), 这里在干净的 v24 之上加列,
@@ -459,6 +516,11 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # htop 低调化 (见 scripts/proctitle.py)
+        from proctitle import lowkey
+        lowkey("mltask/etl")
+    except Exception:
+        pass
     try:
         sys.exit(main())
     except Exception as e:

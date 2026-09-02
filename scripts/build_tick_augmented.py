@@ -22,6 +22,7 @@
     python scripts/build_tick_augmented.py --lag 0 --source training_data_pit_v24.parquet
 """
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +30,9 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 PROC = ROOT / "data" / "processed"
-MICRO = PROC / "tick_micro"
+# TICK_MICRO_DIR 环境变量可指向其他抽取目录(如 tick_micro_1500 扩容实验、
+# 评分池 tick_micro_ext)。默认不变, 生产链路不受影响。
+MICRO = Path(os.environ.get("TICK_MICRO_DIR", PROC / "tick_micro"))
 
 # 逐笔抽取器产出的列里, 这些是纯价格水平, 矩阵已有等价物, 不再重复引入
 DROP = {"code", "date", "close", "vwap", "prev_close", "day_amt"}

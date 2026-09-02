@@ -144,7 +144,8 @@ def build_one(base, force):
 
     # 挂单计划也要搬 —— 否则网页上这条线看不到"明天该买什么"
     n = 0
-    for pp in sorted(LIVE.glob(f"plan_{src}_*.json")):
+    # [0-9] 锁日期段: 防 plan_<pid>_* 误扫到 pid 为前缀的其它线
+    for pp in sorted(LIVE.glob(f"plan_{src}_[0-9]*.json")):
         date = pp.name[len(f"plan_{src}_"):]
         tgt = LIVE / f"plan_{base}_{date}"
         plan = json.loads(pp.read_text(encoding="utf-8"))

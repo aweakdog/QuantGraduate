@@ -9,7 +9,7 @@ import urllib.error as ue
 import urllib.parse as up
 import urllib.request as ur
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8737"
 PW = sys.argv[2] if len(sys.argv) > 2 else ""
 
 jar = cj.CookieJar()

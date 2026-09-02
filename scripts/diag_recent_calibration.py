@@ -47,7 +47,7 @@ def main():
     a = ap.parse_args()
 
     # ── 1. 最近推荐的重合度 ──
-    plans = sorted(glob.glob(str(LIVE / f"plan_{a.profile}_*.json")))[-6:]
+    plans = sorted(glob.glob(str(LIVE / f"plan_{a.profile}_[0-9]*.json")))[-6:]
     picks = {}
     for p in plans:
         d = json.load(open(p))

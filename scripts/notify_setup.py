@@ -110,7 +110,7 @@ def main():
             "· 执行日 14:35 催下单(会 @所有人)\n"
             "· 盘后预告下一个交易日要做什么\n"
             "· 催回填成交价\n\n"
-            "http://eez041.ece.ust.hk:8080/",
+            "http://eez041.ece.ust.hk:8737/",
             meta={"slot": "setup", "urgent": False})
         print("结果:", "成功, 去群里看看" if ok else "失败, 见上面的错误")
         return 0 if ok else 1

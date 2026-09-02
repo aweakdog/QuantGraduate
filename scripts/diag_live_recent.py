@@ -82,7 +82,7 @@ def main():
     ap.add_argument("--universe", default="", help="留空则用 plan 里记录的池")
     a = ap.parse_args()
 
-    plans = sorted(glob.glob(str(LIVE / f"plan_{a.profile}_*.json")))[-a.days:]
+    plans = sorted(glob.glob(str(LIVE / f"plan_{a.profile}_[0-9]*.json")))[-a.days:]
     if not plans:
         raise SystemExit(f"没找到 plan_{a.profile}_*.json")
 

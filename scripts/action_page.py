@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import macro_calendar
 import trading_calendar
 from live_config import (DEFAULT_PROFILE, PROFILES, capital_of, display_name,
                          is_auto, is_locked, main_board_only, state_file)
@@ -123,8 +124,12 @@ def _load_json(p: Path):
 
 
 def _plan_glob(pid):
-    """计划文件名与 live_signal.PLAN_PREFIX 的命名规则保持一致"""
-    return f"plan_{pid}_*.json"
+    """计划文件名与 live_signal.PLAN_PREFIX 的命名规则保持一致。
+
+    日期段锁死首字符是数字([0-9]): 否则 plan_aggr2w_*.json 会把
+    plan_aggr2w_px2_*.json 一并扫进来, 且 px2 字典序排在日期后面,
+    aggr2w 页面会把 PX2 的建仓单当成自己的最新计划(2026-08-18 线上事故)。"""
+    return f"plan_{pid}_[0-9]*.json"
 
 
 def _latest_plan(live_dir: Path, pid):
@@ -246,15 +251,32 @@ def _freshness(root: Path, state, plan):
     }
 
 
-def list_profiles():
-    """给前端做切换用的简表"""
+def list_profiles(allowed=None):
+    """给前端做切换用的简表。
+
+    allowed 非 None(账户口令会话)时只列这些线 —— 前端卡片/切换列表
+    都源于这张表, 过滤在这里做一次, 其他线对该会话就不存在。"""
     return [{"id": k, "name": display_name(k), "default_name": v["name"],
              # capital 用生效值而不是代码默认值 —— 网页上重置时可能改过
              "capital": capital_of(k), "default_capital": v["capital"],
              "positions": v["tranche-n"],
              "main_board_only": main_board_only(k),
+             # 开户日 = 这条线上站的日期(代码静态字段, 重置不变)
+             "opened": v.get("opened"),
              "desc": v["desc"], "auto": is_auto(k), "locked": is_locked(k)}
-            for k, v in PROFILES.items()]
+            for k, v in PROFILES.items() if allowed is None or k in allowed]
+
+
+def _resolve_pid(pid, allowed):
+    """把请求的 pid 落到会话可见范围内。
+
+    账户口令越权/缺省时不报错而是落到其名下第一条线 —— 登录后的
+    首次请求带不带 profile 都能直接看到自己的东西。"""
+    if allowed is None:
+        return pid if pid in PROFILES else DEFAULT_PROFILE
+    if pid in allowed:
+        return pid
+    return DEFAULT_PROFILE if DEFAULT_PROFILE in allowed else next(iter(allowed))
 
 
 def _quote_map(plan):
@@ -275,6 +297,54 @@ def _quote_map(plan):
     return m
 
 
+def _day_quotes(root: Path, codes):
+    """每只股最近两根日线收盘 -> 今日盈亏的原料。
+
+    返回 {code6: {"prev":, "last":, "date": "YYYY-MM-DD"}}。读的是入库
+    前复权日线(与模型/参考价同源); 除权日前复权价整体同幅平移,
+    相邻两天的差仍近似真实当日涨跌。文件缺失/行数不足的股不出现
+    在结果里(前端显示 --), 不编数字。"""
+    out = {}
+    kdir = root / "data" / "raw" / "kline"
+    for c6 in codes:
+        p = kdir / f"{c6}.parquet"
+        if not p.exists():
+            continue
+        # 库里两种列名并存: 新抓的是 date/close, 旧文件是 时间/收盘价
+        # (api_kline 同样两边兼容)
+        kl = None
+        for cols in (["date", "close"], ["时间", "收盘价"]):
+            try:
+                kl = pd.read_parquet(p, columns=cols).set_axis(
+                    ["date", "close"], axis=1)
+                break
+            except Exception:
+                continue
+        if kl is None:
+            continue
+        kl = kl.sort_values("date").tail(2)
+        if len(kl) < 2:
+            continue
+        prev = float(kl["close"].iloc[0])
+        last = float(kl["close"].iloc[1])
+        if prev > 0 and last > 0:
+            out[c6] = {"prev": prev, "last": last,
+                       "date": str(pd.Timestamp(kl["date"].iloc[1]).date())}
+    return out
+
+
+def _sold_name(live: Path, pid, sig_date, c6):
+    """卖出股的名字: 最新 plan 已不含它, 去它被卖出那天的计划里找"""
+    if not sig_date:
+        return ""
+    d = _load_json(live / f"plan_{pid}_{sig_date}.json") or {}
+    for grp in ("sell", "hold"):
+        for r in (d.get(grp) or []):
+            if str(r.get("code"))[:6] == c6 and r.get("name"):
+                return r["name"]
+    return ""
+
+
 def _equity_of(state, plan):
     """总资产 = 现金 + Σ(股数 x 最新参考价)。拿不到行情才退回成本价。
 
@@ -291,7 +361,7 @@ def _equity_of(state, plan):
     return float(st.get("cash") or 0) + mv
 
 
-def build_recommend(root: Path, pid=None):
+def build_recommend(root: Path, pid=None, allowed=None):
     """每日推荐看板: 模型当天打分最高的股票。
 
     模型排序与本金/持仓数无关, 但主板-only 的线(skip-boards)模型不同,
@@ -300,7 +370,7 @@ def build_recommend(root: Path, pid=None):
     的会被跳过。所以这里按当前 profile 标出 affordable, 避免照榜买入后
     发现根本买不了。
     """
-    pid = pid if pid in PROFILES else DEFAULT_PROFILE
+    pid = _resolve_pid(pid, allowed)
     prof = PROFILES[pid]
     live = root / "data" / "live"
     plan = _latest_plan(live, pid)
@@ -343,7 +413,7 @@ def build_recommend(root: Path, pid=None):
         "profile": pid,
         "profile_name": display_name(pid),
         "auto": is_auto(pid),
-        "profiles": list_profiles(),
+        "profiles": list_profiles(allowed),
         "signal_date": (plan or {}).get("signal_date"),
         "exec_when": _rec_win["when_text"],
         "exec_day_text": _rec_win["day_text"],
@@ -356,16 +426,44 @@ def build_recommend(root: Path, pid=None):
     }
 
 
-def build_today(root: Path, pid=None):
+def _macro_events(plan, win):
+    """信号日起 14 天内的宏观事件, 并标出信号盲区。
+
+    盲区 = 数据截止(信号日 15:00 收盘)之后、本单成交(执行日 14:50)之前
+    发生的事件 —— 这段时间里的新信息, 这份计划一概不知。按事件在收盘前
+    还是收盘后发生(after_close)分三种情形:
+      信号日当天    盘后发生才算盲区(沃什 22:00) ; 上午的中国 PMI 已进收盘价
+      两日之间      一律算盲区(隔天、周末、长假)
+      执行日当天    盘前/盘中发生才算盲区(你 14:50 才下单, 已经受影响);
+                    盘后事件轮不到影响这一单, 是下一单的事
+    分这一层是为了让警示条只在真盲区亮 —— 否则每月底 PMI 都误报, 天天亮就没人看了。
+    """
+    sig = (plan or {}).get("signal_date")
+    exec_d = (win or {}).get("exec_date")
+    evs = macro_calendar.upcoming(start=sig, horizon_days=14)
+    for e in evs:
+        d, after = e["date"], e.get("after_close")
+        if not (sig and exec_d) or not (sig <= d <= exec_d):
+            e["in_blind"] = False
+        elif d == sig:
+            e["in_blind"] = bool(after)
+        elif d == exec_d:
+            e["in_blind"] = not after
+        else:
+            e["in_blind"] = True
+    return evs
+
+
+def build_today(root: Path, pid=None, allowed=None):
     """把 state + plan + pipeline_status 归一化成"明天该做什么"。"""
-    pid = pid if pid in PROFILES else DEFAULT_PROFILE
+    pid = _resolve_pid(pid, allowed)
     prof = PROFILES[pid]
     live = root / "data" / "live"
     state = _load_json(live / state_file(pid))
     plan = _latest_plan(live, pid)
     if state is None:
         return {"profile": pid, "profile_name": display_name(pid),
-                "auto": is_auto(pid), "profiles": list_profiles(),
+                "auto": is_auto(pid), "profiles": list_profiles(allowed),
                 "action": "init", "headline": "这条线还没建仓",
                 "subline": f"本金 {prof['capital']:,.0f} / {prof['tranche-n']} 只, "
                            f"还没初始化。跑 init_profiles.py 建立。",
@@ -452,7 +550,75 @@ def build_today(root: Path, pid=None):
             # 成本价必须取 state.lots 而不是 plan —— 校准持仓改的就是它,
             # 而 plan 是出信号那一刻的快照, 校准后不会更新
             "buy_price": round(bp, 3) if bp else None,
+            # 买入执行日: 今日盈亏要用它判断"今天刚买的"
+            "open_date": lot.get("open_date"),
         })
+    # ── 今日盈亏: 最新交易日 vs 前一交易日, 逐股 + 合计 ──
+    # 口径 (三条都是为了"今天这个账户真赚了多少"对得上真实账户):
+    # 1) 存量持仓 = 昨收 -> 今收;
+    # 2) 今天刚买的 = 买入价 -> 今收 (隔夜跳空不是你的盈亏);
+    # 3) 今天卖掉的保留显示一天 = 昨收 -> 卖出成交价 (只算存量会把
+    #    这块漏掉, 合计就对不上号, 用户 2026-08-18 指出)。
+    # "今日"基准日 = 各相关股 K 线最新日期的最大值; 停牌股 K 线停在
+    # 更早的日子, 当天没交易, 变动记 0 但不显示百分比。
+    sold_fills = []
+    for ent in (state.get("history") or []):
+        if ent.get("exec_date") and ent.get("fills"):
+            for f in ent["fills"]:
+                if f.get("action") == "sell" and (f.get("shares") or 0) > 0:
+                    sold_fills.append(
+                        (ent["exec_date"], ent.get("signal_date"), f))
+    # 只可能展示"最新一批"卖出, 老的不查行情
+    last_exec = max((e for e, _, _ in sold_fills), default=None)
+    sold_fills = [t for t in sold_fills if t[0] == last_exec]
+
+    dq = _day_quotes(root, {h["code"] for h in hold} |
+                           {str(f.get("code"))[:6] for _, _, f in sold_fills})
+    day_date = max((v["date"] for v in dq.values()), default=None)
+    day_pnl = 0.0
+    day_base = 0.0
+    for h in hold:
+        q = dq.get(h["code"])
+        if not q:
+            h["day_chg"] = None
+            h["day_pct"] = None
+            continue
+        if q["date"] != day_date:
+            h["day_chg"] = 0.0
+            h["day_pct"] = None
+            continue
+        bought_today = (h.get("open_date") == day_date
+                        and (h.get("buy_price") or 0) > 0)
+        base = h["buy_price"] if bought_today else q["prev"]
+        h["bought_today"] = bought_today
+        chg = (q["last"] - base) * (h["shares"] or 0)
+        h["day_chg"] = round(chg, 2)
+        h["day_pct"] = round(q["last"] / base * 100 - 100, 2)
+        day_pnl += chg
+        day_base += base * (h["shares"] or 0)
+
+    # 今天卖掉的: 幽灵行, 只活一天 (基准日前进后 exec_date 对不上就消失)
+    sold_today = []
+    if day_date and last_exec == day_date:
+        for _, sig_d, f in sold_fills:
+            c6 = str(f.get("code"))[:6]
+            q = dq.get(c6)
+            px = f.get("price") or 0
+            sh = f.get("shares") or 0
+            row = {"code": c6,
+                   "name": name_src.get(c6) or _sold_name(live, pid, sig_d, c6),
+                   "shares": sh,
+                   "sell_price": round(px, 3) if px else None,
+                   "day_chg": None, "day_pct": None}
+            # 卖出日的"昨收" = 卖出日前一根 K 线, 恰好是 dq 的 prev
+            if q and q["date"] == day_date and px > 0 and q["prev"] > 0:
+                chg = (px - q["prev"]) * sh
+                row["day_chg"] = round(chg, 2)
+                row["day_pct"] = round(px / q["prev"] * 100 - 100, 2)
+                day_pnl += chg
+                day_base += q["prev"] * sh
+            sold_today.append(row)
+
     in_cash = bool((plan or {}).get("in_cash"))
     is_rebal = bool((plan or {}).get("is_rebal"))
 
@@ -504,6 +670,9 @@ def build_today(root: Path, pid=None):
             "quote_ok": r.get("quote_ok", True),
             "amount": round(sh * px, 0) if px else None,
             "pnl_pct": r.get("pnl_pct"),
+            "day_chg": r.get("day_chg"),
+            "day_pct": r.get("day_pct"),
+            "bought_today": r.get("bought_today", False),
             "held_days": r.get("held_days"),
             "tenure_days": r.get("tenure_days"),
             "n_rolled": r.get("n_rolled"),
@@ -534,7 +703,7 @@ def build_today(root: Path, pid=None):
         # 计划刚出、执行日还没到时提交是没法结算的(没有执行日行情),
         # 前端据此把打勾锁住, 免得用户白填一遍。
         "can_confirm": (not is_auto(pid)) and bool(state.get("awaiting_confirm")),
-        "profiles": list_profiles(),
+        "profiles": list_profiles(allowed),
         "action": action,
         "headline": headline,
         "subline": subline,
@@ -553,6 +722,9 @@ def build_today(root: Path, pid=None):
         "sell": [_fmt_row(r, "sell") for r in sell],
         "buy": [_fmt_row(r, "buy") for r in buy],
         "hold": [_fmt_row(r, "hold") for r in hold],
+        # 今天刚卖掉的, 保留显示一天: 它们从昨收到成交价的变动是今日
+        # 盈亏的一部分, 不显示的话合计数字对不上号
+        "sold_today": sold_today,
         "alternates": [_fmt_row(r, "alt") for r in ((plan or {}).get("alternates") or [])],
         "account": {
             "equity": round(equity, 2),
@@ -564,6 +736,11 @@ def build_today(root: Path, pid=None):
             # 存款同额加进 cash 和 initial_capital, 相减后盈亏不变。
             # 所以做过出入金的条线应以这个数为准。
             "total_pnl": round(equity - init_cap, 2) if init_cap else None,
+            # 持仓的今日盈亏(最新交易日 vs 前一日, 只含当前持仓,
+            # 不含当天已卖出的实现盈亏)。空仓/无行情时为 null。
+            "day_pnl": round(day_pnl, 2) if day_date else None,
+            "day_pnl_pct": round(day_pnl / day_base * 100, 2) if day_base else None,
+            "day_date": day_date,
         },
         # 这条线的参数换过几次。换过就意味着上面的累计收益横跨多段不同策略,
         # 那个百分比不对应任何单一策略 —— 必须在页面上说出来, 否则又是一个
@@ -580,6 +757,11 @@ def build_today(root: Path, pid=None):
             "main_board_only": main_board_only(pid),
         },
         "freshness": fresh,
+        # 宏观日历: 模型只看 A 股量价, 对 FOMC/非农这类事件全盲(2026-08-28
+        # 沃什周五盘后放鹰, 周一计划里的黄金集群 -7~9%)。从信号日起列两周,
+        # 落在 信号日..执行日 的标 in_blind —— 那段是计划看不见的窗口,
+        # 人工确认成交前该扫一眼再决定照不照单。
+        "macro_events": _macro_events(plan, win),
         "market": {
             "breadth": (plan or {}).get("breadth"),
             "mkt_close": (plan or {}).get("mkt_close"),
@@ -614,6 +796,8 @@ ACTION_HTML = """<!DOCTYPE html>
   .prof .pn{font-size:14px;font-weight:600;color:#e8eaed}
   .prof .pm{font-size:11px;color:#6f7889;margin-top:2px}
   .prof .pr{font-size:13px;font-weight:600;margin-top:3px}
+  .prof.ptog{border-style:dashed;background:transparent}
+  .prof.ptog .pn{color:#8a93a6}
   /* 记账方式徽标: 纸面=自动按行情, 实盘=等你确认成交 */
   .mode{display:inline-block;font-size:10px;font-weight:700;padding:1px 5px;
         border-radius:4px;margin-left:4px;vertical-align:middle}
@@ -833,7 +1017,9 @@ ACTION_HTML = """<!DOCTYPE html>
   </div>
   <div id="app"></div>
   <div class="foot">
-    数据每天收盘后自动更新 · <a href="/pro">运维仪表盘</a><br>
+    数据每天收盘后自动更新 · <a href="/pro">运维仪表盘</a> ·
+    <a href="/machines">机器监控</a> ·
+    <a href="javascript:void(0)" onclick="switchLogin()">退出登录</a><br>
     <span id="gen"></span>
     <div class="disc">本站信息仅供参考，不构成任何投资建议</div>
   </div>
@@ -848,6 +1034,23 @@ const $ = s => document.querySelector(s);
 let PID  = localStorage.getItem('pid')  || '';
 let VIEW = localStorage.getItem('view') || 'act';
 let PROFS = [];
+
+// 账户口令会话的「看全部/只看自己」切换。
+// SCOPE = 名下线列表(后端每次响应里给), 全站身份为 null 不显示切换。
+// 切到看全部只多了"看": 改账按钮对非名下的线隐掉, 后端也会拒。
+let SCOPE = null;
+let SHOWALL = localStorage.getItem('showall') === '1';
+const canEdit = pid => !SCOPE || SCOPE.includes(pid);
+
+function toggleAll(){
+  SHOWALL = !SHOWALL;
+  localStorage.setItem('showall', SHOWALL ? '1' : '0');
+  // 收回来时如果正停在别人的线上, 跳回自己的第一条
+  if (!SHOWALL && SCOPE && !SCOPE.includes(PID)){
+    PID = SCOPE[0]; localStorage.setItem('pid', PID);
+  }
+  load();
+}
 
 // 勾选状态按 条线+信号日 隔离: 换了一天或换了条线都不会串
 let DAY = '';
@@ -874,6 +1077,18 @@ const money = v => v == null ? '--' : '¥' + Number(v).toLocaleString('zh-CN',{m
 // 价格一律 2 位小数 —— 后台给的是 round(,3), 直接展示会出现 12.3 和 12.345
 // 混在一起, 两列对不齐。报价本身就是分精度, 2 位不丢信息。
 const px2 = v => (v == null || v === 0) ? '--' : Number(v).toFixed(2);
+
+// 今日盈亏的带色小件: 金额(可选百分比), 红涨绿跌, 无数据显示 --。
+// 金额 < 100 时保留 2 位小数 —— 小账户单股一天就几块钱, 取整就成 0 了。
+function dayTxt(chg, pct){
+  if (chg == null) return '<span style="color:#5e6675">--</span>';
+  const cls = chg > 0 ? 'pos' : (chg < 0 ? 'neg' : '');
+  const s = chg > 0 ? '+' : (chg < 0 ? '-' : '');
+  const n = Math.abs(chg);
+  const amt = n < 100 ? n.toFixed(2) : Number(n).toLocaleString('zh-CN', {maximumFractionDigits: 0});
+  const p = pct == null ? '' : ` (${pct > 0 ? '+' : ''}${pct}%)`;
+  return `<span class="${cls}">${s}${amt}${p}</span>`;
+}
 
 // 操作行有三种形态, 取决于记账方式:
 //   纸面模式        -> 只读, 不给打勾。打勾不影响账目, 给了勾反而误导
@@ -1010,16 +1225,31 @@ function holdRow(r){
   const sign = p == null ? '' : (p >= 0 ? '+' : '');
   return `<div class="hold-row">
     <div style="flex:1;min-width:0">
-      <div class="nm">${esc(r.name||r.code)} <span style="color:#6f7889;font-size:12px">${r.code}</span></div>
+      <div class="nm">${esc(r.name||r.code)} <span style="color:#6f7889;font-size:12px">${r.code}</span>${
+        r.bought_today?'<span class="mode mode-mb" title="今天刚买入, 今日盈亏从买入价算起">今买</span>':''}</div>
       <div class="meta">成本 ${px2(r.buy_price)} → 现 ${r.quote_ok === false
         ? '<span style="color:#a1662f">无行情</span>' : px2(r.ref_price)}</div>
       <div class="meta">${holdMeta(r)}</div></div>
     <div class="${cls}" style="text-align:right;font-weight:600">${sign}${p==null?'--':p+'%'}
-         <div class="meta">${money(r.amount)}</div></div>
-    ${curProf().locked ? '' : `<div class="fix" title="校准成本价/股数"
+         <div class="meta">${money(r.amount)}</div>
+         <div class="meta">今日 ${dayTxt(r.day_chg, r.day_pct)}</div></div>
+    ${(curProf().locked || !canEdit(PID)) ? '' : `<div class="fix" title="校准成本价/股数"
          onclick="askFix('${r.code}','${esc(r.name||'')}',${r.shares},${r.buy_price||0})">⚙</div>
       <div class="del" title="删除这笔持仓"
          onclick="askDrop('${r.code}','${esc(r.name||'')}',${r.shares},${r.ref_price||0})">✕</div>`}
+  </div>`;
+}
+
+// 今天刚卖掉的股票: 保留显示一天(灰行)。它从昨收到卖出成交价的变动
+// 是今日盈亏的一部分 —— 不显示的话, 合计和逐行对不上号。
+function soldRow(r){
+  return `<div class="hold-row" style="opacity:.6">
+    <div style="flex:1;min-width:0">
+      <div class="nm">${esc(r.name||r.code)} <span style="color:#6f7889;font-size:12px">${r.code}</span>
+        <span class="mode mode-lock">今日已卖出</span></div>
+      <div class="meta">卖出价 ${px2(r.sell_price)} · ${r.shares} 股</div></div>
+    <div style="text-align:right;font-weight:600">
+      <div class="meta">今日 ${dayTxt(r.day_chg, r.day_pct)}</div></div>
   </div>`;
 }
 
@@ -1193,6 +1423,15 @@ function toast(msg, ms){
 
 function closeModal(){ $('#modal').innerHTML = ''; }
 
+// 退出当前口令, 回登录页换一个身份。典型场景: 这台手机之前用公共口令
+// 登过(cookie 还活着), 现在想用自己的账户口令进自己的页。
+// 顺手清掉记住的条线: 下一个身份未必看得到上一个身份的线。
+async function switchLogin(){
+  try{ await fetch('/api/view/logout', {method:'POST'}); }catch(e){}
+  localStorage.removeItem('pid');
+  location.reload();
+}
+
 // 所有改账操作都要口令。401 时弹密码框, 输对了自动重试原操作,
 // 这样用户不会因为"密码过期"丢掉刚填的表单内容。
 async function api(path, body){
@@ -1245,14 +1484,22 @@ function askPassword(){
 const curProf = () => PROFS.find(p => p.id === PID) || {};
 
 function renderProfs(active){
-  $('#profs').innerHTML = PROFS.map(p => `
+  let h = PROFS.map(p => `
     <div class="prof ${p.id===active?'on':''}" onclick="setPid('${p.id}')">
       <div class="pn">${esc(p.name)}<span class="mode ${p.locked?'mode-lock':(p.auto?'mode-auto':'mode-man')}">${
         p.locked?'基准':(p.auto?'纸面':'实盘')}</span>${
         p.main_board_only?'<span class="mode mode-mb">主板</span>':''}</div>
       <div class="pm">${p.positions} 只 · 每只 ${money(
         (p.equity != null ? p.equity : p.capital) / p.positions)}</div>
+      ${p.opened?`<div class="pm">开户 ${p.opened}</div>`:''}
     </div>`).join('');
+  // 账户口令: 卡片区末尾追一个切换钥, 不用重输口令就能来回跳
+  if (SCOPE) h += `
+    <div class="prof ptog" onclick="toggleAll()">
+      <div class="pn">${SHOWALL ? '↩ 只看自己' : '◎ 看全部'}</div>
+      <div class="pm">${SHOWALL ? '回到名下账户' : '浏览所有线 · 只能看'}</div>
+    </div>`;
+  $('#profs').innerHTML = h;
   renderActs();
 }
 
@@ -1262,6 +1509,14 @@ let ACCT = {};
 function renderActs(){
   const p = curProf();
   if (!p.id){ $('#acts').innerHTML = ''; return; }
+  // 看全部模式下停在别人的线上: 只能看, 改账按钮全部不给
+  // (后端 _write_deny 同样会拒, 这里只是别让人白点)。
+  if (!canEdit(p.id)){
+    $('#acts').innerHTML = `
+      <div class="lockbox">这是别人的线 · 只能看。确认成交、改账都要到
+        「只看自己」里自己的线上操作。</div>`;
+    return;
+  }
   // 基准线: 一个写操作按钮都不给。后端同样会拒, 这里只是别让人白点。
   if (p.locked){
     $('#acts').innerHTML = `
@@ -1636,13 +1891,22 @@ async function pollRun(okMsg){
   toast('耗时偏长, 请稍后刷新');
 }
 
+// 两个数据接口共用的 query: 当前线 + 账户会话的「看全部」标记
+// (全站身份带 all=1 是无害空转, 首次加载 SCOPE 未知时也不会错)
+function dataQuery(){
+  const ps = [];
+  if (PID) ps.push('profile=' + PID);
+  if (SHOWALL) ps.push('all=1');
+  return ps.length ? '?' + ps.join('&') : '';
+}
+
 async function loadRec(){
-  const q = PID ? ('?profile=' + PID) : '';
   let d;
-  try { d = await (await fetch('/api/recommend' + q)).json(); }
+  try { d = await (await fetch('/api/recommend' + dataQuery())).json(); }
   catch(e){ $('#app').innerHTML = '<div class="warn">无法连接服务器</div>'; return; }
 
-  PID = d.profile; PROFS = d.profiles || PROFS; renderProfs(PID);
+  PID = d.profile; PROFS = d.profiles || PROFS;
+  SCOPE = d.viewer_scope || null; renderProfs(PID);
   LASTD = d;                     // recRow 要用 exec_day_text 拼"X日买"标签
   $('#sigdate').textContent = d.signal_date ? ('信号日 ' + d.signal_date) : '';
   $('#gen').textContent = '';
@@ -1667,12 +1931,12 @@ async function loadRec(){
 }
 
 async function loadAct(){
-  const q = PID ? ('?profile=' + PID) : '';
   let d;
-  try { d = await (await fetch('/api/today' + q)).json(); }
+  try { d = await (await fetch('/api/today' + dataQuery())).json(); }
   catch(e){ $('#app').innerHTML = '<div class="warn">无法连接服务器</div>'; return; }
 
-  PID = d.profile; PROFS = d.profiles || PROFS; renderProfs(PID);
+  PID = d.profile; PROFS = d.profiles || PROFS;
+  SCOPE = d.viewer_scope || null; renderProfs(PID);
   LASTD = d;                     // 资金链重算要用到当前计划与账户
   DAY = d.signal_date || 'na';
   $('#sigdate').textContent = d.signal_date ? ('信号日 ' + d.signal_date) : '';
@@ -1692,8 +1956,8 @@ async function loadAct(){
       <div class="cfs">这条线是<b style="color:#fcd34d">实盘模式</b>，
         在你确认之前<b>不会记账、也不会出新计划</b>。` +
       (hasOrders ? `<br>请在下面的操作清单里给成交了的打勾。</div>`
-                 : `<br>当天没有需要买卖的单子。</div>
-        <div class="btn btn-pri" onclick="submitTicked(true)">确认无操作, 继续</div>`) +
+                 : `<br>当天没有需要买卖的单子。</div>` +
+        (canEdit(PID) ? `<div class="btn btn-pri" onclick="submitTicked(true)">确认无操作, 继续</div>` : '')) +
       `</div>`;
   }
 
@@ -1715,6 +1979,14 @@ async function loadAct(){
   // 横幅已经把原因说完了(stale / await 两种), 不再重复一遍
   if (d.freshness && d.freshness.stale && d.action !== 'stale' && d.action !== 'await')
     h += `<div class="warn">${d.freshness.note}</div>`;
+
+  // 信号盲区警示: 落在 信号日..执行日 的宏观事件, 这份计划生成时看不见。
+  // 只在真有盲区事件时才出现 —— 平时不给页面加噪音。
+  const blindEv = (d.macro_events||[]).filter(e => e.in_blind);
+  if (blindEv.length)
+    h += `<div class="warn" style="background:#2a2312;border-color:#7c5310;color:#fcd34d">
+      信号盲区有宏观事件: ${blindEv.map(e => `${e.name}(${e.date.slice(5)})`).join('、')}<br>
+      <span style="color:#b0a172">这份计划生成时不知道这些事 —— 照单执行前自己掂量。</span></div>`;
 
   // 操作清单。打勾的含义完全取决于记账方式, 所以标题和说明也跟着变
   if (d.sell.length || d.buy.length){
@@ -1762,7 +2034,9 @@ async function loadAct(){
       h += `<div class="money" id="moneybox">${moneyChain(d)}</div>`;
     }
 
-    if (mode === 'confirm'){
+    if (mode === 'confirm' && !canEdit(PID)){
+      h += `<div class="cfs">这条线在等持有人自己确认成交, 你只能看。</div>`;
+    } else if (mode === 'confirm'){
       h += `<div class="mbtns">
           <div class="btn" onclick="submitTicked(true)">一笔都没成交</div>
           <div class="btn btn-pri" onclick="submitTicked(false)">提交打勾的成交</div>
@@ -1778,9 +2052,13 @@ async function loadAct(){
     h += `</div>`;
   }
 
-  // 持仓
-  h += `<div class="card"><h2>当前持仓 · ${d.hold.length} 只</h2>`;
+  // 持仓。标题行带合计今日盈亏 —— 用户最常问的就是"今天赚了多少"。
+  const aD = d.account || {};
+  const dayHdr = aD.day_pnl == null ? '' :
+    ` <span style="font-size:13px;font-weight:400">· 今日 ${dayTxt(aD.day_pnl, aD.day_pnl_pct)}</span>`;
+  h += `<div class="card"><h2>当前持仓 · ${d.hold.length} 只${dayHdr}</h2>`;
   h += d.hold.length ? d.hold.map(holdRow).join('') : '<div class="empty">空仓</div>';
+  h += (d.sold_today||[]).map(soldRow).join('');
   h += `</div>`;
 
   // 账户
@@ -1790,6 +2068,8 @@ async function loadAct(){
   const pl = a.total_pnl;
   h += `<div class="card"><h2>账户</h2><div class="grid">
       <div class="kv"><div class="k">总资产</div><div class="v">${money(a.equity)}</div></div>
+      <div class="kv"><div class="k">今日盈亏${a.day_date ? ' · ' + a.day_date.slice(5) : ''}</div>
+        <div class="v">${dayTxt(a.day_pnl, a.day_pnl_pct)}</div></div>
       <div class="kv"><div class="k">累计盈亏</div>
         <div class="v ${pl==null?'':(pl>=0?'pos':'neg')}">${
           pl==null?'--':(pl>=0?'+':'-')+money(Math.abs(pl)).slice(1)}</div></div>
@@ -1799,6 +2079,22 @@ async function loadAct(){
       <div class="kv"><div class="k">现金</div><div class="v">${money(a.cash)}</div></div>
       <div class="kv"><div class="k">持仓市值</div><div class="v">${money(a.market_value)}</div></div>
     </div>${epochNote(d)}</div>`;
+
+  // 宏观日历: 未来两周的例行大事 + A股长假。模型对它们全盲, 这里只是
+  // 把日子摆出来给人看, 不做任何预测或建议。
+  const mev = d.macro_events || [];
+  if (mev.length){
+    h += `<div class="card"><h2>宏观日历 · 未来两周</h2>`;
+    h += mev.map(e => `<div class="hold-row"><div style="min-width:0">
+        <div class="nm">${e.name}${e.approx ? ' <span style="color:#6f7889">(约)</span>' : ''}${
+          e.in_blind ? ' <span class="chip chip-no">信号盲区</span>' : ''}</div>${
+        e.note ? `<div class="meta">${e.note}</div>` : ''}</div>
+      <div style="color:#8a93a6;font-size:13px;flex:0 0 auto;margin-left:10px">${
+        e.date.slice(5)} ${e.weekday}</div></div>`).join('');
+    h += `<div style="font-size:12px;color:#6f7889;line-height:1.7;margin-top:8px">
+      模型只看A股量价, 以上事件它一概不知。「信号盲区」= 事件落在信号生成之后、
+      执行之前(含信号日晚间) —— 出大事时可以选择不照单执行。</div></div>`;
+  }
 
   // 该条线的方案与数据状态
   const f = d.freshness || {};
@@ -1810,6 +2106,7 @@ async function loadAct(){
         持仓 <b style="color:#c9cdd6">${s.positions||'--'} 只</b> ·
         每 <b style="color:#c9cdd6">${s.hold_days||'--'} 个交易日</b>整体换仓 ·
         每只预算 <b style="color:#c9cdd6">${money(s.per_slot_budget)}</b><br>
+        在网站开户 <b style="color:#c9cdd6">${curProf().opened||'--'}</b><br>
         记账方式 <b style="color:${d.auto?'#86efac':'#fcd34d'}">${
           d.auto ? '纸面 · 每天按行情自动记账' : '实盘 · 等你确认真实成交'}</b>
       </div>

@@ -39,7 +39,7 @@ from action_page import PROFILES, build_today, display_name, is_auto  # noqa: E4
 from notify_channels import get_channel, load_config  # noqa: E402
 
 SENT_PATH = ROOT / "data" / "live" / "notify_sent.json"
-SITE_URL = "http://eez041.ece.ust.hk:8080/"
+SITE_URL = "http://eez041.ece.ust.hk:8737/"
 
 SLOTS = ("preclose", "signal", "confirm")
 

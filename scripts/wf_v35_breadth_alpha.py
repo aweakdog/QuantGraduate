@@ -28,6 +28,12 @@ warnings.filterwarnings("ignore")
 import lightgbm as lgb
 
 ROOT = Path(__file__).resolve().parents[1]
+
+try:  # htop 低调化: 显示题名而非完整命令行 (见 scripts/proctitle.py)
+    from proctitle import lowkey
+    lowkey("mltask/worker")
+except Exception:
+    pass
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -93,6 +99,14 @@ parser.add_argument("--regime-breadth", type=float, default=0.40,
                     help="广度阈值: 全市场收盘价站上MA20的比例低于此值视为弱势")
 parser.add_argument("--regime-confirm", type=int, default=2,
                     help="连续N个信号日满足条件才切换状态(双向), 抑制来回打脸")
+parser.add_argument("--regime-reenter", type=float, default=0.0,
+                    help="滞回回场阈值: 空仓后需广度连续确认 ≥ 此值才回场; 离场仍用 "
+                         "--regime-breadth。中间是死区(状态保持)。0=关闭。仅 breadth 过滤")
+parser.add_argument("--regime-soft-low", type=float, default=0.0,
+                    help="半仓档下限: 广度在 [此值, regime-breadth) 时不清仓, 新买槽位压到 "
+                         "--regime-soft-n; 低于此值才全清。0=关闭。仅 breadth 过滤")
+parser.add_argument("--regime-soft-n", type=int, default=2,
+                    help="半仓档保留的买入槽位数 (配合 --regime-soft-low)")
 parser.add_argument("--train-file", type=str, default="training_data_v24.parquet",
                     help="训练集文件名 (data/processed/ 下)")
 parser.add_argument("--train-start", type=str, default=None,
@@ -100,6 +114,16 @@ parser.add_argument("--train-start", type=str, default=None,
                          "用于在同一份数据上隔离'训练历史长度'这一个变量: 矩阵/股票池/"
                          "特征全不变, 只截短模型能看到的历史。注意 MIN_TRAIN_DAYS 仍需满足, "
                          "截短后首个出信号日会相应推后")
+parser.add_argument("--train-years", type=float, default=None,
+                    help="滑动训练窗: 每次重训只用 cutoff 往前 N 年内的样本 (365.25*N 天)。"
+                         "与 --train-start 可叠加 (取交集)。默认 None = expanding 全历史。"
+                         "动机: 2026-08-20 三点连线实测窗B牛市 alpha 随训练起点变旧单调衰减"
+                         "(2022+/+77% -> 2019+/-1% -> 2017+/-2.5%), expanding 窗在生产里"
+                         "会随年头自然积累旧市况数据, 滑窗是结构性对冲")
+parser.add_argument("--train-halflife-years", type=float, default=None,
+                    help="样本时间衰减权重: w = 0.5^(样本距 cutoff 的年龄/H)。与滑窗答同一"
+                         "问题(遗忘速度)但衰减平滑, 旧样本保留微弱贡献。None=等权。"
+                         "可与 --train-years/--train-start 叠加")
 parser.add_argument("--pit-universe", type=str, default=None,
                     help="PIT 股票池 parquet (data/universe/ 下), 如 universe_pit.parquet; "
                          "开启后每行样本只保留当期生效成分股, 训练/预测/基准均受约束")
@@ -116,6 +140,11 @@ parser.add_argument("--roll-rank", type=int, default=0,
                          "只有进前 TRANCHE_N 名才续持。买入门槛不变(仍只买最强的)。"
                          "从第2名滑到第7名的股不再值得新买, 但也不值得付往返成本换掉。"
                          "0 = 关闭(等于 TRANCHE_N, 旧行为)")
+parser.add_argument("--rank-stop", type=int, default=0,
+                    help="排名止损: 未到期持仓若跌出当日预测排名前 K 名就卖出（信息口径与"
+                         "续持判定完全一致, 同日先卖后买）。腾出的槽位由 --fill-daily 在"
+                         "买入段立即补买(新批次自带独立 5 日到期时钟)。只对未到期批次"
+                         "生效, 到期批次仍走 roll/卖出老逻辑。0 = 关闭")
 parser.add_argument("--save-preds", type=str, default=None,
                     help="把逐日模型预测结果缓存到此 pickle (data/processed/ 下)")
 parser.add_argument("--load-preds", type=str, default=None,
@@ -148,9 +177,29 @@ parser.add_argument("--max-chase", type=float, default=0.0,
                          "用来模拟实盘挂限价单的真实成交 —— 回测默认假设 100% 按"
                          "执行日收盘价成交, 而实盘跳空高开的票打不到限价位。"
                          "0 = 关闭(维持原假设)")
+parser.add_argument("--gap-skip", type=float, default=0.0,
+                    help="下跌跳空弃买: 执行日价格比信号日收盘价低超过该比例就不买, "
+                         "且该槽位留现金不递补 (如 0.03 = 低开3%以上就放弃)。"
+                         "动机: 信号是隔夜/周末利空落地前生成的(2026-08-28 沃什盘后"
+                         "放鹰, 周一黄金集群 -7~9%), 便宜可能不是机会而是信息。"
+                         "与 --max-chase 同构反向。0 = 关闭")
+parser.add_argument("--holiday-flat", type=int, default=0,
+                    help="长假前清仓: 下一交易日距执行日 >= N 个自然日时, 该执行日"
+                         "收盘卖出全部持仓且不开新仓, 节后首个交易日立即重建。"
+                         "动机: 长假里宏观照发不误而 A 股无法反应(国庆最长 9 天)。"
+                         "参考: 4=含清明/端午等 3 天小长假, 6=只管春节/国庆/五一。"
+                         "0 = 关闭")
 parser.add_argument("--fill-daily", action="store_true",
                     help="空槽位逐日补买: 非换仓日若持仓 < TRANCHE_N 且当日有过门槛的候选,"
                     " 立即补买(新批次自带 5 日到期时钟)。与 --min-pred 搭配使用")
+parser.add_argument("--ind-cap", type=int, default=0,
+                    help="行业集中度上限: 组合内每个申万一级行业最多持 N 只。0 = 不限。"
+                    " 买入候选与续持名单都受约束: 超限的候选顺位递补下一名(不同行业),"
+                    " 已持仓超限的到期不续持。无行业归属的股(罕见)不计数不受限")
+parser.add_argument("--ind-map", type=str,
+                    default="raw/tushare/sw_member/sw_member.parquet",
+                    help="申万行业 PIT 成分表路径(相对 data/ 或绝对), 需含"
+                         " ts_code/l1_name/in_date/out_date; 按信号日判归属")
 parser.add_argument("--export-matrix", type=str, default=None,
                     help="把准备好的训练矩阵(含市场/隔夜特征、demean标签、选定特征列)导出到 "
                          "data/processed/ 下的 parquet(+同名.meta.json), 然后退出。"
@@ -199,9 +248,12 @@ REBAL_OFFSET = args.rebal_offset % HOLD_DAYS
 NO_ROLL = args.no_roll
 LOT_FLEX = args.lot_flex
 ROLL_RANK = args.roll_rank
+RANK_STOP = args.rank_stop
 MIN_PRED = args.min_pred
 FILL_DAILY = args.fill_daily
 MAX_CHASE = args.max_chase
+GAP_SKIP = args.gap_skip
+HOLIDAY_FLAT = args.holiday_flat
 SKIP_BOARDS = tuple(s.strip() for s in args.skip_boards.split(",") if s.strip())
 SKIP_CASH = args.skip_boards_mode == "cash"
 TARGET_POSITIONS = TRANCHE_N if PERIODIC else HOLD_DAYS * TRANCHE_N
@@ -321,24 +373,54 @@ def compute_market_features():
 
 
 def build_regime_state(regime_src):
-    """大盘 regime -> 每个信号日的空仓布尔值 (只用截至当日的信息, PIT 安全)
+    """大盘 regime -> (空仓布尔序列, 半仓布尔序列|None) (只用截至当日的信息, PIT 安全)
 
     弱势判定:
       ma      : 全市场平均收盘价跌破 MA(regime_ma)
       breadth : 站上均线的个股比例 < regime_breadth
     切换需连续 regime_confirm 天确认(进出双向), 避免震荡市反复空/满仓。
+
+    --regime-reenter R: 滞回 —— 离场仍用 breadth < regime_breadth, 但回场要求
+      breadth 连续 k 天 >= R (R > 离场阈值)。中间是死区(状态保持), 堵的是
+      "阈值附近来回鞭打"的往返成本。仅支持 breadth 过滤。
+    --regime-soft-low L: 半仓档 —— 三态状态机(同样 k 天确认):
+      breadth < L → 全清仓; [L, regime_breadth) → 不清仓但新买槽位压到
+      --regime-soft-n; >= regime_breadth → 满配。只管买入侧, 已持仓按普通
+      到期/续持规则处理。仅支持 breadth; 与 --regime-reenter 互斥(单变量归因)。
     """
     if args.regime_filter == "off":
-        return None
+        return None, None
+    if (args.regime_reenter > 0 or args.regime_soft_low > 0) and args.regime_filter != "breadth":
+        raise SystemExit("--regime-reenter / --regime-soft-low 仅支持 --regime-filter breadth")
+    if args.regime_reenter > 0 and args.regime_soft_low > 0:
+        raise SystemExit("--regime-reenter 与 --regime-soft-low 不可同用 (单变量归因)")
     r = regime_src.set_index("date").sort_index()
+    k = max(1, args.regime_confirm)
+    if args.regime_soft_low > 0:
+        b = r["breadth_above_ma"]
+        zone = pd.Series(np.where(b < args.regime_soft_low, 2,
+                                  np.where(b < args.regime_breadth, 1, 0)),
+                         index=b.index)
+        zone[b.isna()] = 0
+        state, run_z, run_n = 0, -1, 0
+        cash, soft = {}, {}
+        for d in r.index:
+            z = int(zone.loc[d])
+            run_z, run_n = (z, run_n + 1) if z == run_z else (z, 1)
+            if run_n >= k and z != state:
+                state = z
+            cash[d], soft[d] = state == 2, state == 1
+        return pd.Series(cash), pd.Series(soft)
     trend_bad = r["mkt_close"] < r[f"mkt_ma{args.regime_ma}"]
     breadth_bad = r["breadth_above_ma"] < args.regime_breadth
     raw = {"ma": trend_bad, "breadth": breadth_bad,
            "both": trend_bad & breadth_bad, "any": trend_bad | breadth_bad}[args.regime_filter]
     raw = raw.fillna(False)
-    k = max(1, args.regime_confirm)
+    good = ~raw                                           # 默认: 回场条件 = 离场条件取反
+    if args.regime_reenter > 0:
+        good = (r["breadth_above_ma"] >= args.regime_reenter).fillna(False)
     turn_off = raw.rolling(k).min().fillna(0) == 1        # 连续k天弱 -> 空仓
-    turn_on = (~raw).rolling(k).min().fillna(0) == 1      # 连续k天不弱 -> 回场
+    turn_on = good.rolling(k).min().fillna(0) == 1        # 连续k天达回场条件 -> 回场
     state, out = False, {}
     for d in r.index:
         if not state and bool(turn_off.loc[d]):
@@ -346,7 +428,7 @@ def build_regime_state(regime_src):
         elif state and bool(turn_on.loc[d]):
             state = False
         out[d] = state
-    return pd.Series(out)
+    return pd.Series(out), None
 
 
 def compute_overnight_features(codes):
@@ -657,7 +739,7 @@ if SKIP_BOARDS and not args.load_preds:
 
 print("构建增强特征...")
 mkt_df, mkt_features, regime_src = compute_market_features()
-regime_state = build_regime_state(regime_src)
+regime_state, regime_soft_state = build_regime_state(regime_src)
 df = df.merge(mkt_df, on="date", how="left")
 for c in mkt_features:
     df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -771,6 +853,12 @@ if regime_state is not None:
     _rs = regime_state.loc[(regime_state.index >= pd.Timestamp(TEST_START))]
     print(f"大盘空仓过滤: {args.regime_filter} (MA{args.regime_ma}, 广度<{args.regime_breadth:.0%}, "
           f"确认{args.regime_confirm}天) | 回测期内弱势日占比 {_rs.mean()*100:.1f}%")
+    if args.regime_reenter > 0:
+        print(f"  滞回: 回场需广度≥{args.regime_reenter:.0%} (离场<{args.regime_breadth:.0%}, 中间死区保持)")
+    if regime_soft_state is not None:
+        _ss = regime_soft_state.loc[(regime_soft_state.index >= pd.Timestamp(TEST_START))]
+        print(f"  半仓档: 广度∈[{args.regime_soft_low:.0%},{args.regime_breadth:.0%}) 槽位{args.regime_soft_n} "
+              f"| 回测期内半仓日占比 {_ss.mean()*100:.1f}%")
 else:
     print("大盘空仓过滤: 关")
 
@@ -837,9 +925,17 @@ for i, pred_date in enumerate([] if args.load_preds else dates):
     _tr_mask = (df["date"] < cutoff) & df[LABEL].notna()
     if TRAIN_START is not None:
         _tr_mask &= df["date"] >= TRAIN_START
+    if args.train_years is not None:
+        _tr_mask &= df["date"] >= cutoff - pd.Timedelta(days=args.train_years * 365.25)
     train_df = df[_tr_mask]
     if train_df["date"].nunique() < MIN_TRAIN_DAYS:
         continue
+
+    def _age_w(dser):
+        if args.train_halflife_years is None:
+            return None
+        age_y = (cutoff - dser).dt.days / 365.25
+        return np.power(0.5, age_y / args.train_halflife_years).values
 
     if args.objective == "rank":
         tdf = train_df.sort_values("date", kind="mergesort")
@@ -847,10 +943,11 @@ for i, pred_date in enumerate([] if args.load_preds else dates):
         y = tdf.groupby("date")[LABEL].transform(to_buckets)
         groups = tdf.groupby("date", sort=True).size().values
         model = lgb.LGBMRanker(**LOCKED_PARAMS, label_gain=list(range(RANK_BUCKETS)))
-        model.fit(X, y, group=groups)
+        model.fit(X, y, group=groups, sample_weight=_age_w(tdf["date"]))
     else:
         X = train_df.groupby("code")[features].transform(lambda c: c.ffill().fillna(0))
-        model = lgb.LGBMRegressor(**LOCKED_PARAMS).fit(X, train_df[LABEL])
+        model = lgb.LGBMRegressor(**LOCKED_PARAMS).fit(
+            X, train_df[LABEL], sample_weight=_age_w(train_df["date"]))
 
     tm = df["date"] == pred_date
     Xt = df.loc[tm, features].fillna(0)
@@ -945,6 +1042,48 @@ n_below_thresh = 0           # 因信号强度门槛留空的槽位次数 (--min
 n_daily_fill = 0             # 非换仓日补买成交笔数 (--fill-daily)
 n_board_skip = 0             # 因板块权限跳过的候选次数 (--skip-boards)
 n_chase_skip = 0             # 因涨太多放弃买入的槽位次数 (--max-chase)
+n_gap_skip = 0               # 因低开太多放弃买入的槽位次数 (--gap-skip)
+n_holiday_days = 0           # 因长假清仓规则强制空仓的天数 (--holiday-flat)
+n_ind_skip = 0               # 因行业上限跳过的候选次数 (--ind-cap, 买入段)
+n_ind_roll_out = 0           # 因行业上限被踢出续持名单的次数 (--ind-cap)
+
+# ── --ind-cap: 申万一级行业 PIT 查询表 ──
+# 区间表小(每股 1~3 段), 线性扫描 + 全量缓存足够快。归属按信号日判定:
+# in_date 是公告日口径, 信号日已知, 无未来函数。
+IND_CAP = args.ind_cap
+_ind_intervals: dict = {}
+_ind_cache: dict = {}
+if IND_CAP > 0:
+    _imp = Path(args.ind_map)
+    if not _imp.is_absolute():
+        _imp = DATA_DIR / _imp
+    _sw = pd.read_parquet(_imp)
+    _sw["c6"] = _sw["ts_code"].astype(str).str[:6]
+    _sw["in_date"] = pd.to_datetime(_sw["in_date"], errors="coerce")
+    _sw["out_date"] = pd.to_datetime(_sw["out_date"], errors="coerce").fillna(
+        pd.Timestamp("2099-12-31"))
+    _sw = _sw.dropna(subset=["l1_name", "in_date"])
+    for _r in _sw.itertuples():
+        _ind_intervals.setdefault(_r.c6, []).append(
+            (_r.in_date, _r.out_date, _r.l1_name))
+    print(f"  行业上限: 每申万一级最多持 {IND_CAP} 只 "
+          f"(PIT 成分表 {len(_ind_intervals)} 股, {_imp.name})")
+
+
+def ind_of(code, d):
+    """申万一级行业归属 (PIT, 按日期 d); 查不到返 None"""
+    c6 = str(code)[:6]
+    key = (c6, d)
+    hit = _ind_cache.get(key, "\x00")
+    if hit != "\x00":
+        return hit
+    r = None
+    for _i, _o, _nm in _ind_intervals.get(c6, ()):
+        if _i <= d <= _o:
+            r = _nm
+            break
+    _ind_cache[key] = r
+    return r
 if MIN_PRED > 0 and daily_preds and daily_preds[0].get("pred_vals") is None:
     raise SystemExit("ERROR: --min-pred 需要带 pred_vals 的 v2 预测缓存, "
                      "当前缓存是旧格式(只存排名)")
@@ -977,9 +1116,23 @@ for i, (dp, exec_date) in enumerate(sched):
             if ic_cash and np.mean(_avail[-10:]) > 0:
                 ic_cash = False
     regime_cash = bool(regime_state.get(dp["date"], False)) if regime_state is not None else False
+    # 长假前清仓(--holiday-flat): 看的是【执行日】到下一交易日的自然日间隔。
+    # 假期安排提前公布, 信号日晚上就知道"明天是节前最后一个交易日", 无未来函数。
+    # 节后首日由 was_in_cash 机制触发 is_rebal 立即重建, 不额外等换仓日。
+    holiday_cash = False
+    if HOLIDAY_FLAT > 0:
+        _gp_h = date_pos.get(d)
+        if _gp_h is not None and _gp_h + 1 < len(all_dates):
+            _gap_nat = (pd.Timestamp(all_dates[_gp_h + 1]) - pd.Timestamp(d)).days
+            holiday_cash = _gap_nat >= HOLIDAY_FLAT
+            n_holiday_days += int(holiday_cash)
     was_in_cash = in_cash
-    in_cash = ic_cash or regime_cash
+    in_cash = ic_cash or regime_cash or holiday_cash
     n_cash_days += int(in_cash)
+    # 半仓档: 只压新买槽位数, 卖出/续持规则不变; 每槽尺寸仍是 1/TRANCHE_N
+    day_cap = TRANCHE_N
+    if regime_soft_state is not None and bool(regime_soft_state.get(dp["date"], False)):
+        day_cap = min(TRANCHE_N, max(1, args.regime_soft_n))
 
     pos_size = 1.0
     if args.vol_target and mkt_position is not None and dp["date"] in mkt_position.index:
@@ -1006,6 +1159,9 @@ for i, (dp, exec_date) in enumerate(sched):
         # --roll-rank: 卖出门槛比买入宽。新买仍只买前 TRANCHE_N 名,
         # 但已持仓只要没掉出前 M 名就不卖 (避免为微小排名变化付往返成本)
         _lim = max(TRANCHE_N, ROLL_RANK) if ROLL_RANK else TRANCHE_N
+        # --ind-cap: 续持名单也按行业限额填 —— 否则超配行业的持仓永远在
+        # 前 M 名里续持, 上限就永远收不到目标水位。同一把尺子量买入与续持。
+        _ind_cnt_roll: dict = {}
         for code in dp["ranked"]:
             if len(roll_set) >= _lim:
                 break
@@ -1013,15 +1169,32 @@ for i, (dp, exec_date) in enumerate(sched):
                 continue
             if SKIP_BOARDS and str(code).startswith(SKIP_BOARDS):
                 continue          # 买不了的板块不可能持有, 也不占目标名单位置
+            if IND_CAP > 0:
+                _il = ind_of(code, dp["date"])
+                if _il is not None:
+                    if _ind_cnt_roll.get(_il, 0) >= IND_CAP:
+                        n_ind_roll_out += 1
+                        continue
+                    _ind_cnt_roll[_il] = _ind_cnt_roll.get(_il, 0) + 1
             roll_set.add(code)
 
     # ── 1. 卖出到期批次 (持满 HOLD_DAYS) ──
     sell_fee = 0.0
     keep = []
     rolled_lots = []          # 本轮续持的, 稍后要把权重配平回等权
+    # --rank-stop: 未到期持仓跌出前 K 名即卖。排名查询表每日建一次;
+    # 不在当日截面里的(停牌无预测/出池)视为跌出 —— 停牌卖不成会被下面
+    # 的停牌检查留住, 次日重试, 不会丢失持仓。
+    day_rank = None
+    if RANK_STOP and not in_cash:
+        day_rank = {c: k for k, c in enumerate(dp["ranked"])}
     for lot in lots:
         matured = (i - lot["open_idx"]) >= HOLD_DAYS
-        if not (matured or in_cash):
+        rank_out = False
+        if day_rank is not None and not matured:
+            _rp = day_rank.get(lot["code"])
+            rank_out = _rp is None or _rp >= RANK_STOP
+        if not (matured or in_cash or rank_out):
             keep.append(lot)
             continue
         if matured and not in_cash and lot["code"] in roll_set:
@@ -1047,7 +1220,8 @@ for i, (dp, exec_date) in enumerate(sched):
         trade_log.append({"date": dstr, "signal_date": sig_str, "code": lot["code"],
                           "action": "sell", "shares": lot["shares"], "price": px,
                           "gross": gross, "fee": fee, "net": gross - fee,
-                          "reason": "matured"})
+                          "reason": "rank_stop" if (rank_out and not matured
+                                                    and not in_cash) else "matured"})
     lots = keep
 
     # ── 2. 开新批次: 用 1/HOLD_DAYS 的权益买 TRANCHE_N 只 ──
@@ -1121,8 +1295,15 @@ for i, (dp, exec_date) in enumerate(sched):
         if MIN_PRED > 0:
             _pv = dp.get("pred_vals")
             _pred_of = dict(zip(dp["ranked"], _pv)) if _pv else {}
+        # --ind-cap: 从当前持仓(含刚续持的)起算各行业占用额度
+        _ind_cnt: dict = {}
+        if IND_CAP > 0:
+            for _l in lots:
+                _il = ind_of(_l["code"], dp["date"])
+                if _il is not None:
+                    _ind_cnt[_il] = _ind_cnt.get(_il, 0) + 1
         for code in dp["ranked"]:
-            if bought >= TRANCHE_N:
+            if bought >= day_cap:
                 break
             # 信号强度门槛: ranked 按 pred 降序, 第一个不达标的之后全都不达标。
             # 留空的槽位不沿排名退而求其次 —— 那正是要避免的"买弱信号"。
@@ -1142,6 +1323,14 @@ for i, (dp, exec_date) in enumerate(sched):
                     remaining -= alloc
                     bought += 1
                 continue                # 递补模式: 直接看下一名
+            _il_buy = None
+            if IND_CAP > 0:
+                # 行业满额 -> 递补下一名(不同行业)。递补而非留现金:
+                # 目标就是把钱分散到别的行业, 而不是减仓。
+                _il_buy = ind_of(code, dp["date"])
+                if _il_buy is not None and _ind_cnt.get(_il_buy, 0) >= IND_CAP:
+                    n_ind_skip += 1
+                    continue
             px = get_px(klines, code, d, EXEC_FIELD)
             if px is None:                          # 停牌/无行情
                 rejected_buy += 1
@@ -1166,6 +1355,17 @@ for i, (dp, exec_date) in enumerate(sched):
                     alloc = remaining / (TRANCHE_N - bought)
                     remaining -= alloc      # 预算留住, 不流给后面的槽位
                     bought += 1             # 槽位算被占用: 不递补
+                    continue
+            # 下跌跳空弃买(--gap-skip): 与 --max-chase 同构反向。信号生成于
+            # 隔夜/周末利空落地之前, 执行时已大幅低开的票, 便宜未必是机会。
+            # 同样留现金不递补 —— 递补等于把钱流给排名更弱的信号。
+            if GAP_SKIP > 0:
+                _sig_px_g = get_px(klines, code, dp["date"], "close")
+                if _sig_px_g and (px / _sig_px_g - 1) < -GAP_SKIP:
+                    n_gap_skip += 1
+                    alloc = remaining / (TRANCHE_N - bought)
+                    remaining -= alloc
+                    bought += 1
                     continue
             px = fill_px(px, "buy")
             alloc = remaining / (TRANCHE_N - bought)
@@ -1192,6 +1392,8 @@ for i, (dp, exec_date) in enumerate(sched):
             lots.append({"code": code, "shares": shares, "buy_price": px, "open_idx": i})
             held.add(code)
             bought += 1
+            if IND_CAP > 0 and _il_buy is not None:
+                _ind_cnt[_il_buy] = _ind_cnt.get(_il_buy, 0) + 1
             if not is_rebal:
                 n_daily_fill += 1
             trade_log.append({"date": dstr, "signal_date": sig_str, "code": code,
@@ -1333,10 +1535,13 @@ json.dump({
     "min_train_days": MIN_TRAIN_DAYS,
     "regime_filter": args.regime_filter, "regime_ma": args.regime_ma,
     "regime_breadth": args.regime_breadth, "regime_confirm": args.regime_confirm,
+    "regime_reenter": args.regime_reenter,
+    "regime_soft_low": args.regime_soft_low, "regime_soft_n": args.regime_soft_n,
     "reversal_guard": args.reversal_guard,
     "lot_flex": LOT_FLEX,
-    "roll_rank": ROLL_RANK,
+    "roll_rank": ROLL_RANK, "rank_stop": RANK_STOP,
     "min_pred": MIN_PRED, "fill_daily": FILL_DAILY, "max_chase": MAX_CHASE,
+    "gap_skip": GAP_SKIP, "holiday_flat": HOLIDAY_FLAT,
     "exclude_feats": sorted(_extra_excl),
     "skip_boards": list(SKIP_BOARDS), "skip_boards_mode": args.skip_boards_mode,
     "features": len(features), "selected_features": features,
@@ -1370,6 +1575,11 @@ json.dump({
         "n_daily_fill": n_daily_fill,
         "n_board_skip": n_board_skip,
         "n_chase_skip": n_chase_skip,
+        "n_gap_skip": n_gap_skip,
+        "n_holiday_days": n_holiday_days,
+        "n_ind_skip": n_ind_skip,
+        "n_ind_roll_out": n_ind_roll_out,
+        "ind_cap": IND_CAP,
         "cash_days": n_cash_days,
         "cash_days_pct": round(100 * n_cash_days / n, 1) if n else 0.0,
         "beat_benchmark": bool(excess.mean() > 0),

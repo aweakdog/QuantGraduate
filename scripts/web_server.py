@@ -10,7 +10,7 @@
   GET  /api/history→ 历史成交记录
 
 用法:
-  python scripts/web_server.py --host 0.0.0.0 --port 8080
+  python scripts/web_server.py --host 0.0.0.0 --port 8737
 """
 import argparse
 import asyncio
@@ -36,10 +36,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import access_log  # noqa: E402
 from action_page import (ACTION_HTML, _exec_window, build_recommend,  # noqa: E402
                          build_today, list_profiles)
-from live_config import (DEFAULT_PROFILE, PROFILES, capital_of,  # noqa: E402
-                         display_name, init_args, is_auto, is_locked,
-                         set_auto, set_capital, set_name, signal_args,
-                         state_file)
+from live_config import (ACCESS_CODES, DEFAULT_PROFILE, PROFILES,  # noqa: E402
+                         capital_of, display_name, init_args, is_auto,
+                         is_locked, set_auto, set_capital, set_name,
+                         signal_args, state_file)
 
 # ── 路径 ──
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,11 +105,35 @@ def _view_sign_ro(exp: int) -> str:
     return hmac.new(key, f"{exp}.ro".encode(), hashlib.sha256).hexdigest()[:32]
 
 
-def _view_role(req: Request):
-    """返回 "full" / "ro" / None。
+# ── 口令表 (live_config.ACCESS_CODES) 的 token ──
+# 格式 "exp.c.cid.sig": cid 只是口令的不可逆短标识(选密钥用),
+# 真正的验证在 sig —— 每个口令一把独立密钥(掺口令本身),
+# 改/删哪个口令只作废哪个口令的会话, 不影响其他人。
 
-    两种 token 格式: 完整权限沿用 "exp.sig"(旧 cookie 不失效),
-    只读为 "exp.ro.sig"。"""
+
+def _code_id(code: str) -> str:
+    return hashlib.sha256(("view-code:" + code).encode()).hexdigest()[:10]
+
+
+def _view_sign_code(exp: int, code: str) -> str:
+    key = ("view-code:" + code).encode()
+    return hmac.new(key, f"{exp}.c.{_code_id(code)}".encode(),
+                    hashlib.sha256).hexdigest()[:32]
+
+
+_CODE_BY_ID = {_code_id(c): c for c in ACCESS_CODES}
+
+
+def _view_role(req: Request):
+    """返回会话身份:
+        "full"          旧环境变量口令 (看全站, 改账另过 ops 口令)
+        "ro"            全站只读 (213213 或旧环境变量 ro)
+        "admin"         全站可写 (611611)
+        ("acct", code)  账户口令, 只及 ACCESS_CODES[code]["pids"]
+        None            未登录
+
+    三种 token 格式: "exp.sig"(旧full) / "exp.ro.sig"(旧ro) /
+    "exp.c.cid.sig"(口令表), 旧 cookie 都不失效。"""
     tok = req.cookies.get(VIEW_COOKIE, "")
     parts = tok.split(".")
     try:
@@ -124,7 +148,34 @@ def _view_role(req: Request):
     elif len(parts) == 3 and parts[1] == "ro" and _view_ro_password():
         if hmac.compare_digest(parts[2], _view_sign_ro(exp)):
             return "ro"
+    elif len(parts) == 4 and parts[1] == "c":
+        code = _CODE_BY_ID.get(parts[2])
+        if code and hmac.compare_digest(parts[3], _view_sign_code(exp, code)):
+            spec = ACCESS_CODES[code]
+            return ("acct", code) if spec["role"] == "acct" else spec["role"]
     return None
+
+
+def _view_scope(req: Request):
+    """账户会话的名下线集合; 其他身份 None = 不设限"""
+    role = _view_role(req)
+    if isinstance(role, tuple) and role[0] == "acct":
+        return tuple(ACCESS_CODES[role[1]]["pids"])
+    return None
+
+
+def _effective_scope(req: Request):
+    """这次请求用哪个可见范围。
+
+    账户会话默认只看自己; 带 ?all=1 时放开到全部线 —— 页面上的
+    「看全部/只看自己」切换不需要重输口令。只放宽"看":
+    写权限走 _write_deny, 不看这个参数, 永远只能写自己的线。
+    (213213 全家共用, 账户隔离的目的是"落地就是自己的页 +
+    不误改别人", 不是互相保密。)"""
+    scope = _view_scope(req)
+    if scope is not None and req.query_params.get("all") in ("1", "true"):
+        return None
+    return scope
 
 
 def _view_ok(req: Request) -> bool:
@@ -158,6 +209,36 @@ def _login_fail(ip):
     _login_fails[ip] = (n + 1, first)
 
 
+# 账户口令的接口面收窄。这是"能碰哪些接口"的白/黑名单;
+# 数据层面的过滤(卡片列表/默认线/看全部切换)在 /api/today 等接口里做。
+# GET 黑名单: 运维页/回测页/访问日志, 以及只服务 /pro 的接口 ——
+# 账户用户的一切都在首页, 这些页面/接口对他们没有正当用途。
+ACCT_GET_BLOCK = ("/pro", "/backtest", "/api/bt", "/api/access",
+                  "/api/status", "/api/plan", "/api/history",
+                  "/api/score", "/api/pipeline",
+                  "/machines", "/api/machines")
+# 非 GET 白名单: 自家线的改账(按线权限在 _write_deny 里再查) + 登入登出
+ACCT_POST_OK = ("/api/profile/", "/api/view/", "/api/ops/")
+
+
+def _acct_deny(request: Request, path: str, scope):
+    """账户会话的接口面收窄, 返回 None=放行。
+
+    看别人的线不拦(页面有「看全部」切换, 且 213213 本就全家共用,
+    没有保密需求); 拦的是运维/回测页面和所有非自家的写操作。"""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        if path.startswith(ACCT_GET_BLOCK):
+            return JSONResponse({"error": "当前口令无权访问该页面"},
+                                status_code=403)
+        return None
+    if path in ("/api/view/login", "/api/view/logout"):
+        return None
+    if not path.startswith(ACCT_POST_OK):
+        return JSONResponse({"error": "当前口令无权执行该操作"},
+                            status_code=403)
+    return None
+
+
 @app.middleware("http")
 async def _view_gate(request: Request, call_next):
     """未登录一律拦住, 并记录每次访问。
@@ -169,6 +250,8 @@ async def _view_gate(request: Request, call_next):
     role = _view_role(request)
     authed = role is not None
     public = path in VIEW_PUBLIC
+    scope = (tuple(ACCESS_CODES[role[1]]["pids"])
+             if isinstance(role, tuple) and role[0] == "acct" else None)
     try:
         if role == "ro" and request.method not in ("GET", "HEAD", "OPTIONS") \
                 and path not in ("/api/view/login", "/api/view/logout"):
@@ -177,10 +260,13 @@ async def _view_gate(request: Request, call_next):
             # 会话里提权。想改账就用完整口令重新登录。
             resp = JSONResponse({"error": "只读账户, 不能进行任何修改",
                                  "readonly": True}, status_code=403)
+        elif scope is not None and path not in VIEW_PUBLIC \
+                and (deny := _acct_deny(request, path, scope)) is not None:
+            resp = deny
         elif public or authed:
             resp = await call_next(request)
-        elif not _view_password():
-            # 未配置口令 -> 关站, 而不是放行。与改账口令同一个取舍:
+        elif not (_view_password() or ACCESS_CODES):
+            # 未配置任何口令 -> 关站, 而不是放行。与改账口令同一个取舍:
             # 宁可用不了, 不可裸奔。
             resp = HTMLResponse(NO_PASSWORD_HTML, status_code=503)
         elif path.startswith("/api/"):
@@ -201,8 +287,8 @@ async def _view_gate(request: Request, call_next):
 async def api_view_login(req: Request):
     pw = _view_password()
     ip = _client_ip(req)
-    if not pw:
-        return JSONResponse({"error": "服务器未设置 QUANT_VIEW_PASSWORD"},
+    if not (pw or ACCESS_CODES):
+        return JSONResponse({"error": "服务器未配置任何查看口令"},
                             status_code=503)
     if _login_blocked(ip):
         return JSONResponse(
@@ -210,11 +296,20 @@ async def api_view_login(req: Request):
             status_code=429)
     body = await req.json()
     got = str(body.get("password", ""))
-    # 两个口令都比一遍(不短路), 命中哪个发哪个角色的 token
+    # 所有口令都比一遍(不短路), 命中哪个发哪个身份的 token。
+    # 优先级: 口令表 > 旧环境变量 full > 旧环境变量 ro ——
+    # 环境变量里的旧密码恰好就是 611611, 若环境变量优先, 611611 会拿到
+    # 旧版 full 身份(改账还要再输 ops 口令), 违背"611611=全部可写"。
     ro = _view_ro_password()
-    ok_full = hmac.compare_digest(got, pw)
+    ok_full = bool(pw) and hmac.compare_digest(got, pw)
     ok_ro = bool(ro) and hmac.compare_digest(got, ro)
-    if not (ok_full or ok_ro):
+    hit = None
+    for c in ACCESS_CODES:
+        if hmac.compare_digest(got, c):
+            hit = c
+    if hit:
+        ok_full = ok_ro = False
+    if not (ok_full or ok_ro or hit):
         _login_fail(ip)
         await asyncio.sleep(LOGIN_FAIL_DELAY)
         n = _login_fails.get(ip, (0, 0))[0]
@@ -225,9 +320,14 @@ async def api_view_login(req: Request):
         return JSONResponse({"error": msg}, status_code=403)
     _login_fails.pop(ip, None)
     exp = int(time.time()) + VIEW_TTL
-    role = "full" if ok_full else "ro"
-    tok = (f"{exp}.{_view_sign(exp)}" if ok_full
-           else f"{exp}.ro.{_view_sign_ro(exp)}")
+    if ok_full:
+        role, tok = "full", f"{exp}.{_view_sign(exp)}"
+    elif hit:
+        spec = ACCESS_CODES[hit]
+        role = f"acct:{hit}" if spec["role"] == "acct" else spec["role"]
+        tok = f"{exp}.c.{_code_id(hit)}.{_view_sign_code(exp, hit)}"
+    else:
+        role, tok = "ro", f"{exp}.ro.{_view_sign_ro(exp)}"
     r = JSONResponse({"ok": True, "role": role})
     r.set_cookie(VIEW_COOKIE, tok, max_age=VIEW_TTL,
                  httponly=True, samesite="lax", path="/")
@@ -244,8 +344,11 @@ async def api_view_logout():
 @app.get("/api/view/status")
 async def api_view_status(req: Request):
     role = _view_role(req)
-    return {"authed": role is not None, "role": role,
-            "configured": bool(_view_password())}
+    scope = _view_scope(req)
+    return {"authed": role is not None,
+            "role": (f"acct:{role[1]}" if isinstance(role, tuple) else role),
+            "scope": (list(scope) if scope is not None else None),
+            "configured": bool(_view_password() or ACCESS_CODES)}
 
 
 LOGIN_HTML = """<!DOCTYPE html><html lang="zh-CN"><head>
@@ -268,12 +371,11 @@ input:focus{border-color:#2563eb}
 .disc{color:#6b7280;font-size:12px;line-height:1.7;margin-top:16px;text-align:center}
 </style></head><body>
 <div class="box">
-  <h1>实盘看板</h1>
-  <div class="sub">这个站会显示真实持仓与资金，需要口令才能查看。</div>
-  <input id="pw" type="password" placeholder="查看口令" autocomplete="current-password">
+  <h1>登录</h1>
+  <div class="sub">请输入访问口令。</div>
+  <input id="pw" type="password" placeholder="口令" autocomplete="current-password">
   <button class="btn" id="go" onclick="go()">进入</button>
   <div class="err" id="err"></div>
-  <div class="disc">本站信息仅供参考，不构成任何投资建议</div>
 </div>
 <script>
 const $ = s => document.querySelector(s);
@@ -306,7 +408,7 @@ border-radius:4px;color:#fcd34d}h1{font-size:18px;margin-bottom:14px}
 .w{max-width:620px;margin:0 auto}pre{background:#14171e;padding:14px;border-radius:10px;
 overflow-x:auto;font-size:13px;color:#c9cdd6}</style></head><body><div class="w">
 <h1>服务器未设置 QUANT_VIEW_PASSWORD</h1>
-<p>这个站会显示真实持仓与资金，所以没有口令时<b>整站关闭</b>，而不是放开访问。</p>
+<p>未配置口令时<b>整站关闭</b>，而不是放开访问。</p>
 <pre>ssh eez041.ece.ust.hk
 echo 'QUANT_VIEW_PASSWORD=想用的口令' &gt;&gt; ~/.config/quant-web.env
 systemctl --user restart quant-web.service</pre>
@@ -419,7 +521,8 @@ def _archive_profile(pid):
         dst = arc / f"{src.stem}_{ts}.json"
         shutil.copy2(src, dst)
         out["state"] = dst.name
-    for pp in LIVE_DIR.glob(f"plan_{pid}_*.json"):
+    # [0-9] 锁日期段: 防 plan_aggr2w_* 误扫 plan_aggr2w_px2_* (重置会把别人的计划归档)
+    for pp in LIVE_DIR.glob(f"plan_{pid}_[0-9]*.json"):
         shutil.move(str(pp), str(arc / f"{pp.stem}_{ts}.json"))
         out["plans"] += 1
     return out
@@ -440,6 +543,28 @@ def _check_profile(pid, write=True):
                       f"它的作用是提供一条没人动过的参照, 用来衡量人为干预的代价。",
              "locked": True}, status_code=403)
     return None
+
+
+def _write_deny(req: Request, pid):
+    """改账权限, 三选一命中即放行 (返回 None):
+
+      1. admin 会话(611611)       -> 全部线可写, 不再另问 ops 口令
+      2. 账户会话改自己名下的线  -> 口令即身份, 同样不问 ops
+      3. 老路径: full/环境变量会话 + ops 口令 cookie
+
+    账户会话打别人的线直接 403 —— 不给"输 ops 口令绕过可见范围"的路。
+    调用前提: pid 已过 _check_profile (存在且非基准线)。"""
+    role = _view_role(req)
+    if role == "admin":
+        return None
+    if isinstance(role, tuple) and role[0] == "acct":
+        if pid in ACCESS_CODES[role[1]]["pids"]:
+            return None
+        return JSONResponse({"error": "这条线不属于当前口令"},
+                            status_code=403)
+    if _ops_ok(req):
+        return None
+    return _ops_deny()
 
 
 @app.post("/api/ops/login")
@@ -467,7 +592,11 @@ async def api_ops_logout():
 
 @app.get("/api/ops/status")
 async def api_ops_status(req: Request):
-    return {"authed": _ops_ok(req), "configured": bool(_ops_password())}
+    # admin/账户会话自带改账权(及自己的线), 前端据此不弹 ops 口令框
+    role = _view_role(req)
+    session_write = role == "admin" or isinstance(role, tuple)
+    return {"authed": _ops_ok(req) or session_write,
+            "configured": bool(_ops_password()) or session_write}
 
 
 # ── 运维面板专用口令 (QUANT_PRO_OPS_PASSWORD) ──
@@ -575,7 +704,7 @@ def _state_of(pid):
 
 
 def _latest_plan():
-    plans = sorted(LIVE_DIR.glob(f"plan_{DEFAULT_PROFILE}_*.json"))
+    plans = sorted(LIVE_DIR.glob(f"plan_{DEFAULT_PROFILE}_[0-9]*.json"))
     if not plans:
         return None
     return json.loads(plans[-1].read_text(encoding="utf-8"))
@@ -1208,10 +1337,11 @@ async def api_history():
 
 # ── 首页仪表盘 ──
 @app.get("/api/profiles")
-async def api_profiles():
-    """四条并行线的定义 + 各自当前概况"""
+async def api_profiles(req: Request):
+    """各并行线的定义 + 各自当前概况 (账户口令默认只见自己, ?all=1 看全部)"""
+    scope = _effective_scope(req)
     out = []
-    for p in list_profiles():
+    for p in list_profiles(scope):
         st = _state_of(p["id"])
         out.append({**p,
                     "initialized": st is not None,
@@ -1219,18 +1349,20 @@ async def api_profiles():
                         st.get("cash", 0) + sum(l["shares"] * l["buy_price"]
                                                 for l in (st.get("lots") or [])), 2),
                     "n_positions": None if st is None else len(st.get("lots") or [])})
-    return {"profiles": out, "default": DEFAULT_PROFILE}
+    default = (DEFAULT_PROFILE if scope is None or DEFAULT_PROFILE in scope
+               else scope[0])
+    return {"profiles": out, "default": default}
 
 
 @app.post("/api/profile/rename")
 async def api_rename(req: Request):
     """改显示名。传空串 = 恢复代码里的默认名"""
-    if not _ops_ok(req):
-        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if (bad := _check_profile(pid)) is not None:
         return bad
+    if (deny := _write_deny(req, pid)) is not None:
+        return deny
     try:
         name = set_name(pid, body.get("name"))
     except ValueError as e:
@@ -1248,12 +1380,12 @@ async def api_auto(req: Request):
     切到实盘模式时, 若已有一份挂单计划, 那份计划就会转为"待确认"状态 ——
     因为我们无法知道你到底有没有按它下单。
     """
-    if not _ops_ok(req):
-        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if (bad := _check_profile(pid)) is not None:
         return bad
+    if (deny := _write_deny(req, pid)) is not None:
+        return deny
     auto = bool(body.get("auto"))
     set_auto(pid, auto)
     st = _state_of(pid) or {}
@@ -1271,12 +1403,12 @@ async def api_confirm(req: Request):
     fills 为空数组 = 「当天没下单」, 直接作废该计划且不动账。
     这一步会跑完整模型, 耗时约 30~60 秒, 所以走后台线程 + 轮询 /api/run-status。
     """
-    if not _ops_ok(req):
-        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if (bad := _check_profile(pid)) is not None:
         return bad
+    if (deny := _write_deny(req, pid)) is not None:
+        return deny
     if _running["active"]:
         return JSONResponse({"error": "已有任务在跑, 请稍候"}, status_code=409)
 
@@ -1321,12 +1453,12 @@ async def api_reset(req: Request):
 
     要跑完整模型出建仓计划, 约 30~60 秒, 所以走后台线程 + 轮询 /api/run-status。
     """
-    if not _ops_ok(req):
-        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if (bad := _check_profile(pid)) is not None:
         return bad
+    if (deny := _write_deny(req, pid)) is not None:
+        return deny
     if _running["active"]:
         return JSONResponse({"error": "已有任务在跑, 请稍候"}, status_code=409)
 
@@ -1376,12 +1508,12 @@ async def api_set_cash(req: Request):
     修账, 不是盈亏也不是出入金: 只动现金, 本金不动, 所以收益率会被修正
     到真实水平。用来消除自动记账(收盘价+估算佣金)的累积偏差。
     """
-    if not _ops_ok(req):
-        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if (bad := _check_profile(pid)) is not None:
         return bad
+    if (deny := _write_deny(req, pid)) is not None:
+        return deny
     try:
         cash = float(body.get("cash"))
     except (TypeError, ValueError):
@@ -1401,12 +1533,12 @@ async def api_cash_flow(req: Request):
     本金变动, 不是盈亏: 现金和本金同额增减, 收益率保持不变。
     否则存进 1 万会被算成"赚了 1 万"。
     """
-    if not _ops_ok(req):
-        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if (bad := _check_profile(pid)) is not None:
         return bad
+    if (deny := _write_deny(req, pid)) is not None:
+        return deny
     try:
         amt = float(body.get("amount"))
     except (TypeError, ValueError):
@@ -1428,12 +1560,12 @@ async def api_drop_lot(req: Request):
 
     两种情形现金处理正好相反, 所以必须由前端明确传 mode, 后端不猜。
     """
-    if not _ops_ok(req):
-        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if (bad := _check_profile(pid)) is not None:
         return bad
+    if (deny := _write_deny(req, pid)) is not None:
+        return deny
     code = str(body.get("code") or "").strip()
     if not code.isdigit() or len(code) > 6:
         return JSONResponse({"error": "股票代码不对"}, status_code=400)
@@ -1469,12 +1601,12 @@ async def api_fix_lot(req: Request):
     这是整体对账(--sync)的替代品: 后者一把覆盖整个账户, 网页入口已因破坏力
     太大而下掉。单笔校准语义明确, 且有备份与 history 记录。
     """
-    if not _ops_ok(req):
-        return _ops_deny()
     body = await req.json()
     pid = body.get("profile")
     if (bad := _check_profile(pid)) is not None:
         return bad
+    if (deny := _write_deny(req, pid)) is not None:
+        return deny
     code = str(body.get("code") or "").strip()
     if not code.isdigit() or len(code) > 6:
         return JSONResponse({"error": "股票代码不对"}, status_code=400)
@@ -1510,16 +1642,29 @@ async def api_fix_lot(req: Request):
     return _cash_op(pid, extra, "校准持仓")
 
 
+def _with_viewer(req: Request, d: dict) -> dict:
+    """在载荷里附上本会话的名下线, 前端据此:
+    1) 渲染「看全部/只看自己」切换  2) 对非名下的线隐掉改账按钮"""
+    scope = _view_scope(req)
+    d["viewer_scope"] = list(scope) if scope is not None else None
+    return d
+
+
 @app.get("/api/today")
-async def api_today(profile: str = None):
-    """归一化的"明天该做什么" —— 首页用。只读, 不触发模型。"""
-    return build_today(ROOT, profile)
+async def api_today(req: Request, profile: str = None):
+    """归一化的"明天该做什么" —— 首页用。只读, 不触发模型。
+
+    账户口令会话: 默认只列名下的线, 缺省/越界的 profile 落到名下
+    第一条; 带 ?all=1 时和全站身份看到的一样 (只放宽看, 不放宽改)。"""
+    return _with_viewer(req, build_today(ROOT, profile,
+                                         allowed=_effective_scope(req)))
 
 
 @app.get("/api/recommend")
-async def api_recommend(profile: str = None):
+async def api_recommend(req: Request, profile: str = None):
     """每日推荐看板: 模型打分最高的股票 + 该线能否买得起"""
-    return build_recommend(ROOT, profile)
+    return _with_viewer(req, build_recommend(ROOT, profile,
+                                             allowed=_effective_scope(req)))
 
 
 @app.get("/api/kline")
@@ -1657,6 +1802,7 @@ HTML_PAGE = """<!DOCTYPE html>
     专供看流水线状态与访问日志。<br>
     四条线的持仓、操作清单与所有改账功能在
     <a href="/" style="color:#82b1ff">首页</a>。
+    实验机 CPU/GPU 占用看 <a href="/machines" style="color:#82b1ff">机器监控</a>。
   </div>
 
   <div class="card">
@@ -2132,11 +2278,262 @@ setInterval(refresh, 10000);
 """
 
 
+# ═══════════════════════════════════════════════════════════
+# 机器 CPU 空闲监控 (/machines)
+# 用途: 一眼看出三台实验机谁在用/能不能点火新实验。
+# 设计: 按需轮询 + 30s 缓存, 无后台线程(避开多 worker/重启生命周期问题);
+# 本机读 /proc, 另两台走 BatchMode ssh(已互信)。失联照常出卡片标 unreachable。
+# 权限: 全站口令(611611/213213)可见; 分账户口令 403 (已加 ACCT_GET_BLOCK)。
+# ═══════════════════════════════════════════════════════════
+MACHINES = ["eez040.ece.ust.hk", "eez041.ece.ust.hk", "eez042.ece.ust.hk"]
+# 采集命令: loadavg / 核数 / top进程 / 本项目回测进程数 / GPU / 磁盘。
+# 用分隔符切段, pgrep 的 [h] 把自己排除在外 (老抏法)。df 只报 / 与 /home
+# (三台机的 34T 数据盘都挂在 /home, 不共享, 各自统计)。
+_MACH_CMD = ("cat /proc/loadavg; echo __SEP__; nproc; echo __SEP__; "
+             "ps -eo user:14,pcpu,comm --sort=-pcpu --no-headers | head -8; "
+             "echo __SEP__; pgrep -fc 'wf_v35_breadt[h]|mltask/worke[r]' || echo 0; "
+             "echo __SEP__; nvidia-smi --query-gpu=utilization.gpu,memory.used "
+             "--format=csv,noheader,nounits 2>/dev/null || echo NOGPU; "
+             "echo __SEP__; df -PB1G / /home 2>/dev/null | tail -n +2; "
+             "echo __SEP__; free -g | sed -n 2p")
+_mach_cache = {"at": 0.0, "data": None}
+_MACH_TTL = 30  # 秒; 页面 30s 自刷, 缓存同步到期。不加锁:
+# 并发冷缓存最多重复探一次, 无害; 换来 handler 里没有跨 await 持锁的坑
+
+
+def _mach_parse(host, raw):
+    """把采集输出解析成卡片字段; 解析失败不抖异常, 标 unreachable"""
+    try:
+        seg = [s.strip() for s in raw.split("__SEP__")]
+        load1, load5, load15 = (float(x) for x in seg[0].split()[:3])
+        ncpu = int(seg[1].split()[0])
+        by_user: dict = {}
+        for line in seg[2].splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            u, pc = parts[0], float(parts[1])
+            by_user[u] = by_user.get(u, 0.0) + pc
+        users = [{"user": u, "cores": round(c / 100, 1)}
+                 for u, c in sorted(by_user.items(), key=lambda kv: -kv[1])
+                 if c >= 20][:4]  # 不到 0.2 核的不值得上榜
+        n_wf = int(seg[3].split()[0]) if len(seg) > 3 and seg[3].strip() else 0
+        # GPU 段: 每行 "util, mem_used"; 空闲 = 利用率<10% 且显存<1GB(残留不算)
+        gpus = None
+        if len(seg) > 4 and seg[4].strip() and "NOGPU" not in seg[4]:
+            rows = []
+            for line in seg[4].splitlines():
+                p = [x.strip() for x in line.split(",")]
+                if len(p) >= 2:
+                    try:
+                        rows.append((int(p[0]), int(p[1])))
+                    except ValueError:
+                        continue
+            if rows:
+                n_idle = sum(1 for u, mem in rows if u < 10 and mem < 1024)
+                gpus = {"n": len(rows), "idle": n_idle,
+                        "max_util": max(u for u, _ in rows)}
+        # 磁盘段: df -PB1G 每行 "fs 总G 用G 余G 用% 挂载点";
+        # / 与 /home 同一卷时只报一次(按 fs 去重)
+        disks = None
+        if len(seg) > 5 and seg[5].strip():
+            drows, seen = [], set()
+            for line in seg[5].splitlines():
+                p = line.split()
+                if len(p) < 6 or p[0] in seen:
+                    continue
+                try:
+                    drows.append({"mount": p[5], "size_g": int(p[1]),
+                                  "used_g": int(p[2]),
+                                  "pct": int(p[4].rstrip("%"))})
+                    seen.add(p[0])
+                except ValueError:
+                    continue
+            disks = drows or None
+        # 内存段: free -g 第二行 "Mem: 总 用 余 ..."。空闲判定纳入内存:
+        # 08-22 事故教训 —— CPU 闲但内存满的机器对重放批不是"可点火"
+        mem_total = mem_used = mem_pct = None
+        if len(seg) > 6 and seg[6].strip():
+            mp = seg[6].split()
+            if len(mp) >= 3:
+                mem_total, mem_used = int(mp[1]), int(mp[2])
+                mem_pct = round(mem_used / mem_total * 100) if mem_total else None
+        ratio = load1 / ncpu if ncpu else 1.0
+        status = "idle" if ratio < 0.15 else ("busy" if ratio > 0.55 else "partial")
+        if mem_pct is not None:
+            if mem_pct >= 92:
+                status = "busy"
+            elif mem_pct >= 80 and status == "idle":
+                status = "partial"
+        return {"host": host.split(".")[0], "ok": True, "ncpu": ncpu,
+                "load1": round(load1, 1), "load5": round(load5, 1),
+                "load15": round(load15, 1),
+                "free_cores": max(0, round(ncpu - load1)),
+                "ratio": round(ratio, 3), "status": status,
+                "top_users": users, "n_wf_jobs": n_wf, "gpus": gpus,
+                "disks": disks, "mem_total_g": mem_total,
+                "mem_used_g": mem_used, "mem_pct": mem_pct}
+    except Exception as e:  # 解析炸了等同失联, 不影响其他卡片
+        return {"host": host.split(".")[0], "ok": False, "error": f"parse: {e}"}
+
+
+def _mach_probe(host):
+    """采一台机器。本机直接跑, 其余 ssh; 任何失败都返 unreachable 卡片"""
+    local = os.uname().nodename.split(".")[0] == host.split(".")[0]
+    cmd = ["bash", "-c", _MACH_CMD] if local else \
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+         "-o", "StrictHostKeyChecking=accept-new", host, _MACH_CMD]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        if r.returncode != 0 and not r.stdout.strip():
+            return {"host": host.split(".")[0], "ok": False,
+                    "error": (r.stderr or "ssh 失败").strip()[:120]}
+        return _mach_parse(host, r.stdout)
+    except subprocess.TimeoutExpired:
+        return {"host": host.split(".")[0], "ok": False, "error": "探测超时"}
+    except Exception as e:
+        return {"host": host.split(".")[0], "ok": False, "error": str(e)[:120]}
+
+
+def _mach_collect():
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(MACHINES)) as ex:
+        cards = list(ex.map(_mach_probe, MACHINES))
+    idle = [c["host"] for c in cards if c.get("ok") and c["status"] == "idle"]
+    return {"at": datetime.now().strftime("%H:%M:%S"),
+            "machines": cards, "idle": idle,
+            "verdict": ("可以点火: " + " + ".join(idle)) if idle
+                       else "暂无空闲机器, 先别排实验"}
+
+
+@app.get("/api/machines")
+async def api_machines():
+    """三台实验机的 CPU 占用快照 (30s 缓存)。鉴权由中间件完成:
+    未登录 401, 分账户 403 (ACCT_GET_BLOCK), 全站口令放行。"""
+    if time.time() - _mach_cache["at"] > _MACH_TTL or _mach_cache["data"] is None:
+        data = await asyncio.to_thread(_mach_collect)
+        _mach_cache.update(at=time.time(), data=data)
+    return _mach_cache["data"]
+
+
+@app.get("/machines", response_class=HTMLResponse)
+async def machines_page():
+    return MACHINES_HTML
+
+
+MACHINES_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>实验机空闲监控</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, 'Segoe UI', 'PingFang SC', sans-serif;
+         background: #0f1117; color: #e0e0e0; padding: 20px; }
+  .container { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 20px; margin-bottom: 4px; color: #fff; }
+  .sub { color: #667; font-size: 12px; margin-bottom: 16px; }
+  .verdict { background: #1a1d29; border-radius: 12px; padding: 14px 18px;
+             margin-bottom: 14px; font-size: 15px; font-weight: 600; }
+  .verdict.go { color: #4caf7d; }
+  .verdict.wait { color: #e0a03c; }
+  .card { background: #1a1d29; border-radius: 12px; padding: 16px 18px;
+          margin-bottom: 12px; }
+  .head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .name { font-size: 16px; font-weight: 700; color: #fff; }
+  .badge { font-size: 12px; padding: 2px 10px; border-radius: 10px; }
+  .b-idle { background: #14331f; color: #4caf7d; }
+  .b-partial { background: #33290f; color: #e0a03c; }
+  .b-busy { background: #331414; color: #e05c5c; }
+  .b-err { background: #2a2d39; color: #889; }
+  .bar { height: 8px; background: #2a2d39; border-radius: 4px; overflow: hidden;
+         margin: 8px 0; }
+  .fill { height: 100%; border-radius: 4px; }
+  .row { color: #aab; font-size: 13px; line-height: 1.8; }
+  .muted { color: #667; }
+  .mono { font-family: ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>实验机空闲监控</h1>
+  <div class="sub">30 秒自动刷新 · 彩条=1分钟负载/核数 · 绿=可点火(负载&lt;15% 且内存&lt;80%) 黄=有人在用 红=忙(负载&gt;55% 或内存&gt;92%)
+    · <a href="/" style="color:#82b1ff">首页</a>
+    · <a href="/pro" style="color:#82b1ff">仪表盘</a></div>
+  <div id="verdict" class="verdict">加载中…</div>
+  <div id="cards"></div>
+</div>
+<script>
+const fmtG = g => g >= 1024 ? (g / 1024).toFixed(1) + 'T' : g + 'G';
+async function refresh(){
+  try{
+    const r = await fetch('/api/machines');
+    if(!r.ok){ document.getElementById('verdict').textContent =
+      r.status === 401 ? '需要登录(回首页输口令)' : '无权查看'; return; }
+    const d = await r.json();
+    const v = document.getElementById('verdict');
+    v.textContent = d.verdict + '（' + d.at + ' 采样）';
+    v.className = 'verdict ' + (d.idle.length ? 'go' : 'wait');
+    document.getElementById('cards').innerHTML = d.machines.map(m => {
+      if(!m.ok){
+        return '<div class="card"><div class="head"><span class="name">' + m.host +
+          '</span><span class="badge b-err">失联</span></div>' +
+          '<div class="row muted">' + (m.error || '') + '</div></div>';
+      }
+      const pct = Math.min(100, Math.round(m.ratio * 100));
+      const cls = m.status === 'idle' ? 'b-idle' : (m.status === 'busy' ? 'b-busy' : 'b-partial');
+      const col = m.status === 'idle' ? '#4caf7d' : (m.status === 'busy' ? '#e05c5c' : '#e0a03c');
+      const zh = m.status === 'idle' ? '空闲' : (m.status === 'busy' ? '忙' : '有人在用');
+      const users = (m.top_users || []).map(u =>
+        u.user + ' ≈' + u.cores + '核').join('，') || '无大户';
+      return '<div class="card">' +
+        '<div class="head"><span class="name">' + m.host + '</span>' +
+        '<span class="badge ' + cls + '">' + zh + '</span>' +
+        '<span class="muted" style="margin-left:auto;font-size:12px">' +
+        m.ncpu + ' 核 · 余 ≈' + m.free_cores + ' 核</span></div>' +
+        '<div class="bar"><div class="fill" style="width:' + pct +
+        '%;background:' + col + '"></div></div>' +
+        '<div class="row">负载 <span class="mono">' + m.load1 + ' / ' + m.load5 +
+        ' / ' + m.load15 + '</span>（1/5/15分钟）</div>' +
+        (m.mem_pct != null ? '<div class="row">内存：<span class="mono">' +
+          m.mem_used_g + '/' + m.mem_total_g + 'G</span> <b style="color:' +
+          (m.mem_pct >= 90 ? '#e05c5c' : m.mem_pct >= 75 ? '#e0a03c' : '#4caf7d') +
+          '">' + m.mem_pct + '%</b></div>' : '') +
+        '<div class="row">在用：' + users + '</div>' +
+        (m.gpus ? '<div class="row">显卡：' + m.gpus.n + ' 张 · <b style="color:' +
+          (m.gpus.idle ? '#4caf7d' : '#e05c5c') + '">空闲 ' + m.gpus.idle + '</b>' +
+          '（峰值 util ' + m.gpus.max_util + '%）</div>' : '') +
+        (m.disks && m.disks.length ? '<div class="row">存储：' + m.disks.map(dk =>
+          dk.mount + ' <span class="mono">' + fmtG(dk.used_g) + '/' + fmtG(dk.size_g) +
+          '</span> <b style="color:' + (dk.pct >= 90 ? '#e05c5c' :
+          dk.pct >= 75 ? '#e0a03c' : '#4caf7d') + '">' + dk.pct + '%</b>'
+          ).join(' · ') + '</div>' : '') +
+        (m.n_wf_jobs ? '<div class="row">本项目回测进程：' + m.n_wf_jobs + '</div>' : '') +
+        '</div>';
+    }).join('');
+  }catch(e){
+    document.getElementById('verdict').textContent = '加载失败: ' + e;
+  }
+}
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>
+"""
+
+
 if __name__ == "__main__":
+    try:
+        from proctitle import lowkey
+        lowkey("mltask/srv")
+    except Exception:
+        pass
     import uvicorn
-    ap = argparse.ArgumentParser(description="实盘信号 Web 服务器")
+    ap = argparse.ArgumentParser(description="web server")
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--port", type=int, default=8737)
     a = ap.parse_args()
     print(f"启动: http://{a.host}:{a.port}")
     uvicorn.run(app, host=a.host, port=a.port)

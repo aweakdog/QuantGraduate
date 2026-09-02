@@ -79,7 +79,8 @@ def archive(pid):
         shutil.copy2(src, dst)
         print(f"    旧状态已备份 -> archive/{dst.name}")
     moved = 0
-    for pp in LIVE.glob(f"plan_{pid}_*.json"):
+    # [0-9] 锁日期段: 防 plan_aggr2w_* 误扫 plan_aggr2w_px2_*
+    for pp in LIVE.glob(f"plan_{pid}_[0-9]*.json"):
         shutil.move(str(pp), str(ARCHIVE / f"{pp.stem}_{ts}.json"))
         moved += 1
     if moved:

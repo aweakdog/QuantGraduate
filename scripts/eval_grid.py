@@ -1104,4 +1104,9 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # htop 低调化 (见 scripts/proctitle.py)
+        from proctitle import lowkey
+        lowkey("mltask/grid")
+    except Exception:
+        pass
     main()

@@ -30,7 +30,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 KLINE_DIR = ROOT / "data" / "raw" / "kline"
 UNIVERSE = ROOT / "data" / "universe" / "watchlist_216.json"
-START_DATE = "20190101"    # 保留扩容后的训练历史, 日常全量重拉不得截回 2021
+START_DATE = "20161201"    # 2026-08-19 扩窗到 2017: 前移到 2016-12 (留 ma 缓冲)。
+                           # 全量重拉覆盖机制下, 这个常量就是历史保留线, 不得回调
 
 FINAL_COLS = ["date", "open", "high", "low", "close", "volume",
               "amount", "outstanding_share", "turnover"]
@@ -343,4 +344,9 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # htop 低调化 (见 scripts/proctitle.py)
+        from proctitle import lowkey
+        lowkey("mltask/fetch")
+    except Exception:
+        pass
     main()

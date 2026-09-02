@@ -9,6 +9,7 @@
   US2Y / US5Y          tushare us_tycr y2/y5 (美财政部)                    1.000000 / 1.000000
   USDCNH / USDJPY      tushare fx_daily bid_close (FXCM)                  0.988 / 1.0027 (收盘时点差)
   USDIND               tushare fx_daily 六币按 ICE 公式合成 DXY            0.992 / 1.0019 (收盘时点差)
+  标普/道指/纳指/A50期货 akshare futures_foreign_hist ES/YM/NQ/CHA50CFD  0.9998+ / 1.0000 (2026-08-19 接管)
 
 合并策略: 只 append 旧表末日之后的新行, 旧数据永不改写。
 写盘前 no-regression 自检: 行数与"最新值"非空数都不得减少, 否则拒绝写入。
@@ -159,7 +160,34 @@ def fetch_usdind(since: dt.date) -> pd.DataFrame:
     return pd.DataFrame({"日期": m.index, "最新值": vals}).dropna().sort_values("日期")
 
 
-# ─── 合并与写盘 ──────────────────────────────────────────────
+def _fetch_foreign_fut(sym: str, since: dt.date) -> pd.DataFrame:
+    """外盘指数期货 (新浪). 接管断供的 iFinD 期货表 (2026-08-19):
+    与遗留表重叠段 999 天对账 corr>0.9998 / 中位比值 1.0000 (ES/YM/NQ/CHA50CFD)"""
+    import akshare as ak
+    d = ak.futures_foreign_hist(symbol=sym)
+    d = d.rename(columns={"date": "日期", "close": "最新值"})
+    d["日期"] = pd.to_datetime(d["日期"], errors="coerce")
+    d["最新值"] = pd.to_numeric(d["最新值"], errors="coerce")
+    return d[["日期", "最新值"]].dropna()
+
+
+def fetch_sp_fut(since):
+    return _fetch_foreign_fut("ES", since)
+
+
+def fetch_dj_fut(since):
+    return _fetch_foreign_fut("YM", since)
+
+
+def fetch_nq_fut(since):
+    return _fetch_foreign_fut("NQ", since)
+
+
+def fetch_a50_fut(since):
+    return _fetch_foreign_fut("CHA50CFD", since)
+
+
+# ─── 合并与写盘 ──────────────────────────────
 
 TARGETS = [
     ("中国大宗商品价格指数", fetch_commodity_idx),
@@ -170,6 +198,10 @@ TARGETS = [
     ("USDCNH", fetch_usdcnh),
     ("USDJPY", fetch_usdjpy),
     ("USDIND", fetch_usdind),
+    ("标普期货", fetch_sp_fut),
+    ("道指期货", fetch_dj_fut),
+    ("纳指期货", fetch_nq_fut),
+    ("A50期货", fetch_a50_fut),
 ]
 
 
