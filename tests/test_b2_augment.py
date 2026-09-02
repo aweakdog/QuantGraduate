@@ -101,5 +101,75 @@ def test_t3_excludes_self_and_respects_pit_membership(tmp_path, monkeypatch):
     assert f.loc[(d_early, "000000"), "t3_rel5"] == pytest.approx(5 * np.log(1.03) - r5_peer, rel=1e-6)
     # 调入后: 000009 (2%) 进入银行 -> 目标的行业均值上移
     assert f.loc[(d_late, "000000"), "t3_ind_ret5"] > r5_peer
-    # 调入前 000009 所在行业("电子")只有它一只 -> 峠不到 5 只同伴, 不出值
+    # 调入前 000009 所在行业("电子")只有它一只 -> 凑不到 5 只同伴, 不出值
     assert np.isnan(f.loc[(d_early, "000009"), "t3_ind_ret5"])
+
+
+# ── T2C 解禁 ─────────────────────────────────────────────────
+def test_t2c_event_known_only_after_announcement(tmp_path, monkeypatch):
+    """公告 01-10 (盘后) 解禁 01-20: 01-10 当天不能知道, 01-11 起知道; 解禁后进 past20"""
+    monkeypatch.setattr(B, "SHARE_FLOAT_DIR", tmp_path / "sf")
+    (tmp_path / "sf").mkdir()
+    pd.DataFrame({"ts_code": ["000001.SZ", "000001.SZ"], "ann_date": ["20240110", None],
+                  "float_date": ["20240120", "20240301"], "float_ratio": [5.0, 2.0]}).to_parquet(
+        tmp_path / "sf" / "2024.parquet", index=False)
+    keys = pd.DataFrame({"_c6": "000001", "date": pd.bdate_range("2024-01-02", "2024-03-15")})
+    f = B.t2c_frame(keys).set_index("date")
+    T = pd.Timestamp
+    assert f.loc[T("2024-01-10"), "t2c_days_next"] == B.T2C_HORIZON      # 公告日当天还不知道
+    assert f.loc[T("2024-01-10"), "t2c_ratio_next"] == 0.0
+    assert f.loc[T("2024-01-11"), "t2c_days_next"] == 9                  # 01-11 -> 01-20
+    assert f.loc[T("2024-01-11"), "t2c_ratio_next"] == 5.0
+    assert f.loc[T("2024-01-11"), "t2c_ratio_fwd60"] == 5.0
+    # 解禁当日 (01-20 是周六, 首个交易日 01-22): 已不在"未来", 进 past20
+    assert f.loc[T("2024-01-22"), "t2c_ratio_past20"] == 5.0
+    assert f.loc[T("2024-01-22"), "t2c_days_next"] == B.T2C_HORIZON
+    # 28 个日历日后滑出 past20
+    assert f.loc[T("2024-02-19"), "t2c_ratio_past20"] == 0.0
+    # 无公告日的事件(03-01) 解禁前不可见, 解禁后可见
+    assert f.loc[T("2024-02-28"), "t2c_ratio_fwd60"] == 0.0
+    assert f.loc[T("2024-03-01"), "t2c_ratio_past20"] == 2.0
+
+
+# ── T2B 龙虎榜 ───────────────────────────────────────────────
+def test_t2b_rolling_and_lag(tmp_path, monkeypatch):
+    monkeypatch.setattr(B, "TOP_INST_DIR", tmp_path / "ti")
+    (tmp_path / "ti").mkdir()
+    days = pd.bdate_range("2024-01-01", periods=40)
+    listed = days[25]
+    pd.DataFrame({"trade_date": [listed.strftime("%Y%m%d")] * 2, "ts_code": "000001.SZ",
+                  "exalter": ["机构专用", "某营业部"], "net_buy": [3e6, -9e6]}).to_parquet(
+        tmp_path / "ti" / "2024.parquet", index=False)
+    kl = pd.DataFrame({"_c6": "000001", "date": days, "amount": 1e8})
+    f0 = B.t2b_frame(kl, lag=0).set_index("date")
+    f1 = B.t2b_frame(kl, lag=1).set_index("date")
+    assert f0.loc[listed, "t2b_cnt20"] == 1 and f0.loc[days[24], "t2b_cnt20"] == 0
+    assert f0.loc[listed, "t2b_days_since"] == 0 and f0.loc[days[28], "t2b_days_since"] == 3
+    assert f0.loc[days[24], "t2b_days_since"] == B.T2B_SINCE_CAP        # 从未上榜 = 上限
+    # 只算机构席位: 3e6 / (20 天 * 1e8)
+    assert f0.loc[listed, "t2b_inst_net20"] == pytest.approx(3e6 / 2e9)
+    # lag1: 上榜信息次日才进特征
+    assert f1.loc[listed, "t2b_cnt20"] == 0 and f1.loc[days[26], "t2b_cnt20"] == 1
+    assert B.T2B_LAG == 1
+
+
+# ── T3H 股东户数 ─────────────────────────────────────────────
+def test_t3h_latest_known_report_and_mixed_ann_formats(tmp_path, monkeypatch):
+    monkeypatch.setattr(B, "HOLDER_DIR", tmp_path / "hn")
+    (tmp_path / "hn").mkdir()
+    pd.DataFrame({"ts_code": "000001.SZ",
+                  "ann_date": ["20240110", "2024-04-20 15:09:08", "20240720"],
+                  "end_date": ["20231231", "20240331", "20240630"],
+                  "holder_num": [100000, 110000, 99000]}).to_parquet(
+        tmp_path / "hn" / "2024.parquet", index=False)
+    keys = pd.DataFrame({"_c6": "000001", "date": pd.bdate_range("2024-01-02", "2024-08-30")})
+    f = B.t3h_frame(keys).set_index("date")
+    T = pd.Timestamp
+    assert np.isnan(f.loc[T("2024-01-11"), "t3h_chg"])                 # 首份报告没有环比
+    assert np.isnan(f.loc[T("2024-04-19"), "t3h_chg"])                 # 04-20(周六)公告前不可见
+    # 带时分秒的 ann_date 也要解析对: 04-21 起已知, 首个交易日 04-22 拿到 +10%
+    assert f.loc[T("2024-04-22"), "t3h_chg"] == pytest.approx(np.log(1.1))
+    assert f.loc[T("2024-04-22"), "t3h_days"] == 1
+    assert f.loc[T("2024-07-19"), "t3h_chg"] == pytest.approx(np.log(1.1))   # 07-20 公告前仍是上一份
+    assert f.loc[T("2024-07-22"), "t3h_chg"] == pytest.approx(np.log(0.9))
+    assert f.loc[T("2024-07-22"), "t3h_days"] == 1

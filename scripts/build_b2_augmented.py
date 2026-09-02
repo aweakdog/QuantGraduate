@@ -55,17 +55,29 @@ PROC = ROOT / "data" / "processed"
 KLINE_DIR = ROOT / "data" / "raw" / "kline"
 MARGIN_DIR = ROOT / "data" / "raw" / "tushare" / "margin_detail"
 SW_MEMBER = ROOT / "data" / "raw" / "tushare" / "sw_member" / "sw_member.parquet"
+SHARE_FLOAT_DIR = ROOT / "data" / "raw" / "tushare" / "share_float"
+TOP_INST_DIR = ROOT / "data" / "raw" / "tushare" / "top_inst"
+HOLDER_DIR = ROOT / "data" / "raw" / "tushare" / "stk_holdernumber"
 
 T2D_COLS = ["t2d_rz_chg5", "t2d_rz_chg20", "t2d_rz_net5", "t2d_rz_buy_z"]
 T3_COLS = ["t3_ind_ret5", "t3_ind_ret20", "t3_rel5"]
 T1C_COLS = ["t1c_seas", "t1c_seas_diff", "t1c_seas_hit"]
-# t1c 不在默认里: 同信号 08-30 已判死, 函数保留供 --only t1c 显式调用
+T2C_COLS = ["t2c_days_next", "t2c_ratio_next", "t2c_ratio_fwd60", "t2c_ratio_past20"]
+T2B_COLS = ["t2b_cnt20", "t2b_inst_net20", "t2b_days_since"]
+T3H_COLS = ["t3h_chg", "t3h_days"]
+# t1c 不在默认里: 同信号 08-30 已判死, 函数保留供 --only t1c 显式调用。
+# 第二波 (t2c/t2b/t3h, 09-03 凌晨) 用 --source tick1_b2 --output tick1_b3 --only 三族 建列。
 FAMS = {"t2d": T2D_COLS, "t3": T3_COLS}
-ALL_FAMS = {**FAMS, "t1c": T1C_COLS}
+ALL_FAMS = {**FAMS, "t1c": T1C_COLS, "t2c": T2C_COLS, "t2b": T2B_COLS, "t3h": T3H_COLS}
 
 T2D_LAG = 1          # 两融 D+1 早公布
 T3_MIN_PEERS = 5     # 行业内(剔自身)至少 5 只才算行业收益
 T1C_MIN_YEARS = 3    # 同月至少 3 个往年观测
+T2C_HORIZON = 60     # 解禁"还有几天"的上限(日历日); 没有已知事件 = 上限
+T2C_PAST_DAYS = 28   # “近 20 交易日”的日历日近似
+T2B_LAG = 1          # 龙虎榜盘后才公布, 与 17:30 信号链赛跑, 保守滞后一天
+T2B_SINCE_CAP = 60   # 距上次上榜交易日数上限
+T3H_DAYS_CAP = 250   # 距最近一次股东户数公告天数上限
 
 
 def _c6_of(s):
@@ -212,6 +224,117 @@ def t1c_frame(codes):
     return out  # 月粒度 (y, m, _c6) -> 后面按矩阵行的年月贴
 
 
+# ── T2C 解禁日历 (第二波) ──────────────────────────────────────────
+def _read_dir(d, cols=None):
+    files = sorted(Path(d).glob("*.parquet"))
+    if not files:
+        raise RuntimeError(f"目录为空: {d}")
+    return pd.concat([pd.read_parquet(f, columns=cols) for f in files], ignore_index=True)
+
+
+def t2c_frame(keys):
+    """share_float -> 每个 (date, _c6) 的解禁日历特征
+
+    PIT: 事件在 ann_date **次日**才算已知(公告盘后出, 与 17:30 信号链赛跑, 保守处理);
+    没有 ann_date 的事件在解禁日前一律视为未知, 只进"近期已解禁"一列。
+    实测公告->解禁中位仅 6 天, 所以 days_next 大多数时候是"上限"(无已知事件)。
+    """
+    sf = _read_dir(SHARE_FLOAT_DIR, ["ts_code", "ann_date", "float_date", "float_ratio"])
+    sf["_c6"] = sf["ts_code"].astype(str).str[:6]
+    sf["fd"] = pd.to_datetime(sf["float_date"].astype(str), format="%Y%m%d", errors="coerce")
+    sf["ann"] = pd.to_datetime(sf["ann_date"].astype(str), format="%Y%m%d", errors="coerce")
+    sf = sf.dropna(subset=["fd", "float_ratio"])
+    sf["known"] = (sf["ann"] + pd.Timedelta(days=1)).fillna(sf["fd"])
+    sf = sf[sf["_c6"].isin(set(keys["_c6"]))]
+    H = np.timedelta64(T2C_HORIZON, "D")
+    P = np.timedelta64(T2C_PAST_DAYS, "D")
+    parts = []
+    for c, kk in keys.groupby("_c6", sort=False):
+        d = kk["date"].values.astype("datetime64[D]")[:, None]
+        ev = sf[sf["_c6"] == c]
+        out = pd.DataFrame({"date": kk["date"].values, "_c6": c})
+        if ev.empty:
+            out["t2c_days_next"] = float(T2C_HORIZON)
+            out["t2c_ratio_next"] = out["t2c_ratio_fwd60"] = out["t2c_ratio_past20"] = 0.0
+            parts.append(out)
+            continue
+        fd = ev["fd"].values.astype("datetime64[D]")[None, :]
+        kn = ev["known"].values.astype("datetime64[D]")[None, :]
+        r = ev["float_ratio"].values.astype(float)
+        up = (kn <= d) & (d < fd) & (fd - d <= H)          # 已知、未来 60 日内
+        gap = (fd - d).astype("timedelta64[D]").astype(int)
+        gap_m = np.where(up, gap, 10 ** 6)
+        nxt = gap_m.min(axis=1)
+        has = nxt <= T2C_HORIZON
+        out["t2c_days_next"] = np.where(has, nxt, T2C_HORIZON).astype(float)
+        out["t2c_ratio_next"] = np.where(has, r[gap_m.argmin(axis=1)], 0.0)
+        out["t2c_ratio_fwd60"] = up.astype(float) @ r
+        past = (fd <= d) & (d - fd < P)
+        out["t2c_ratio_past20"] = past.astype(float) @ r
+        parts.append(out)
+    res = pd.concat(parts, ignore_index=True)
+    print(f"  T2C 解禁: 事件 {len(sf)} 条 / {sf['_c6'].nunique()} 只; 有已知待解禁的行占 "
+          f"{(res['t2c_days_next'] < T2C_HORIZON).mean():.1%}")
+    return res
+
+
+# ── T2B 龙虎榜席位 (第二波) ────────────────────────────────────────
+def t2b_frame(kline, lag=T2B_LAG):
+    """top_inst 席位明细 -> 日度 -> 交易日历上的 20 日滚动 (在 kline 日期上铺开, 没上榜=0)
+
+    上榜是交易所机械规则(涨跌幅偏离/换手), 覆盖集不是事后挑的, 无 watchlist 式前视;
+    但极稀疏(池内每日中位 3 只), 多数行为 0 / 上限。机构席位净买用 20 日成交额归一。
+    """
+    ti = _read_dir(TOP_INST_DIR, ["trade_date", "ts_code", "exalter", "net_buy"])
+    ti["_c6"] = ti["ts_code"].astype(str).str[:6]
+    ti["date"] = pd.to_datetime(ti["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+    ti = ti.dropna(subset=["date"])
+    ti["inst_net"] = np.where(ti["exalter"].astype(str).str.contains("机构"), ti["net_buy"].fillna(0), 0.0)
+    daily = ti.groupby(["_c6", "date"], as_index=False).agg(inst_net=("inst_net", "sum"))
+    daily["listed"] = 1.0
+    k = kline[["_c6", "date", "amount"]].merge(daily, on=["_c6", "date"], how="left")
+    k[["inst_net", "listed"]] = k[["inst_net", "listed"]].fillna(0.0)
+    k = k.sort_values(["_c6", "date"]).reset_index(drop=True)
+    g = k.groupby("_c6", sort=False)
+    k["t2b_cnt20"] = g["listed"].transform(lambda s: s.rolling(20, min_periods=20).sum())
+    amt20 = g["amount"].transform(lambda s: s.rolling(20, min_periods=20).sum())
+    k["t2b_inst_net20"] = g["inst_net"].transform(lambda s: s.rolling(20, min_periods=20).sum()) / amt20.where(amt20 > 0)
+    # 距上次上榜的交易日数: 上榜日记下行号, 前向填充后相减
+    pos = pd.Series(np.arange(len(k)), index=k.index, dtype=float)
+    last = pos.where(k["listed"] > 0).groupby(k["_c6"]).ffill()
+    k["t2b_days_since"] = (pos - last).clip(upper=T2B_SINCE_CAP).fillna(T2B_SINCE_CAP)
+    if lag > 0:
+        k[T2B_COLS] = k.groupby("_c6", sort=False)[T2B_COLS].shift(lag)
+    out = k[["date", "_c6"] + T2B_COLS].replace([np.inf, -np.inf], np.nan)
+    print(f"  T2B 龙虎榜: 席位行 {len(ti):,}, 池内上榜股日 {int(k['listed'].sum())}, lag={lag}")
+    return out.reset_index(drop=True)
+
+
+# ── T3H 股东户数 (第二波) ───────────────────────────────────────────
+def t3h_frame(keys):
+    """stk_holdernumber -> 最近一次已知公告的户数环比变化 + 距公告天数 (ann_date 次日才已知)"""
+    hn = _read_dir(HOLDER_DIR, ["ts_code", "ann_date", "end_date", "holder_num"])
+    hn["_c6"] = hn["ts_code"].astype(str).str[:6]
+    # ann_date 有 "20250512" 与 "2025-05-12 15:09:08" 两种写法混用
+    hn["ann"] = pd.to_datetime(hn["ann_date"].astype(str).str.replace("-", "").str[:8],
+                               format="%Y%m%d", errors="coerce").dt.normalize()
+    hn["end"] = pd.to_datetime(hn["end_date"].astype(str).str.replace("-", "").str[:8],
+                               format="%Y%m%d", errors="coerce")
+    hn = hn.dropna(subset=["ann", "end", "holder_num"])
+    hn = hn[hn["holder_num"] > 0]
+    hn = hn.sort_values(["_c6", "end", "ann"]).drop_duplicates(["_c6", "end"], keep="last")
+    hn["t3h_chg"] = np.log(hn["holder_num"] / hn.groupby("_c6")["holder_num"].shift(1))
+    hn["known"] = hn["ann"] + pd.Timedelta(days=1)
+    hn = hn.dropna(subset=["t3h_chg"]).sort_values("known")
+    k = keys.sort_values("date").reset_index(drop=True)
+    j = pd.merge_asof(k, hn[["_c6", "known", "t3h_chg"]], left_on="date", right_on="known",
+                      by="_c6", direction="backward")
+    j["t3h_days"] = (j["date"] - j["known"]).dt.days.clip(upper=T3H_DAYS_CAP)
+    print(f"  T3H 股东户数: 公告 {len(hn):,} 条 / {hn['_c6'].nunique()} 只, "
+          f"矩阵行有值 {j['t3h_chg'].notna().mean():.1%}")
+    return j[["date", "_c6"] + T3H_COLS]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default="training_data_pit_v24_tick1.parquet")
@@ -235,7 +358,7 @@ def main():
 
     start = mat["date"].min() - pd.Timedelta(days=120)
     out = mat
-    if "t2d" in fams or "t3" in fams:
+    if {"t2d", "t3", "t2b"} & set(fams):
         need_all = "t3" in fams
         all_codes = (sorted(p.stem for p in KLINE_DIR.glob("[036]*.parquet"))
                      if need_all else codes)
@@ -246,6 +369,12 @@ def main():
             f = t2d_frame(codes, kl[kl["_c6"].isin(set(codes))])
         elif fam == "t3":
             f = t3_frame(kl)
+        elif fam == "t2c":
+            f = t2c_frame(mat[["date", "_c6"]])
+        elif fam == "t2b":
+            f = t2b_frame(kl[kl["_c6"].isin(set(codes))])
+        elif fam == "t3h":
+            f = t3h_frame(mat[["date", "_c6"]])
         else:
             f = t1c_frame(codes)
             out["y"], out["m"] = out["date"].dt.year, out["date"].dt.month
