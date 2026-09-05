@@ -95,6 +95,14 @@ BASE_PARAMS = {
     # IR 0.57~1.21 (均值0.92), 集成后 1.23~1.30 且两段更均衡。
     # 显式钉死种子列表: live_signal 默认值将来若改, 这里保证线上不悄悄变。
     "seed-ensemble": "42,7,123,2024,31337",
+    # 训练历史滑窗(年). None = expanding(矩阵 2022-09 起全用, 会一直变长).
+    # 2026-09-05 X19 生产血统矩阵(2019 起, 2022-09 后与生产逐值相等)同矩阵同池对照,
+    # 唯一变量=训练起点: expanding 从 2019-07 起(4→7 年) vs 从 2022-09 起(1→4 年)
+    # 窗 B' 配对 -46.6pp, 0/10 正 —— 超过 ~3 年的旧历史把 alpha 打到零; 滑窗 3y vs 2022 起
+    # +18.7pp(7/10). 生产 expanding 现在 4 年, 不加遗忘机制就是在往 EXP 那条路上走.
+    # 用户 09-05 拍板: v2 终判(te=矩阵最新日, 20 种子) R3−E22 ≥ -5pp 则改 3. 不进指纹,
+    # 删回 None 即回滚. 证据 docs/findings_2026-09-05_expand_2019_prodlineage.md
+    "train-years": None,
     # 整手粒度救济(lot-flex)不在这里: 它是每条线自己的参数, 见 PROFILES。
     # 2万线开 0.5 (两份独立数据都验证有效: +0.79/+0.28), 5万线关
     # (两份数据都偶负: -0.04/-0.21, 虽在噪声内但真金线不上未验证正收益的东西)。
@@ -750,6 +758,9 @@ def signal_args(pid, include_features=True):
     if _ff:
         _slug = Path(_ff).stem.lower().removeprefix("features_")
         _cache = _cache.with_name(f"{_cache.stem}_{_slug}{_cache.suffix}")
+    # 训练滑窗不同 = 模型不同, 同理分文件(全局开时所有线同后缀, 仍共享)
+    if params.get("train-years") is not None:
+        _cache = _cache.with_name(f"{_cache.stem}_ty{params['train-years']:g}{_cache.suffix}")
     out += ["--preds-cache", str(_cache)]
     # 线自己的 features-from 已在上面的参数循环里发出; 只有没覆盖的线才发全局表。
     # (不能两个都发: argparse 后者覆盖前者, 全局表会把分线表顶掉。)

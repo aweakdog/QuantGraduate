@@ -109,6 +109,12 @@ ap.add_argument("--n-features", type=int, default=80)
 ap.add_argument("--corr-threshold", type=float, default=0.9)
 ap.add_argument("--feat-cutoff", default="2023-09-19",
                 help="特征筛选只允许用该日期之前的数据 (与回测保持一致)")
+ap.add_argument("--train-years", type=float, default=None,
+                help="训练集滑窗: 只用 cutoff 往前 N 年内的样本 (与 wf_v35 --train-years 同义, "
+                     "365.25 天/年). 缺省 None = expanding 用矩阵全部历史. 证据: 2026-09-05 X19 "
+                     "生产血统同矩阵对照, 训练历史超过 ~3 年后 alpha 归零(expanding 2019 起 vs "
+                     "2022 起 -46.6pp 0/10), 滑窗 3y 不输生产等价; 见 findings_2026-09-05. 不进指纹: "
+                     "只改模型不改持仓记账, 删配置即回滚")
 ap.add_argument("--features-from",
                 default="wf_daily_REGRESS_CHK_ts2022-09-01_te2026-07-27_cap50000.json",
                 help="直接复用回测结果 json 里的 selected_features (data/processed/ 下); "
@@ -1522,7 +1528,12 @@ else:
 # ── 训练 + 预测 ──
 seq = date_pos[SIGNAL_DATE]
 cutoff = all_dates[seq - LABEL_HORIZON]
-train_df = df[(df["date"] < cutoff) & df[LABEL].notna()]
+_tr_mask = (df["date"] < cutoff) & df[LABEL].notna()
+TRAIN_FROM = None
+if args.train_years is not None:
+    TRAIN_FROM = pd.Timestamp(cutoff) - pd.Timedelta(days=args.train_years * 365.25)
+    _tr_mask &= df["date"] >= TRAIN_FROM
+train_df = df[_tr_mask]
 if train_df["date"].nunique() < MIN_TRAIN_DAYS:
     raise SystemExit(f"ERROR: 训练集只有 {train_df['date'].nunique()} 天, 少于 {MIN_TRAIN_DAYS}")
 # 四条线的模型完全相同 —— 特征、标签、训练集、超参都不依赖 tranche_n 与本金,
@@ -1537,6 +1548,7 @@ if args.preds_cache:
         "params": {k: str(v) for k, v in sorted(LOCKED_PARAMS.items())},
         "seeds": ENSEMBLE_SEEDS,
         "skip_boards": list(SKIP_BOARDS),
+        "train_years": args.train_years,
         "rows": int(len(train_df)),
     }, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
@@ -1557,8 +1569,9 @@ if _cache_key:
             print(f"[训练] 预测缓存读取失败, 改为重新训练: {e}")
 
 if ranked is None:
-    print(f"\n[训练] 样本 < {pd.Timestamp(cutoff).date()} | "
-          f"{train_df['date'].nunique()} 天 {len(train_df):,} 行 {len(features_used)} 特征 | "
+    print(f"\n[训练] 样本 < {pd.Timestamp(cutoff).date()}"
+          + (f" 且 >= {TRAIN_FROM.date()} (滑窗 {args.train_years:g} 年)" if TRAIN_FROM is not None else " (expanding)")
+          + f" | {train_df['date'].nunique()} 天 {len(train_df):,} 行 {len(features_used)} 特征 | "
           f"{len(ENSEMBLE_SEEDS)} 种子集成"
           + (f" | 门控: {'弱势态→CGO模型' if gate_weak else '强势态→base模型'}"
              if args.gate_ma60 else ""))

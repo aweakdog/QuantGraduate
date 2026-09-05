@@ -201,3 +201,26 @@ def test_feature_set_lines_use_isolated_preds_cache():
                 ("aggr5w", "steady5w", "aggr2w", "steady2w",
                  "base5w_aggr", "base5w_steady")}
     assert len(distinct) == 6, f"六类模型的缓存文件必须两两不同: {distinct}"
+
+
+def test_train_years_plumbing(monkeypatch):
+    """训练滑窗是模型参数: None 时不发旗标、缓存文件不变; 开了要发 --train-years
+    且缓存文件带 _ty 后缀(与 expanding 模型的缓存隔离), 所有线同后缀仍共享"""
+    import live_config
+    from live_config import signal_args
+
+    def cache_of(pid):
+        a = signal_args(pid)
+        return a[a.index("--preds-cache") + 1]
+
+    monkeypatch.setitem(live_config.BASE_PARAMS, "train-years", None)
+    off = signal_args("aggr5w")
+    assert "--train-years" not in off
+    assert "_ty" not in cache_of("aggr5w")
+
+    monkeypatch.setitem(live_config.BASE_PARAMS, "train-years", 3)
+    on = signal_args("aggr5w")
+    assert on[on.index("--train-years") + 1] == "3"
+    assert cache_of("aggr5w").endswith("_ty3.json")
+    assert cache_of("aggr5w") == cache_of("aggr10w")
+    assert cache_of("aggr5w") != cache_of("steady5w")

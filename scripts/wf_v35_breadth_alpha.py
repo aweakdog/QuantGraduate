@@ -39,7 +39,8 @@ if str(ROOT) not in sys.path:
 
 parser = argparse.ArgumentParser(description="WF v35 breadth + alpha vs benchmark")
 parser.add_argument("--test-start", type=str, default="2022-09-01")
-parser.add_argument("--test-end", type=str, default="2026-07-16")
+parser.add_argument("--test-end", type=str, default=None,
+                    help="缺省=矩阵最新日. alpha 会衰减, 回测每次都应跟到最新日期; 固定旧日期只在复现档案时显式给")
 parser.add_argument("--initial-capital", type=float, default=100000.0)
 parser.add_argument("--label", type=str, default="5d", choices=["1d", "2d", "5d"],
                     help="预测目标: 1d=次日收益, 5d=5日收益(与5日持有对齐)")
@@ -215,6 +216,11 @@ from pipeline.config import settings
 DATA_DIR = settings.DATA_DIR
 TRAIN_PATH = DATA_DIR / "processed" / args.train_file
 KLINE_DIR = DATA_DIR / "raw" / "kline"
+if args.test_end is None:
+    import pyarrow.parquet as pq
+    _dmax = pd.to_datetime(pq.read_table(TRAIN_PATH, columns=["date"]).column("date").to_pandas()).max()
+    args.test_end = f"{_dmax:%Y-%m-%d}"
+    print(f"--test-end 未给, 跟到矩阵最新日 {args.test_end}")
 
 LABEL_RAW = {"1d": "fwd_1d_ret", "2d": "fwd_2d_ret", "5d": "fwd_5d_ret"}[args.label]
 LABEL = "y_target"
@@ -1515,6 +1521,26 @@ for h in halves:
           f"IR {h['ir']:.2f} {flag}")
 both = all(h["excess_annual_pct"] > 0 for h in halves)
 print(f"  两段都跑赢       : {'是 ✓' if both else '否 ✗'}")
+# ── 近期分段: alpha 会衰减, 最近 6/3 个月单独看 ──
+recent = []
+for name, k in (("最近6月", 126), ("最近3月", 63)):
+    if n <= k:
+        continue
+    rr, bb = r.iloc[-k:], bench_s.iloc[-k:]
+    ex = rr - bb
+    recent.append({
+        "segment": name,
+        "period": f"{rdf['date'].iloc[-k]:%Y-%m-%d} ~ {rdf['date'].iloc[-1]:%Y-%m-%d}",
+        "strategy_pct": round(float((1 + rr).prod() - 1) * 100, 1),
+        "benchmark_pct": round(float((1 + bb).prod() - 1) * 100, 1),
+        "excess_annual_pct": round(float(ex.mean()) * 252 * 100, 1),
+        "ir": round(float(ex.mean() / ex.std() * np.sqrt(252)) if ex.std() > 0 else 0.0, 2),
+    })
+for h in recent:
+    flag = "✓" if h["excess_annual_pct"] > 0 else "✗"
+    print(f"  {h['segment']} {h['period']}: 策略 {h['strategy_pct']:+.1f}% "
+          f"vs 基准 {h['benchmark_pct']:+.1f}% | 年化超额 {h['excess_annual_pct']:+.1f}% "
+          f"IR {h['ir']:.2f} {flag}")
 print(f"  耗时             : {(datetime.now()-t0).total_seconds():.0f}s")
 
 json.dump({
@@ -1586,6 +1612,7 @@ json.dump({
         "beat_both_halves": bool(both),
     },
     "stability": halves,
+    "recent": recent,
     "daily": daily_records, "trades": trade_log,
 }, open(_tmp_out := OUT_PATH.with_suffix(".json.part"), "w", encoding="utf-8"),
     ensure_ascii=False, indent=2, default=str)
