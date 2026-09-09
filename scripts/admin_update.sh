@@ -61,7 +61,8 @@ git -C "$SOURCE" log --oneline "$current..$target" | head -20
 
 stage="$(mktemp -d "$STATE/update-stage.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT
-git -C "$SOURCE" archive "$target" "${CODE_DIRS[@]}" | tar -x -C "$stage"
+# 代码文件保持 git 里的 644/755 (整个脚本 umask 077 只是为了锁/标记/暂存目录本身)
+( umask 022; git -C "$SOURCE" archive "$target" "${CODE_DIRS[@]}" | tar -x -C "$stage" )
 
 "$PY" - "$stage" <<'PYEOF'
 import os, sys
@@ -93,5 +94,11 @@ for d in "${CODE_DIRS[@]}"; do
   rsync -a --no-links "${SELF_EXCLUDES[@]}" "$stage/$d/" "$LIVE/$d/"
 done
 printf '%s\n' "$target" > "$MARKER"
+# 活树自己也是个 git 仓: 把 HEAD/index 对齐到已部署提交 (mixed reset 不碰工作区),
+# 这样 SSH 上去 `git status` 看到的就是真漂移。失败不影响部署结果。
+if [[ -d "$LIVE/.git" ]]; then
+  ( git -C "$LIVE" fetch --quiet origin "refs/heads/$BRANCH" && git -C "$LIVE" reset --quiet --mixed "$target" ) \
+    || echo "note: live git HEAD not aligned (worktree is deployed regardless)"
+fi
 echo "deployed: $target"
 echo "restart required"

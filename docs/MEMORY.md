@@ -114,6 +114,7 @@
 - 指纹已迁移（fpmigrate 备份在 data/live/backup/），回滚 = 改回两行 + 还原 state；FDRR8 回滚 = 删两个 profile 键（或用 scripts/*.bak_fdrr8）
 - daily_rebuild §4.5 硬失败：tick 断供 >3 天宁可无信号
 - **分账户口令（2026-08-18）**：登录框口令即身份。213213 全站只读 / 611611 全站可写（免 ops 二次密码）/ px·llx·phy·xjb·fyf·xmy 只见且只能改自己名下的线（px=steady5w+aggr2w_px2，xmy=steady2w 即 plmm_2）。页面有「看全部/只看自己」切换（?all=1 只放宽看）。表在 `live_config.ACCESS_CODES`，改完重启 quant-web；token 每口令独立密钥，改一个只废一个。账户会话接口面收窄（/pro /backtest /api/status 等默认线接口全 403）；口令表优先于旧环境变量（否则 611611 会命中旧 QUANT_VIEW_PASSWORD 拿到要二次密码的旧身份）。详见 credentials.md §2.1，测试 test_web_access_codes.py
+- **无 VPN 应急面 quant-admin（2026-09-09）**：041 sshd 有来源白名单，校 VPN 一挂 SSH 就上不去；`eez041:8738` HTTPS 独立进程只做 7 个固定动作（status/health/logs/backup/update/restart/daily），HMAC 签名 + nonce 防重放 + 证书指纹固定，本机 `python3 scripts/admin_client.py <动作>`。`update` 只认 github main **快进** + 3.10 compileall + 两组纯逻辑测试，rsync 进 scripts/pipeline/tests（不碰 data/.venv/配置），并把 041 活树 git HEAD 对齐。**纪律：SSH 手工 scp 到 041 的改动必须随后 commit+push，否则下次 update 会覆盖回 main**；日更链 `activating` 时不要 update/daily。admin_* 三文件更新器排除，改它们必须 SSH。手册 `docs/vpn_fallback_admin.md`，凭据位置 credentials.md §2.2，回归 test_admin_plane.py
 
 ## 7. 交付物约定
 

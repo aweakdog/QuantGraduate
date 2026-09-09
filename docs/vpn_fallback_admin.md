@@ -38,11 +38,12 @@ python3 scripts/admin_client.py status
 flock 互斥 → 校验 origin 是固定仓库 → fetch main → **拒绝非快进** (公网接口不给回滚) → `git archive` 到临时目录 →
 拒绝 symlink / `.pem` `.key` `.env` `.db` → 用生产 venv 的 **python 3.10** `compileall` 全部 .py (本机是 3.13, 新语法在这一步被拦) →
 在暂存目录跑 `test_web_access_codes` + `test_live_config_profiles` → `rsync --no-links` 进三个代码目录 (不删文件、不碰 `data/` `.venv/` 配置) →
-写 `~/.local/state/quant-admin/deployed-commit`。重启是单独动作, 为的是先看见更新校验结果。
+写 `~/.local/state/quant-admin/deployed-commit` → 把活树自己的 git HEAD 对齐到该提交 (mixed reset, 不碰工作区)。
+重启是单独动作, 为的是先看见更新校验结果。
 
 **两条纪律**:
 - 通过 SSH 手工 `scp` 到 041 的改动, 必须随后 commit+push; 否则下次应急 `update` 会把它覆盖回 main 的版本。
-  (2026-09-09 引导时已把 041 活树的 `git HEAD` 对齐到 main, `git -C ~/quant-strategy status` 里代码目录应保持干净。)
+  (更新器每次都把 041 活树的 `git HEAD` 对齐到已部署提交, 所以 `git -C ~/quant-strategy status` 里代码目录有东西 = 有未推的手工改动。)
 - `status` 里 `daily.active_state` 是 `activating` 时 (日更链正在跑, 21:30 起约 1~2h) 不要 `update`/`daily`。
 
 ## 安全边界
@@ -96,5 +97,6 @@ chmod 600 "$HOME/Library/Application Support/QuantAdmin/"*
 | `update failed (25)` | 预检失败: 3.10 编译不过或两组测试挂了, 修了再推 |
 | `update failed (24)` | 非快进: main 被 force-push 或落后于服务器标记 |
 
-验收 (2026-09-09): 鉴权 10 项回归 `tests/test_admin_plane.py`; 真实快进 `13143af → <admin plane 提交>` 走完
-fetch→archive→3.10 compileall→26 测试→rsync→标记; restart 闭环 PID 变化 + HTTP 探活。**校外无 VPN 的可达性还要用手机热点跑一次 `status` 确认**。
+验收 (2026-09-09): 鉴权 10 项回归 `tests/test_admin_plane.py`; 两次真实快进 (`13143af → f1a235d → 本提交`) 走完
+fetch→archive→3.10 compileall→26 测试→rsync→标记→HEAD 对齐, 单次 17s; restart 闭环 PID 2364027→2378569 + HTTP 探活。
+**校外无 VPN 的可达性还要用手机热点跑一次 `status` 确认** (8738 在校防火墙实测放行的 8000-8929 段内, 但没在校外亲测)。

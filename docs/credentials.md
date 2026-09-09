@@ -132,8 +132,21 @@ systemctl --user restart quant-web.service
 | `THS_PYTHON` | 空 | Windows 上 thsdk 专用 Python 解释器路径 |
 | `UFD_ROUTER` | 空 | UFD 路由，可选 |
 
-> 凭据共三组：同花顺账号（§1，在 `.env`）+ 网页两个密码（§2，在服务器
-> `~/.config/quant-web.env`）。没有企业微信 webhook、neo4j 密码或其他 API key。
+> 凭据共四组：同花顺账号（§1，在 `.env`）+ 网页两个密码（§2，在服务器
+> `~/.config/quant-web.env`）+ **应急维护面 quant-admin**（§2.2）。没有企业微信 webhook、neo4j 密码或其他 API key。
+
+### 2.2 应急维护面 quant-admin（2026-09-09 起，无 VPN 时用）
+
+`eez041:8738` HTTPS，独立进程 `quant-admin.service`，固定 7 个动作（status/health/logs/backup/update/restart/daily），
+手册见 `docs/vpn_fallback_admin.md`。凭据**不在本文档写明文**，也不进 git：
+
+| 凭据 | 服务器 | 本机 (Mac) |
+|---|---|---|
+| 管理 token（256 位，HMAC 签名用，从不上网线） | `~/.config/quant-admin.env` 的 `QA_ADMIN_TOKEN`（0600） | `~/Library/Application Support/QuantAdmin/admin-token`（0600） |
+| 自签证书 SHA-256 指纹（客户端固定校验） | `~/.config/quant-admin/cert.pem` 算出 | `~/Library/Application Support/QuantAdmin/server-cert.sha256`（0600） |
+
+换 token：`bash ~/quant-strategy/scripts/admin_bootstrap.sh --rotate`（旧的立刻作废）；换证书 `--recert`；
+撤销：`systemctl --user disable --now quant-admin.service && rm ~/.config/quant-admin.env`。审计在 `~/.local/state/quant-admin/audit.log`。
 
 ---
 
