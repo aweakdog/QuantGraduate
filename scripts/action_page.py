@@ -1868,27 +1868,58 @@ async function submitTicked(none){
   }
   try {
     const d = await api('/api/profile/confirm', {profile: PID, fills});
-    setDone([]); setFills({});                   // 已入账, 清掉免得下轮串
     toast(d.note, 6000);
-    pollRun();
+    // 填的股数/成交价先留着: 后台可能拒(比如算出现金为负), 拒了改完还要再提。
+    // 真入账了再清, 免得下轮串。
+    pollRun('已结算并生成新计划', () => { setDone([]); setFills({}); });
   } catch(e){ toast('提交失败: ' + e.message, 8000); }
 }
 
-// 结算/重置都要跑一遍模型, 轮询到跑完再刷新页面
-async function pollRun(okMsg){
-  for (let i = 0; i < 90; i++){
-    await new Promise(r => setTimeout(r, 2000));
-    let s;
-    try { s = await (await fetch('/api/signal-status')).json(); } catch(e){ continue; }
-    if (!s.active){
-      const log = s.log || '';
-      if (/ERROR|Traceback/.test(log)) toast('后台任务报错, 详情见运维仪表盘', 6000);
-      else toast(okMsg || '已结算并生成新计划', 4000);
+// 后台任务(确认成交/重置)被拒时, 原因要常驻显示到你点掉为止。
+// 它只活在 /api/signal-status 的内存里, 之前只弹 6 秒 toast, 而且页面一刷
+// 轮询就断了 —— 2026-09-08 凌晨 aggr10w 因现金算成负数被拒 3 次, 每次都在
+// 后台跑完前刷新了页面, 看起来就像"卡住"。
+let BGFAIL = null;
+const bgFailed = s => /ERROR|Traceback/.test(s.log || '');
+function bgErrText(log){
+  let i = log.indexOf('ERROR'); if (i < 0) i = log.indexOf('Traceback');
+  return (i >= 0 ? log.slice(i) : log).trim().slice(-1500);
+}
+function noteBgFail(s){
+  if (localStorage.getItem('bgfail_seen') === s.done_at) return;   // 已点过"知道了"
+  BGFAIL = {task: s.task || '', done_at: s.done_at || '', text: bgErrText(s.log || '')};
+}
+function dismissBgFail(){
+  if (BGFAIL) localStorage.setItem('bgfail_seen', BGFAIL.done_at);
+  BGFAIL = null; load();
+}
+
+// 页面(重新)打开时补看一眼后台: 正在跑就接着轮询; 30 分钟内失败过就把原因摆出来
+async function checkBg(){
+  let s;
+  try { s = await (await fetch('/api/signal-status')).json(); } catch(e){ return; }
+  if (s.active){ toast('后台正在' + (s.task || '结算') + ', 完成后自动刷新', 4000); pollRun(); return; }
+  if (s.done_at && Date.now() - new Date(s.done_at).getTime() < 30*60*1000 && bgFailed(s)) noteBgFail(s);
+}
+
+// 结算/重置都要跑一遍模型, 轮询到跑完再刷新页面。onOk 只在后台真成功时调
+let POLLING = false;
+async function pollRun(okMsg, onOk){
+  if (POLLING) return;
+  POLLING = true;
+  try {
+    for (let i = 0; i < 90; i++){
+      await new Promise(r => setTimeout(r, 2000));
+      let s;
+      try { s = await (await fetch('/api/signal-status')).json(); } catch(e){ continue; }
+      if (s.active) continue;
+      if (bgFailed(s)){ noteBgFail(s); toast('后台拒绝了这次操作, 原因见页面顶部', 6000); }
+      else { if (onOk) onOk(); toast(okMsg || '已结算并生成新计划', 4000); }
       load();
       return;
     }
-  }
-  toast('耗时偏长, 请稍后刷新');
+    toast('耗时偏长, 请稍后刷新');
+  } finally { POLLING = false; }
 }
 
 // 两个数据接口共用的 query: 当前线 + 账户会话的「看全部」标记
@@ -1945,6 +1976,14 @@ async function loadAct(){
   const bcls = {none:'b-none', trade:'b-trade', cash:'b-cash', stale:'b-stale',
                 await:'b-await', init:'b-init'}[d.action] || 'b-init';
   let h = '';
+
+  // 后台刚拒过这条线的操作: 账没记、计划没变, 原因原文摆在最上面
+  await checkBg();
+  if (BGFAIL && (!BGFAIL.task || BGFAIL.task.endsWith(' ' + PID)))
+    h += `<div class="warn"><b>上次「${esc(BGFAIL.task || '后台任务')}」被系统拒绝了</b>（${
+        esc(BGFAIL.done_at.replace('T',' '))}），账没有记、计划没有变。原因：
+      <pre style="white-space:pre-wrap;margin:8px 0 10px;font-size:12px;line-height:1.6;color:#fecaca">${esc(BGFAIL.text)}</pre>
+      <div class="btn" style="display:inline-block;flex:none" onclick="dismissBgFail()">知道了</div></div>`;
 
   // 实盘模式在等你确认时, 整条线都停着, 所以置顶提示。
   // 有买卖单时确认入口在下面的操作清单里(打勾); 没有单时这里直接给个按钮。

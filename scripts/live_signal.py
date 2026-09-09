@@ -195,6 +195,10 @@ ap.add_argument("--set-cash", type=float, default=None,
 ap.add_argument("--cash-flow", type=float, default=None,
                 help="出入金: 正数存入, 负数取出。这是本金变动不是盈亏, "
                      "所以现金和本金同额增减, 收益率保持不变")
+ap.add_argument("--set-capital", type=float, default=None,
+                help="本金重记: 只改 initial_capital, 现金和持仓都不动。"
+                     "用于把重置前的真实本金补回来, 让累计盈亏把之前的亏损体现出来 "
+                     "(本金调大 -> 累计盈亏变小)。不是出入金, 不是修账")
 ap.add_argument("--drop-lot", default=None,
                 help="删除一笔持仓 (填6位代码)。必须同时说明现金怎么算: "
                      "配 --sold-at <成交价> 表示已在券商卖出(现金增加); "
@@ -1211,6 +1215,50 @@ def do_set_cash(st, kl, names):
     save_state(st)
 
 
+def do_set_capital(st, kl, names):
+    """本金重记: 只改 initial_capital, 不动现金和持仓。
+
+    场景: 「从头再来」时填的本金和真实投入不一致 (比如实际投了 11 万, 亏到
+    10 万后重置时填了 10 万), 于是之前的亏损从账面上消失了。把本金改回 11 万,
+    总资产不变, 累计盈亏 = 总资产 - 本金 就会把那 1 万亏损重新体现出来。
+
+    它和另外两个现金操作的区别:
+      --set-cash  只动现金        (修账)
+      --cash-flow 现金+本金同额    (出入金)
+      --set-capital 只动本金      (重记分母)
+    本金不参与任何交易决策 (每只预算按总资产算), 所以改它只影响收益率显示。
+    """
+    new_cap = float(args.set_capital)
+    if new_cap <= 0:
+        raise SystemExit(f"ERROR: 本金必须为正 (收到 {new_cap})")
+    before = snapshot(st, kl, names)
+    old_cap = float(st.get("initial_capital") or 0)
+    delta = new_cap - old_cap
+
+    bak = backup_state("setcapital")
+    st["initial_capital"] = new_cap
+    after = snapshot(st, kl, names)
+    st.setdefault("history", []).append({
+        "type": "set_capital", "at": datetime.now().isoformat(timespec="seconds"),
+        "note": args.note, "delta": round(delta, 2),
+        "before": {"initial_capital": old_cap, "equity": before["equity"]},
+        "after": {"initial_capital": new_cap, "equity": after["equity"]},
+    })
+
+    W = 68
+    print(f"\n{'='*W}\n  本金重记 (只改分母, 现金/持仓不动)\n{'='*W}")
+    print(f"  本金   : ¥{old_cap:,.2f}  ->  ¥{new_cap:,.2f}  ({delta:+,.2f})")
+    print(f"  总资产 : ¥{after['equity']:,.2f}  (不变)")
+    print(f"  累计盈亏: ¥{before['equity'] - old_cap:+,.2f}  ->  ¥{after['equity'] - new_cap:+,.2f}")
+    if before["total_return_pct"] is not None and after["total_return_pct"] is not None:
+        print(f"  收益率 : {before['total_return_pct']:+.2f}%  ->  {after['total_return_pct']:+.2f}%")
+    if args.note:
+        print(f"  备注   : {args.note}")
+    if bak:
+        print(f"  已备份 : {bak.name}")
+    save_state(st)
+
+
 def do_cash_flow(st, kl, names):
     """出入金: 存入(正)或取出(负)。
 
@@ -1381,9 +1429,12 @@ if args.sync_template:
 if args.sync:
     do_sync(state, kl, names)
     sys.exit(0)
-if args.set_cash is not None and args.cash_flow is not None:
-    raise SystemExit("ERROR: --set-cash 和 --cash-flow 不能同时用 —— 一个是修账"
-                     "(本金不动), 一个是出入金(本金同额变动), 混在一起账就说不清了")
+if sum(x is not None for x in (args.set_cash, args.cash_flow, args.set_capital)) > 1:
+    raise SystemExit("ERROR: --set-cash / --cash-flow / --set-capital 不能同时用 —— 修账"
+                     "(本金不动) / 出入金(本金同额变动) / 本金重记(现金不动), 混在一起账就说不清了")
+if args.set_capital is not None:
+    do_set_capital(state, kl, names)
+    sys.exit(0)
 if args.set_cash is not None:
     do_set_cash(state, kl, names)
     sys.exit(0)

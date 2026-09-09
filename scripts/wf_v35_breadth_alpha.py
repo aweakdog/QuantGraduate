@@ -1010,6 +1010,13 @@ if args.save_preds:
 print(f"\n训练/加载完成 {(datetime.now()-t0).total_seconds():.0f}s | 加载K线...")
 klines = load_all_klines()
 print(f"  {len(klines)} 个K线文件")
+# K线末日必须盖住 test_end: 否则末段没有价格, 持仓被冻结、到期也卖不出, 收益静默为 0
+# (2026-09-08 发现 eez040 副本停在 08-18, 09-05/06 面板末 12 天全冻结)
+_kl_last = max((kl["date"].max() for kl in klines.values() if len(kl)), default=None)
+if _kl_last is None or _kl_last < pd.Timestamp(TEST_END) - pd.Timedelta(days=4):
+    print(f"ERROR: K线末日 {_kl_last} 落后 test_end {TEST_END} 超过 4 天, 末段会被冻结; "
+          f"先同步 {KLINE_DIR} 再跑 (或显式 --test-end 到 K线末日)")
+    sys.exit(2)
 
 # ═══════════════════════════════════════════════════════════════
 # 执行: 5日分档, 每天只换 1/HOLD_DAYS 仓位

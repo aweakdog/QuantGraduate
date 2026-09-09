@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from scipy.stats import spearmanr
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,11 +86,16 @@ def main():
     if any(value != dates[0] for value in dates[1:]):
         raise ValueError("预测缓存日期序列不一致")
 
-    matrix = pd.read_parquet(processed / args.matrix, columns=["date", "code", "y_target"])
+    # 标签列: 导出矩阵带 y_target(已日 demean); 生产矩阵只有原始 fwd_{label}_ret, IC 退到原始标签
+    schema = pq.read_schema(processed / args.matrix).names
+    label_col = "y_target" if "y_target" in schema else f"fwd_{base_meta.get('label', '5d')}_ret"
+    if label_col not in schema:
+        raise ValueError(f"矩阵无标签列 y_target / {label_col}")
+    matrix = pd.read_parquet(processed / args.matrix, columns=["date", "code", label_col])
     matrix["date"] = pd.to_datetime(matrix["date"])
     matrix["code"] = matrix["code"].astype(str)
     labels = {
-        date: dict(zip(group["code"], group["y_target"], strict=True))
+        date: dict(zip(group["code"], group[label_col], strict=True))
         for date, group in matrix.groupby("date")
     }
 
@@ -114,7 +120,7 @@ def main():
         np.nanmean([row["ic"] for row in cache["preds"]]) for cache in caches
     ]
     ensemble_ics = np.array([row["ic"] for row in predictions], dtype=float)
-    print(f"输入缓存: {len(caches)} | 日期: {len(predictions)} | 方法: {args.method}")
+    print(f"输入缓存: {len(caches)} | 日期: {len(predictions)} | 方法: {args.method} | IC 标签列: {label_col}")
     print(f"单种子 IC: {[round(float(x), 5) for x in individual_ics]}")
     print(f"集成 IC: {np.nanmean(ensemble_ics):+.5f}")
     print(f"单种子两两 top3 重合率: {top_overlap(caches):.1%}")

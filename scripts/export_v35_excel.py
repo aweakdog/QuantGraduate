@@ -231,7 +231,7 @@ def format_workbook(path, n_ops):
     book.save(path)
 
 
-def export(src: Path, out: Path):
+def export(src: Path, out: Path, bench_file: str | None = None):
     res = json.loads(src.read_text())
     names, concepts = load_meta()
     s = res["summary"]
@@ -240,7 +240,9 @@ def export(src: Path, out: Path):
     pv_by_date = dict(zip(daily["date"], daily["portfolio_value"]))
 
     # ── 每日汇总 ──
-    bench = benchmark_series(daily["date"], res.get("train_file", "training_data_v24.parquet"),
+    # 基准缺省读回测自己记的矩阵; 本机没有最新矩阵时可用 --bench-file 指一份只含
+    # date/code/fwd_1d_ret 的瘦身副本(从服务器当前矩阵导出), 否则旧矩阵覆盖不到的尾段基准会被填 0 走平。
+    bench = benchmark_series(daily["date"], bench_file or res.get("train_file", "training_data_v24.parquet"),
                             res.get("pit_universe"), tuple(res.get("skip_boards") or ()))
     daily["基准日收益"] = bench
     daily["超额收益"] = daily["daily_ret"] - bench
@@ -390,5 +392,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("source", type=Path)
     ap.add_argument("--output", type=Path, default=None)
+    ap.add_argument("--bench-file", default=None,
+                    help="算基准用的矩阵文件名(data/processed/ 下), 缺省用结果里记的 train_file")
     a = ap.parse_args()
-    export(a.source, a.output or default_output(a.source))
+    export(a.source, a.output or default_output(a.source), a.bench_file)

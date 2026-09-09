@@ -853,6 +853,7 @@ async def api_signal(req: Request):
 async def api_signal_status():
     return {
         "active": _running["active"],
+        "task": _running["task"],
         "started_at": _running["started_at"],
         "done_at": _running["done_at"],
         "log": _running["log"][-3000:] if _running["log"] else "",
@@ -1549,6 +1550,31 @@ async def api_cash_flow(req: Request):
     if body.get("note"):
         extra += ["--note", str(body["note"])[:100]]
     return _cash_op(pid, extra, "出入金")
+
+
+@app.post("/api/profile/set-capital")
+async def api_set_capital(req: Request):
+    """本金重记: 只改 initial_capital, 现金和持仓不动。
+
+    用于「从头再来」时本金填得和真实投入不一致的情形 (实际 11 万, 重置时填了
+    10 万), 把本金改回去, 累计盈亏就会把重置前的亏损重新体现出来。
+    """
+    body = await req.json()
+    pid = body.get("profile")
+    if (bad := _check_profile(pid)) is not None:
+        return bad
+    if (deny := _write_deny(req, pid)) is not None:
+        return deny
+    try:
+        cap = float(body.get("capital"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "请填一个数字"}, status_code=400)
+    if cap <= 0:
+        return JSONResponse({"error": "本金必须为正"}, status_code=400)
+    extra = ["--set-capital", repr(cap)]
+    if body.get("note"):
+        extra += ["--note", str(body["note"])[:100]]
+    return _cash_op(pid, extra, "本金重记")
 
 
 @app.post("/api/profile/drop-lot")
