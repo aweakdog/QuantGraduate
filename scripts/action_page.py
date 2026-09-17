@@ -2314,9 +2314,11 @@ async function loadHist(){
       <div class="kv"><div class="k">首次成交</div><div class="v" style="font-size:15px">${esc(s.first_exec_date||'--')}</div></div>
       <div class="kv"><div class="k">买卖笔数</div><div class="v">${s.n_trades ?? '--'}</div></div>
     </div>
-    <div class="acts" style="margin:12px 0 0">
-      <div class="btn btn-pri" onclick="window.location='${esc(d.export_url)}'">导出 Excel</div>
-    </div>
+    ${d.can_export
+      ? `<div class="acts" style="margin:12px 0 0">
+           <div class="btn btn-pri" onclick="window.location='${esc(d.export_url)}'">导出 Excel</div>
+         </div>`
+      : `<div class="lockbox" style="margin:12px 0 0">别人的账户只能在页面上看，<b>不能导出 Excel</b>；导出请在自己的账户上操作。</div>`}
     <div class="tipbox" style="margin:10px 0 0">口径：总资产 = 现金 + 股数×执行日收盘价；
       收益率 = 总资产 ÷ 当时本金 − 1。<b>存取现金改的是本金，不算盈亏</b>；校准现金是修账。${
       s.reconciled === false ? `<br><b style="color:#fcd34d">${esc(s.note)}</b>（现金差 ${money2(s.cash_diff_vs_state)}）` : ''}${

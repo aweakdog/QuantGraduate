@@ -1694,34 +1694,36 @@ async def api_recommend(req: Request, profile: str = None):
                                              allowed=_effective_scope(req)))
 
 
-def _ledger_deny(req: Request, pid):
-    """「历史操作」的可见范围, 返回 None=放行。
+def _ledger_deny(req: Request, pid, export=False):
+    """「历史操作」的权限, 返回 None=放行。
 
-    比普通看板严: 账户口令只能看自己名下的线, 「看全部」(?all=1) 也不放开 ——
-    别人的买卖流水与存取记录属于账户隐私, 不是共享看板。只读口令(全家共用)
-    同样不给; 管理员(611611)与站长口令(环境变量 full)能看所有线。"""
+    看 (记录+曲线): 任何已登录身份都能看所有线 —— 与看板「看全部」同口径
+    (2026-09-17 用户改口径: 一家人互相看得见, 不保密)。
+    导出 Excel (export=True): 只给账户本人(名下线)、管理员(611611)与站长口令
+    (环境变量 full); 只读口令与看别人线的账户会话都不给 —— 整份流水落地成文件
+    比在页面上翻一翻重得多, 留给账户本人。"""
     if pid not in PROFILES:
         return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
     role = _view_role(req)
     if role is None:
         return JSONResponse({"error": "未登录"}, status_code=401)
-    if role in ("admin", "full"):
+    if not export or role in ("admin", "full"):
         return None
     if isinstance(role, tuple) and role[0] == "acct":
         if pid in ACCESS_CODES[role[1]]["pids"]:
             return None
-        return JSONResponse({"error": "只能查看自己账户的历史操作", "forbidden": True},
+        return JSONResponse({"error": "只能导出自己账户的历史操作", "forbidden": True},
                             status_code=403)
-    return JSONResponse({"error": "只读口令不能查看账户历史, 请用自己的账户口令登录",
+    return JSONResponse({"error": "只读口令不能导出账户历史, 请用自己的账户口令登录",
                          "forbidden": True}, status_code=403)
 
 
-def _ledger_payload(req: Request, pid):
+def _ledger_payload(req: Request, pid, export=False):
     """公共装配: 校验 -> 读状态 -> 回放。返回 (载荷, 错误响应) 二选一。"""
     scope = _view_scope(req)
     if not pid:
         pid = (scope[0] if scope else DEFAULT_PROFILE)
-    if (deny := _ledger_deny(req, pid)) is not None:
+    if (deny := _ledger_deny(req, pid, export)) is not None:
         return None, deny
     st = _state_of(pid)
     if st is None:
@@ -1740,17 +1742,20 @@ async def api_ledger(req: Request, profile: str = None):
                      "viewer_scope": (list(s) if (s := _view_scope(req)) is not None else None)})
         return JSONResponse(body, status_code=err.status_code)
     ledger = build_ledger(ROOT, d["profile"], d["state"])
+    can_export = _ledger_deny(req, d["profile"], export=True) is None
     out = {"profile": d["profile"], "profile_name": d["profile_name"],
            "profiles": list_profiles(_effective_scope(req)),
            "rows": ledger["rows"], "summary": ledger["summary"], "curve": ledger["curve"],
-           "export_url": f"/api/ledger/xlsx?profile={d['profile']}"}
+           # 前端据此决定给不给导出按钮; 后端 /api/ledger/xlsx 同样会拦
+           "can_export": can_export,
+           "export_url": f"/api/ledger/xlsx?profile={d['profile']}" if can_export else None}
     return _with_viewer(req, out)
 
 
 @app.get("/api/ledger/xlsx")
 async def api_ledger_xlsx(req: Request, profile: str = None):
-    """导出该账户的历史操作 Excel。权限与 /api/ledger 完全一致; 文件在内存生成, 不落盘。"""
-    d, err = _ledger_payload(req, profile)
+    """导出该账户的历史操作 Excel。只给账户本人/管理员; 文件在内存生成, 不落盘。"""
+    d, err = _ledger_payload(req, profile, export=True)
     if err is not None:
         return err
     data = ledger_xlsx(d["profile"], d["profile_name"], build_ledger(ROOT, d["profile"], d["state"]))

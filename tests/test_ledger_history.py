@@ -201,17 +201,25 @@ def _token(ws, code):
 
 
 def test_ledger_permission_matrix():
+    """看: 所有登录身份看所有线; 导出: 只有账户本人/管理员 (2026-09-17 用户口径)"""
     import web_server as ws
     px = _Req({ws.VIEW_COOKIE: _token(ws, "px")}, q={"all": "1"})
-    assert ws._ledger_deny(px, "steady5w") is None
-    deny = ws._ledger_deny(px, "aggr5w")            # 别人的线, ?all=1 也不放开
-    assert deny is not None and deny.status_code == 403
     adm = _Req({ws.VIEW_COOKIE: _token(ws, "611611")})
-    assert ws._ledger_deny(adm, "aggr5w") is None
     ro = _Req({ws.VIEW_COOKIE: _token(ws, "213213")})
-    deny = ws._ledger_deny(ro, "aggr5w")
-    assert deny is not None and deny.status_code == 403
+    # 看
+    for req in (px, adm, ro):
+        assert ws._ledger_deny(req, "steady5w") is None
+        assert ws._ledger_deny(req, "aggr5w") is None
     assert ws._ledger_deny(_Req(), "aggr5w").status_code == 401
     assert ws._ledger_deny(adm, "nope").status_code == 400
+    # 导出
+    assert ws._ledger_deny(px, "steady5w", export=True) is None
+    assert ws._ledger_deny(px, "aggr2w_px2", export=True) is None
+    deny = ws._ledger_deny(px, "aggr5w", export=True)       # 别人的线
+    assert deny is not None and deny.status_code == 403
+    assert ws._ledger_deny(adm, "aggr5w", export=True) is None
+    deny = ws._ledger_deny(ro, "aggr5w", export=True)       # 只读口令
+    assert deny is not None and deny.status_code == 403
+    assert ws._ledger_deny(_Req(), "aggr5w", export=True).status_code == 401
     assert not any(p.startswith(b) for p in ("/api/ledger", "/api/ledger/xlsx")
                    for b in ws.ACCT_GET_BLOCK), "账户会话必须能访问历史操作接口"
