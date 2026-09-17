@@ -25,6 +25,10 @@ def test_main_covers_all_worker_files():
         f"这些文件工作节点会用但主节点不核对, 会导致旧版本反向传播: {missing}")
 
 
+def test_backtest_research_helpers_are_synced_to_workers():
+    assert {"scripts/research_labels.py", "scripts/research_risk.py"}.issubset(WORKER_FILES)
+
+
 def test_no_duplicates_in_watched():
     assert len(WATCHED) == len(set(WATCHED)), "WATCHED 有重复项"
 

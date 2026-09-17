@@ -2,7 +2,7 @@
 
 > **维护约定**：与 `TODO.md` 配套。新增规矩 / 推翻旧约定 / 沉淀重要事实时更新本文件。
 > 按主题组织，不按时间。每条尽量带"为什么"（教训来源）。
-> **最后更新：2026-08-31 23:45**
+> **最后更新：2026-09-16 Falcon暂缓与生产空仓触发核验**
 
 ---
 
@@ -37,6 +37,38 @@
 7. **ssh 长命令会被截断拼接**（2026-08-18 事故：多行 heredoc+嵌套引号碎成乱码，批任务静默未启动）→ 批脚本一律本地写文件 + scp + 短命令启动；启动后必验 `ps | grep -c` 和日志头几行
 8. **040 上跑回测/重放前必先同步 K线**：`ssh eez041 'rsync -az --delete ~/quant-strategy/data/raw/kline/ eez040:~/quant-strategy/data/raw/kline/'`（6 秒）。040 的 K线没有任何自动同步（09-08 发现停在 08-18，09-05 PL / 09-06 SEK 面板末 12 天被静默冻结）。引擎已加硬闸（K线末日落后 test_end >4 天 exit 2），但矩阵/universe 同样是手工拷的，同理
 9. **proctitle 低调化后 `pkill -f "tag XXX"` 杀不到 worker**（进程名已改成 `mltask/worker`，/proc/cmdline 里没有参数）：要杀先 `pkill -f "[x]args -P"` 断补位，再 `pkill -f "[m]ltask/worker"`（前提：确认机器上没有别的自己的 mltask 任务）
+
+### 隔离夜间研究队列（2026-09-11 起）
+
+- `scripts/run_overnight_research.py` 从脚本所在独立研究根目录读取快照，显式 `QUANT_DATA_DIR` 和 `QUANT_MODE=backtest`。N1两机根为 `~/quant-research-20260911-n1/`，不要在生产仓库直接启动该队列。快照不复制 `.env`/账户账本，日线是独立副本而非链接；`snapshot_manifest.json` 记录输入SHA-256，`plan_*.json` 记录实际命令和代码哈希。
+- 状态读取 `status_corr.json`、`prep_t2a_status.json`、`status_t2a.json`；结果自动汇总到 `summary_*.json`。存在队列状态时拒绝重复启动，失败依赖标 blocked。中断后先核对PID/产物，不删除状态硬重跑。
+- 新模块测试：`.venv/bin/python -m pytest tests/test_corr_cap.py tests/test_t2a_augment.py tests/test_overnight_research.py -q`。本机 pandas 3 与服务器 pandas 2 的 `stack` 参数有差异；用无参数 `stack()` 后显式按目标键 reindex 保持缺失语义，测试钉死。服务器 Python 3.10，因此新增研究代码用 `ruff check --target-version py310`，不要把 `timezone.utc` 自动升级为仅3.11支持的 `datetime.UTC`。
+- 09-11核查：041生产矩阵/11条计划到09-10；040研究矩阵及PL缓存仍到09-04，日线抽样到09-07。更新测试末日必须连预测缓存一起更新，不能拿旧缓存冒充最新。线上aggr5w当前本金10万，不等同历史标准5万操作点。
+
+- N1已于09-11收尾，09-12核验：CORR 210/210无失败，六格20配对全部不过收益/回撤联合门；本版不上，不继续扫阈值。T2a 20/20训练完成，两配置五配对−19.2/−6.6pp、2/5与1/5正，暂缓而非证明整个族无效。B前三种子的−64.2pp最终收敛为−6.6pp，禁止引用中途值；固定生产集成单点胜出也不能取代跨种子面板。最终汇总/状态已拉到本机 `data/processed/n1_{corr,t2a}_{summary,status}_20260912_0108.json`，断VPN也可查看，完整判决在实验看板。
+
+- N2标签/特征研究根为两机 `~/quant-research-20260912-n2/`。041 `status_label.json`，040 `status_prune.json`，各60训练/10种子；参数及判据在对应plan/summary和看板。QMT暂缓。`research_labels.py` 构建并核验标签侧表、生成明确的删列特征表；`wf_v35 --label-alignment` 默认legacy不改旧行为，common/t1close才启用6日闭合。
+- **比较不同标签闭合期还必须统一首个可预测日**：N2中2023-09-19在5日截断下恰250个训练日，6日下249；统一改从09-20评估，避免把入场相位误归因于标签。`common_test_start`和测试钉死这一点。标签共同有效行只影响训练目标，不影响候选集合；已知未来的标签/有效性helper严禁作为特征。
+- 新回归测试 `tests/test_label_alignment.py`、N2编排/汇总测试在`test_overnight_research.py`。缓存显式存label_alignment/horizon/侧表哈希/实际selected_features，不能跨标签或删列臂复用；`check_server_sync`工人清单已补research_labels/research_risk依赖，避免只同步引擎后缺模块。研究数据/代码放独立快照，未将这些变更部署到生产。
+
+- Falcon本地方法实现位于`falcon_model.py`/`falcon_data.py`/`falcon_trial.py`；09-15已在041 GPU1完成三种微型结构各128步真实数据训练，checkpoint重载一致。产物`~/quant-research-20260912-falcon1/artifacts/`，本机摘要`data/processed/falcon1_trial_summary_20260915.json`。此前因认证/资源中断，未实际落地等待队列，不能误记为持续后台运行。
+- Mac环境没有torch，12项模型测试会明确跳过；不要为此改生产venv。用041既有`.venv-gpu/bin/python -m unittest discover -s tests -p 'test_falcon_*.py' -v`运行20项测试；加`CUDA_VISIBLE_DEVICES=<空闲卡>`、`FALCON_TEST_CUDA=1`才启用CUDA测试。训练设置CPU线程2、同一预测日实体分组、未来目标在下段开始前闭合；选权重只用验证集。
+- 此版是13万~26万参数的未预训练结构检查，使用asinh/sinh和平方余弦交叉约束，和论文公式的区别记录在run_config。八个测试日期组的RankIC不可当全市场/多种子证据，线性分位数头仍有约11%~16%交叉，不能直接用作校准风险分布。不自动扩到591M，不改生产或调用云API。
+
+- Falcon固定权重复验(09-15)：入口`falcon_evaluate.py`，用同checkpoint/数据、全111/48验证/测试日和当日全主板PIT池，不重训/不隐式分块。先复现旧8日16股预测，再评全池，并比较固定目标股在16/64/全池上下文的变化；不能把会跨实体注意的输入按不同日期乱拼。测试238票/日、11424票日；均值IC−0.061/+0.035/−0.052，区间全含0；5日收益点MAE也未胜零收益。原0.16~0.26只来自很小抽样，不能继续引用作alpha。Pinball胜退化点质量基线不等于点预测或交易收益更好。完整记录及复验局限见看板FALCON2，本机摘要`falcon2_eval_summary_20260915.json`。
+- Falcon扩评新增`test_falcon_evaluation.py`：全池asof选择、缺失高排名标签不能偷偷换下一只、分组变化、分位覆盖、块bootstrap；服务器共27项含CUDA通过，本机311 passed/16 skipped。top3_excess_5d为重叠前向收益诊断，绝不能当日收益连乘或报为扣成本PnL；历史测试已看过，不再称全新样本外。
+
+- FALCON3训练预算工程诊断(09-16)：`falcon_study.py`在独立目录调度最多两GPU，worker用`falcon_trial.py --mode budget`。固定42/1/123 × 三结构 ×128/512/2048步，9轨迹/27权重完成；仅全111验证日，GuardedSplits测试禁止访问test。128步seed42与F1权重相同；更长训练减少loss/误差/交叉，但2048步IC中位仅0.012/0.001/0.013、9模型收益MAE都未胜零收益，未确立选股能力。验证尾63日是03-20~06-23，不得称为当前最近3月。三种子是训练充分度工程诊断，不代替下述5/20种子策略协议。
+- 预算模式保存固定阶段、不挑最优步；paired_delta_median按同种子相减后取中位，不能减两个中位数。当前阶段pt只有模型权重/配置等，不含优化器与RNG，不可加载后重置Adam却声称无缝延续原训练轨迹。后续增预算需复现原前缀或补正确续训状态。完整证据在看板FALCON3与`falcon3_budget_summary_20260916.json`；服务器32项含CUDA通过，本机315 passed/17 skipped，生产未改。
+
+- FALCON4目标对照(09-16收口)：固定prototype、五种子、2048步，A原五步价格/B终点同价格损失/C终点简单收益分位数/D收益加同日排序，共20轨迹/60权重完成。父队列钉住manifest并传worker、起止复核哈希；旧三种子A权重与F3完全一致。只看全111验证日，不能冒充新样本外。IC中位+0.0009/−0.0093/−0.0016/+0.0032；新目标未获稳定增量，20模型MAE均未胜零收益；本版不采纳、不直接扩模型/上线，但不永久否决方法。
+- D绝对IC中位略高于A，却只有2/5种子优于A、D−A配对中位−0.00831；不能减两个中位或相加中位差代替逐种子配对。C−B改变损失空间及个股权重，不是单纯扣掉当前价格；D保留收益分位数锚以免未训练头冒充概率预测。B/C/D仅监督第5天，比较统一的endpoint_return_pinball(scale0.05)、endpoint_quantile_crossing_fraction/覆盖，不拿未监督的前4天指标混比。详见看板与`falcon4_objective_summary_20260916.json`。
+- 09-16本机仓库确认已移到`/Users/yuanhangli/Documents/code/quant-strategy`，旧`Documents - yuanhang’s MacBook Pro/code/quant-strategy`路径已不存在。若工具仍使用旧会话工作目录，命令显式指定新workdir；不因此重启或重复创建远端研究队列。
+
+- 09-16用户明确暂缓Falcon方法研究：F1~F4代码/数据/权重保留，不自动重启训练、扫目标/系数或扩模型。恢复需用户重新确认；现有生产仍为LightGBM，暂停不改变生产策略或QMT。
+
+- 09-16空仓核验：当前breadth口径是原始全市场K线中“收盘>各股MA20”的比例，**不是当日涨家数比例，也不是PIT/主板候选池的占比**。40%阈值、双向两交易日确认，T收盘信号/T+1尾盘执行。09-11首次26.90%跌破、09-14第二次28.47%确认，基准账本09-15尾盘regime_exit；09-16虽75.16%股票上涨，站上MA20仍仅1496/5512=27.14%。原始5784文件扫描、22日两广度值/84计划对账均无误触发；这是确认滞后造成踏空的代价，不是模型断言明天跌。
+- 纯读审计不要直接运行live_signal.py，也不要把--dry-run当完全无写入：compute_market_features仍可能删旧缓存并生成新缓存。此次只读plan/state/K线，独立计数并抽取纯build_regime_series核验。缓存输入戳19:38与后续行情重写20:12不同，但复算最近22日广度完全相同；mtime变化不等于当次数值错误。不得为刷新网页而擅自提交空成交确认或切自动记账。
 
 ## 3. 实验方法论约定
 

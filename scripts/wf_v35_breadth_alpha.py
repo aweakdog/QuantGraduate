@@ -197,6 +197,10 @@ parser.add_argument("--ind-cap", type=int, default=0,
                     help="行业集中度上限: 组合内每个申万一级行业最多持 N 只。0 = 不限。"
                     " 买入候选与续持名单都受约束: 超限的候选顺位递补下一名(不同行业),"
                     " 已持仓超限的到期不续持。无行业归属的股(罕见)不计数不受限")
+parser.add_argument("--corr-cap", type=float, default=0.0,
+                    help="新买入与现持仓的正相关上限; 仅用信号日及以前的日收益, 0=关闭, 不强制卖出旧仓")
+parser.add_argument("--corr-window", type=int, default=20)
+parser.add_argument("--corr-min-periods", type=int, default=15)
 parser.add_argument("--ind-map", type=str,
                     default="raw/tushare/sw_member/sw_member.parquet",
                     help="申万行业 PIT 成分表路径(相对 data/ 或绝对), 需含"
@@ -209,8 +213,15 @@ parser.add_argument("--lgb-seed", type=int, default=42,
                     help="LightGBM random_state。不是可调超参 —— 仅供多种子集成实验"
                          "(同一模型训多个种子平均排名, 降低前3名选择方差)使用。"
                          "禁止用它挑好看的单种子结果")
+parser.add_argument("--label-alignment", choices=["legacy", "common", "t1close"], default="legacy",
+                    help="研究标签: legacy原口径; common旧标签+共同样本/6日截断; t1close次日收盘起5日收益+相同截断")
+parser.add_argument("--label-panel", default="label_alignment_panel.parquet")
 parser.add_argument("--tag", type=str, default=None)
 args = parser.parse_args()
+if not 0 <= args.corr_cap <= 1:
+    parser.error("--corr-cap must be between 0 and 1")
+if not 2 <= args.corr_min_periods <= args.corr_window:
+    parser.error("require 2 <= corr-min-periods <= corr-window")
 
 from pipeline.config import settings
 DATA_DIR = settings.DATA_DIR
@@ -222,15 +233,23 @@ if args.test_end is None:
     args.test_end = f"{_dmax:%Y-%m-%d}"
     print(f"--test-end 未给, 跟到矩阵最新日 {args.test_end}")
 
-LABEL_RAW = {"1d": "fwd_1d_ret", "2d": "fwd_2d_ret", "5d": "fwd_5d_ret"}[args.label]
+from research_labels import HELPER_COLUMNS, label_horizon, load_panel, validate_cache_contract
+
+LEGACY_LABEL_RAW = {"1d": "fwd_1d_ret", "2d": "fwd_2d_ret", "5d": "fwd_5d_ret"}[args.label]
+LABEL_RAW = "lab1_t1close_5d" if args.label_alignment == "t1close" else LEGACY_LABEL_RAW
 LABEL = "y_target"
-LABEL_HORIZON = {"1d": 1, "2d": 2, "5d": 5}[args.label]
+try:
+    LABEL_HORIZON = label_horizon(args.label, args.label_alignment)
+except ValueError as exc:
+    parser.error(str(exc))
+LABEL_PANEL_SHA256 = None
 
 LEAKAGE_FEATS = {"ret_1d", "ret_2d", "ret_5d", "ret_21d"}
 SKIP_COLS = {"date", "code", "group", LABEL,
              "fwd_1d_ret", "fwd_2d_ret", "fwd_5d_ret", "fwd_21d_ret",
              "fwd_1d_excess", "fwd_5d_excess", "fwd_1d_open_ret", "fwd_1d_exec_ret",
              "fwd_1d_t1_open_ret", "fwd_1d_t1_close_ret", "fwd_1d_exec_excess"}
+SKIP_COLS.update(HELPER_COLUMNS)
 EXCLUDED_FEATS = {"mf_pct_1d", "mf_pct_1d_ma5", "mf_pct_1d_ma20",
                   "macd_signal", "macd_signal_ma5", "macd_signal_ma20"}
 
@@ -729,9 +748,14 @@ for c in df.select_dtypes(include=[np.number]).columns:
 # fwd 标签在数据末尾天然缺失(未来收益还没发生)。历史段照旧剔除缺失标签,
 # 但保留"末尾整段无标签的日期"用于出信号 —— 否则最新 LABEL_HORIZON 天
 # 会连同 all_dates 一起被删掉, 最近几天永远无法交易。
-_lab_ok = df[LABEL_RAW].notna()
+_lab_ok = df[LEGACY_LABEL_RAW].notna()
 _last_lab_date = df.loc[_lab_ok, "date"].max()
 df = df[_lab_ok | (df["date"] > _last_lab_date)]
+if args.label_alignment != "legacy":
+    df, LABEL_PANEL_SHA256 = load_panel(DATA_DIR / "processed" / args.label_panel,
+                                        TRAIN_PATH, df, args.label_alignment)
+    print(f"标签模式 {args.label_alignment}, 闭合间隔 {LABEL_HORIZON} 日, "
+          f"共同标签有效 {int(df.lab1_common.sum())}/{len(df)}; 候选行不因新标签缺失而删除")
 if args.pit_universe:
     df = apply_pit_universe(df, args.pit_universe)
 if SKIP_BOARDS and not args.load_preds:
@@ -753,7 +777,11 @@ ovn_df, ovn_features = compute_overnight_features(df["code"].unique())
 df = df.merge(ovn_df[["date", "code"] + ovn_features], on=["date", "code"], how="left")
 
 # ── 改动 A: 只按日期 demean (保序, 与 raw 收益 corr=1.00) ──
-df[LABEL] = df.groupby("date")[LABEL_RAW].transform(lambda x: x - x.mean())
+if args.label_alignment == "legacy":
+    df[LABEL] = df.groupby("date")[LABEL_RAW].transform(lambda x: x - x.mean())
+else:
+    _target = df[LABEL_RAW].where(df.lab1_common)
+    df[LABEL] = _target - _target.groupby(df["date"]).transform("mean")
 
 _extra_excl = {x.strip() for x in args.exclude_feats.split(",") if x.strip()}
 _excl_exact = {x for x in _extra_excl if not x.endswith("*")}
@@ -806,6 +834,8 @@ if args.features_from:
     if not _src.exists():
         raise SystemExit(f"ERROR: 找不到特征来源 {_src}")
     _sel = json.load(open(_src, encoding="utf-8"))["selected_features"]
+    if set(_sel) & HELPER_COLUMNS:
+        raise SystemExit("ERROR: future label/helper columns cannot be selected features")
     _miss = [f for f in _sel if f not in df.columns]
     features = [f for f in _sel if f in df.columns]
     print(f"  特征: 复用 {args.features_from} 的 {len(_sel)} 个, "
@@ -880,6 +910,10 @@ if args.load_preds:
     with open(_cache, "rb") as fh:
         cached = pickle.load(fh)
     meta, daily_preds = cached["meta"], cached["preds"]
+    try:
+        validate_cache_contract(meta, args.label_alignment, LABEL_PANEL_SHA256, features)
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
     # 校验模型相关参数一致, 不一致则拒绝复用。
     # 外部模型缓存(meta 带 "model" 字段, 如 wf_mlp_gpu / 种子集成)不比 objective:
     # 它们本来就不是 LightGBM, 但数据口径字段必须全部一致。
@@ -990,6 +1024,8 @@ if args.save_preds:
     cache_path = DATA_DIR / "processed" / args.save_preds
     meta = {"train_file": args.train_file, "pit_universe": args.pit_universe,
             "label": args.label, "objective": args.objective,
+            "label_alignment": args.label_alignment, "label_horizon": LABEL_HORIZON,
+            "label_panel_sha256": LABEL_PANEL_SHA256, "selected_features": list(features),
             "train_start": args.train_start,
             "test_start": TEST_START, "test_end": TEST_END,
             "neutralize_style": args.neutralize_style,
@@ -1010,6 +1046,15 @@ if args.save_preds:
 print(f"\n训练/加载完成 {(datetime.now()-t0).total_seconds():.0f}s | 加载K线...")
 klines = load_all_klines()
 print(f"  {len(klines)} 个K线文件")
+corr_guard = None
+n_corr_skip = 0
+if args.corr_cap > 0:
+    from research_risk import CorrelationGuard, close_returns
+    _corr_codes = {c for dp in daily_preds for c in dp["ranked"]}
+    corr_guard = CorrelationGuard(close_returns(klines, _corr_codes, all_dates),
+                                  args.corr_window, args.corr_min_periods)
+    print(f"  相关性上限 {args.corr_cap}, {args.corr_window} 日窗口, "
+          f"至少 {args.corr_min_periods} 对观测; 缺历史不拦截并单独计数")
 # K线末日必须盖住 test_end: 否则末段没有价格, 持仓被冻结、到期也卖不出, 收益静默为 0
 # (2026-09-08 发现 eez040 副本停在 08-18, 09-05/06 面板末 12 天全冻结)
 _kl_last = max((kl["date"].max() for kl in klines.values() if len(kl)), default=None)
@@ -1344,6 +1389,9 @@ for i, (dp, exec_date) in enumerate(sched):
                 if _il_buy is not None and _ind_cnt.get(_il_buy, 0) >= IND_CAP:
                     n_ind_skip += 1
                     continue
+            if corr_guard is not None and corr_guard.blocks(code, held, dp["date"], args.corr_cap):
+                n_corr_skip += 1
+                continue
             px = get_px(klines, code, d, EXEC_FIELD)
             if px is None:                          # 停牌/无行情
                 rejected_buy += 1
@@ -1552,6 +1600,8 @@ print(f"  耗时             : {(datetime.now()-t0).total_seconds():.0f}s")
 
 json.dump({
     "label": LABEL_RAW,
+    "label_alignment": args.label_alignment, "label_horizon": LABEL_HORIZON,
+    "label_panel_sha256": LABEL_PANEL_SHA256,
     "neutralization": "date_demean_only",
     "objective": args.objective,
     "exec_mode": args.exec_mode,
@@ -1575,6 +1625,8 @@ json.dump({
     "roll_rank": ROLL_RANK, "rank_stop": RANK_STOP,
     "min_pred": MIN_PRED, "fill_daily": FILL_DAILY, "max_chase": MAX_CHASE,
     "gap_skip": GAP_SKIP, "holiday_flat": HOLIDAY_FLAT,
+    "corr_cap": args.corr_cap, "corr_window": args.corr_window,
+    "corr_min_periods": args.corr_min_periods,
     "exclude_feats": sorted(_extra_excl),
     "skip_boards": list(SKIP_BOARDS), "skip_boards_mode": args.skip_boards_mode,
     "features": len(features), "selected_features": features,
@@ -1612,6 +1664,9 @@ json.dump({
         "n_holiday_days": n_holiday_days,
         "n_ind_skip": n_ind_skip,
         "n_ind_roll_out": n_ind_roll_out,
+        "n_corr_skip": n_corr_skip,
+        "corr_comparisons": corr_guard.comparisons if corr_guard else 0,
+        "corr_unavailable": corr_guard.unavailable if corr_guard else 0,
         "ind_cap": IND_CAP,
         "cash_days": n_cash_days,
         "cash_days_pct": round(100 * n_cash_days / n, 1) if n else 0.0,
