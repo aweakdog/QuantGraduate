@@ -29,13 +29,14 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import access_log  # noqa: E402
 from action_page import (ACTION_HTML, _exec_window, build_recommend,  # noqa: E402
                          build_today, list_profiles)
+from ledger_history import build_ledger, ledger_xlsx  # noqa: E402
 from live_config import (ACCESS_CODES, DEFAULT_PROFILE, PROFILES,  # noqa: E402
                          capital_of, display_name, init_args, is_auto,
                          is_locked, set_auto, set_capital, set_name,
@@ -1691,6 +1692,73 @@ async def api_recommend(req: Request, profile: str = None):
     """每日推荐看板: 模型打分最高的股票 + 该线能否买得起"""
     return _with_viewer(req, build_recommend(ROOT, profile,
                                              allowed=_effective_scope(req)))
+
+
+def _ledger_deny(req: Request, pid):
+    """「历史操作」的可见范围, 返回 None=放行。
+
+    比普通看板严: 账户口令只能看自己名下的线, 「看全部」(?all=1) 也不放开 ——
+    别人的买卖流水与存取记录属于账户隐私, 不是共享看板。只读口令(全家共用)
+    同样不给; 管理员(611611)与站长口令(环境变量 full)能看所有线。"""
+    if pid not in PROFILES:
+        return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
+    role = _view_role(req)
+    if role is None:
+        return JSONResponse({"error": "未登录"}, status_code=401)
+    if role in ("admin", "full"):
+        return None
+    if isinstance(role, tuple) and role[0] == "acct":
+        if pid in ACCESS_CODES[role[1]]["pids"]:
+            return None
+        return JSONResponse({"error": "只能查看自己账户的历史操作", "forbidden": True},
+                            status_code=403)
+    return JSONResponse({"error": "只读口令不能查看账户历史, 请用自己的账户口令登录",
+                         "forbidden": True}, status_code=403)
+
+
+def _ledger_payload(req: Request, pid):
+    """公共装配: 校验 -> 读状态 -> 回放。返回 (载荷, 错误响应) 二选一。"""
+    scope = _view_scope(req)
+    if not pid:
+        pid = (scope[0] if scope else DEFAULT_PROFILE)
+    if (deny := _ledger_deny(req, pid)) is not None:
+        return None, deny
+    st = _state_of(pid)
+    if st is None:
+        return None, JSONResponse({"error": "这条线还没建立账本"}, status_code=404)
+    return {"profile": pid, "profile_name": display_name(pid), "state": st}, None
+
+
+@app.get("/api/ledger")
+async def api_ledger(req: Request, profile: str = None):
+    """一条线从建户起的全部操作: 买卖/续持/未成交/存取现金/修账, 附当时总资产与收益率。只读。"""
+    d, err = _ledger_payload(req, profile)
+    if err is not None:
+        # 账户会话停在别人的线上时, 页面仍要能渲染卡片与切换, 故把名下线一并回给它
+        body = json.loads(err.body)
+        body.update({"profile": profile, "profiles": list_profiles(_effective_scope(req)),
+                     "viewer_scope": (list(s) if (s := _view_scope(req)) is not None else None)})
+        return JSONResponse(body, status_code=err.status_code)
+    ledger = build_ledger(ROOT, d["profile"], d["state"])
+    out = {"profile": d["profile"], "profile_name": d["profile_name"],
+           "profiles": list_profiles(_effective_scope(req)),
+           "rows": ledger["rows"], "summary": ledger["summary"],
+           "export_url": f"/api/ledger/xlsx?profile={d['profile']}"}
+    return _with_viewer(req, out)
+
+
+@app.get("/api/ledger/xlsx")
+async def api_ledger_xlsx(req: Request, profile: str = None):
+    """导出该账户的历史操作 Excel。权限与 /api/ledger 完全一致; 文件在内存生成, 不落盘。"""
+    d, err = _ledger_payload(req, profile)
+    if err is not None:
+        return err
+    data = ledger_xlsx(d["profile"], d["profile_name"], build_ledger(ROOT, d["profile"], d["state"]))
+    fname = f"history_{d['profile']}_{datetime.now():%Y%m%d}.xlsx"
+    return Response(content=data,
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"',
+                             "Cache-Control": "no-store"})
 
 
 @app.get("/api/kline")

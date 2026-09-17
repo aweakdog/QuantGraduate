@@ -989,6 +989,27 @@ ACTION_HTML = """<!DOCTYPE html>
   .kv .k{font-size:12px;color:#6f7889}
   .kv .v{font-size:19px;font-weight:700;margin-top:2px}
 
+  /* 历史操作: 按日分组的流水行 */
+  .hday{font-size:12px;color:#7c8598;font-weight:600;margin:12px 0 6px;padding-top:8px;
+        border-top:1px solid #1e222b}
+  .hday:first-of-type{border-top:none;padding-top:0;margin-top:0}
+  .hrow{background:#1b1f28;border-radius:10px;padding:10px 12px;margin-bottom:7px}
+  .hrow .hl1{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:14px}
+  .hrow .hwho{color:#e8eaed;font-weight:600}
+  .hrow .hqty{color:#8a93a6;font-size:13px}
+  .hrow .hnote{font-size:12px;color:#6f7889;margin-top:3px}
+  .hrow .hl2{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:#8a93a6;margin-top:6px;
+             padding-top:6px;border-top:1px dashed #262c38}
+  .hk{display:inline-block;font-size:11px;font-weight:700;padding:2px 7px;border-radius:5px;
+      background:#26292f;color:#c9cdd6}
+  .hk-buy{background:#14532d;color:#bbf7d0}
+  .hk-sell{background:#7f1d1d;color:#fecaca}
+  .hk-roll{background:#1e3a8a;color:#bfdbfe}
+  .hk-no{background:#3a2a12;color:#fcd34d}
+  .hk-cash{background:#3b2f14;color:#e0a83a}
+  .hk-fix{background:#2a2438;color:#c4b5fd}
+  .hk-sys{background:#26292f;color:#9aa3b5}
+
   .foot{font-size:12px;color:#5e6675;margin-top:16px;text-align:center;line-height:1.8}
   .foot a{color:#7c8598}
   .foot .disc{color:#6f7889;margin-top:6px}
@@ -1014,6 +1035,7 @@ ACTION_HTML = """<!DOCTYPE html>
   <div class="tabs">
     <div class="tab on" id="tab-act" onclick="setView('act')">明日操作</div>
     <div class="tab" id="tab-rec" onclick="setView('rec')">每日推荐</div>
+    <div class="tab" id="tab-hist" onclick="setView('hist')">历史操作</div>
   </div>
   <div id="app"></div>
   <div class="foot">
@@ -1402,7 +1424,8 @@ function setView(v){
   VIEW = v; localStorage.setItem('view', v);
   $('#tab-act').classList.toggle('on', v==='act');
   $('#tab-rec').classList.toggle('on', v==='rec');
-  $('#title').textContent = v==='act' ? '明日操作' : '每日推荐';
+  $('#tab-hist').classList.toggle('on', v==='hist');
+  $('#title').textContent = {act:'明日操作', rec:'每日推荐', hist:'历史操作'}[v] || '明日操作';
   load();
 }
 
@@ -2159,7 +2182,92 @@ async function loadAct(){
   $('#app').innerHTML = h;
 }
 
-function load(){ return VIEW === 'rec' ? loadRec() : loadAct(); }
+// ── 历史操作: 从建户起每一笔买卖/续持/存取/修账, 附当时总资产与收益率 ──
+// 只读接口。账户口令只能看自己的线(后端 _ledger_deny 拦), 别人的线这里
+// 只显示被拒的原因; 管理员能看所有线。
+const money2 = v => v == null ? '--' : '¥' + Number(v).toLocaleString('zh-CN',
+  {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const pctTxt = v => v == null ? '<span style="color:#5e6675">--</span>'
+  : `<span class="${v > 0 ? 'pos' : (v < 0 ? 'neg' : '')}">${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%</span>`;
+const KIND_CLS = {'买入':'hk-buy', '卖出':'hk-sell', '续持':'hk-roll', '未成交':'hk-no',
+                  '存入现金':'hk-cash', '取出现金':'hk-cash', '校准现金':'hk-fix',
+                  '本金重记':'hk-fix', '校准持仓':'hk-fix', '整体对账':'hk-fix',
+                  '策略配置切换':'hk-sys', '建立账户':'hk-sys'};
+
+function histRow(r){
+  const cls = KIND_CLS[r.kind] || (String(r.kind).startsWith('删除持仓') ? 'hk-fix' : 'hk-sys');
+  const who = r.code ? `${esc(r.code)} ${esc(r.name||'')}` : '';
+  const qty = r.shares != null ? `${r.shares} 股` : '';
+  const px  = r.price != null ? `@ ${px2(r.price)}` : '';
+  const fee = r.fee ? ` · 手续费 ${Number(r.fee).toFixed(2)}` : '';
+  const cd  = r.cash_delta == null || r.cash_delta === 0 ? ''
+    : `<span class="${r.cash_delta > 0 ? 'pos' : 'neg'}">${r.cash_delta > 0 ? '+' : '-'}${
+        money2(Math.abs(r.cash_delta)).slice(1)}</span>`;
+  return `<div class="hrow">
+    <div class="hl1"><span class="hk ${cls}">${esc(r.kind)}</span>
+      <span class="hwho">${who}</span><span class="hqty">${qty} ${px}</span></div>
+    ${(r.note || fee) ? `<div class="hnote">${esc(r.note||'')}${fee}</div>` : ''}
+    <div class="hl2">
+      <span>现金 ${cd ? cd + ' → ' : ''}${money2(r.cash_after)}</span>
+      <span>总资产 ${money2(r.equity_after)}</span>
+      <span>收益率 ${pctTxt(r.return_pct_after)}</span>
+    </div></div>`;
+}
+
+async function loadHist(){
+  let r, d;
+  try { r = await fetch('/api/ledger' + dataQuery()); d = await r.json(); }
+  catch(e){ $('#app').innerHTML = '<div class="warn">无法连接服务器</div>'; return; }
+
+  if (d.profile) PID = d.profile;
+  PROFS = d.profiles || PROFS;
+  SCOPE = d.viewer_scope || null; renderProfs(PID);
+  LASTD = null;
+  $('#sigdate').textContent = '';
+  $('#gen').textContent = '';
+
+  if (!r.ok){
+    $('#app').innerHTML = `<div class="card"><h2>历史操作</h2>
+      <div class="lockbox">${esc(d.error || ('HTTP ' + r.status))}${
+        d.forbidden ? '<br>历史操作只对账户本人与管理员开放。切回「只看自己」查看自己的账户。' : ''}</div></div>`;
+    return;
+  }
+
+  const s = d.summary || {}, rows = d.rows || [];
+  let h = `<div class="card"><h2>${esc(d.profile_name||'')} · 账户概览</h2><div class="grid">
+      <div class="kv"><div class="k">起始本金</div><div class="v">${money(s.initial_capital_at_start)}</div></div>
+      <div class="kv"><div class="k">当前本金</div><div class="v">${money(s.current_capital)}</div></div>
+      <div class="kv"><div class="k">最新总资产</div><div class="v">${money(s.last_equity)}</div></div>
+      <div class="kv"><div class="k">最新收益率</div><div class="v">${pctTxt(s.last_return_pct)}</div></div>
+      <div class="kv"><div class="k">首次成交</div><div class="v" style="font-size:15px">${esc(s.first_exec_date||'--')}</div></div>
+      <div class="kv"><div class="k">买卖笔数</div><div class="v">${s.n_trades ?? '--'}</div></div>
+    </div>
+    <div class="acts" style="margin:12px 0 0">
+      <div class="btn btn-pri" onclick="window.location='${esc(d.export_url)}'">导出 Excel</div>
+    </div>
+    <div class="tipbox" style="margin:10px 0 0">口径：总资产 = 现金 + 股数×执行日收盘价；
+      收益率 = 总资产 ÷ 当时本金 − 1。<b>存取现金改的是本金，不算盈亏</b>；校准现金是修账。${
+      s.reconciled === false ? `<br><b style="color:#fcd34d">${esc(s.note)}</b>（现金差 ${money2(s.cash_diff_vs_state)}）` : ''}${
+      (s.approx_quote_dates||[]).length ? `<br>停牌日按前一收盘估值：${s.approx_quote_dates.join('、')}` : ''}
+    </div></div>`;
+
+  // 按日期倒序分组: 最近的在最上面, 同一天的多笔放一起
+  const byDate = {};
+  rows.forEach(x => { const k = x.date || '建户'; (byDate[k] = byDate[k] || []).push(x); });
+  const dates = Object.keys(byDate).filter(k => k !== '建户').sort().reverse();
+  if (byDate['建户']) dates.push('建户');          // 建户那条最老, 放最底
+  h += `<div class="card"><h2>全部记录 · ${rows.length} 条</h2>`;
+  if (!rows.length) h += '<div class="empty">还没有任何操作</div>';
+  dates.forEach(dt => {
+    const g = byDate[dt];
+    const sig = g.find(x => x.signal_date) ? ` <span style="color:#5e6675">(信号日 ${esc(g.find(x => x.signal_date).signal_date)})</span>` : '';
+    h += `<div class="hday">${esc(dt)}${sig}</div>` + g.map(histRow).join('');
+  });
+  h += `</div>`;
+  $('#app').innerHTML = h;
+}
+
+function load(){ return VIEW === 'rec' ? loadRec() : (VIEW === 'hist' ? loadHist() : loadAct()); }
 
 setView(VIEW);
 // 定时刷新会重建 DOM。填的值虽然已经落到 localStorage 不会丢, 但刷新会

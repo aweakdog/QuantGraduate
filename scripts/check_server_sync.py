@@ -49,6 +49,8 @@ WORKER_FILES = [
     "scripts/pull_fundflow_shard.py",
     "pipeline/pull_fundflow_sina.py",
     "scripts/wf_v35_breadth_alpha.py",
+    "scripts/research_labels.py",
+    "scripts/research_risk.py",
     "scripts/eval_grid.py",
     "scripts/dist_caches.py",        # 分布式建缓存, 主节点调度但工人也要有
     "pipeline/feature_engine.py",
@@ -63,6 +65,7 @@ MAIN_FILES = [
     "scripts/live_config.py",            # 线上参数唯一来源
     "scripts/migrate_config.py",         # 换参数不清账
     "scripts/action_page.py",
+    "scripts/ledger_history.py",         # 网页「历史操作」回放 (web_server 依赖)
     "scripts/web_server.py",
     "scripts/daily_rebuild.py",
     "scripts/build_pit_universe.py",
