@@ -140,6 +140,13 @@ def build_ledger(root: Path, pid: str, state: dict, names=None):
     rows = []
     approx_dates = set()
     unknown_price = set()
+    # 每次现金/持仓/本金变动后的快照, 给逐日收益曲线用: 两次变动之间账户是静止的,
+    # 逐日只需换收盘价重新估值
+    checkpoints = []
+
+    def checkpoint(date):
+        checkpoints.append({"date": date, "cash": cash, "capital": capital,
+                            "positions": {c: dict(p) for c, p in positions.items() if p["shares"] > 0}})
 
     def market_value(date):
         mv = 0.0
@@ -216,6 +223,7 @@ def build_ledger(root: Path, pid: str, state: dict, names=None):
                               "signal_date": e.get("signal_date")})
             if not batch:
                 continue
+            checkpoint(exec_date)
             mv = market_value(exec_date)
             for b in batch:
                 rows.append(snapshot_row(b, cash, cash + mv, mv))
@@ -272,6 +280,8 @@ def build_ledger(root: Path, pid: str, state: dict, names=None):
         equity = _f(after.get("equity"))
         mv = None if equity is None else max(0.0, equity - cash)
         rows.append(snapshot_row(base, cash, equity, mv))
+        if date:
+            checkpoint(date)
 
     for ep in (state.get("strategy_epochs") or [])[1:]:
         rows.append({"date": ep.get("since"), "time": None, "kind": KIND_LABEL["epoch"],
@@ -312,7 +322,84 @@ def build_ledger(root: Path, pid: str, state: dict, names=None):
                  if reconciled else
                  "回放结果与当前账本不完全一致(历史记录可能缺项), 表中总资产/收益率仅供参考。"),
     }
-    return {"rows": rows, "summary": summary}
+    curve = build_curve(state, checkpoints, closes)
+    summary["curve_stats"] = curve_stats(curve)
+    return {"rows": rows, "summary": summary, "curve": curve}
+
+
+def build_curve(state, checkpoints, closes):
+    """逐交易日净值: 两次变动之间账户静止, 只按当日收盘重新估值。
+
+    日历用 state.calendar (与 live_signal 同一份交易日历), 从首次变动日到日历末日。
+    同一天多次变动取最后一次快照 (与「历史操作」表末行一致)。
+    收益率 = 总资产 / 当时本金 - 1; 回撤 = 相对历史最高收益率指数的跌幅。
+    停牌股沿用不晚于当日的最后收盘; 完全无行情的股退回成本价并在 flag 里标出。
+    """
+    if not checkpoints:
+        return []
+    cal = [str(pd.Timestamp(d).date()) for d in (state.get("calendar") or [])]
+    by_date = {}
+    for cp in checkpoints:
+        by_date[cp["date"]] = cp                       # 后者覆盖前者 = 当天最后一次
+    dated = sorted(by_date)
+    start = dated[0]
+    days = [d for d in cal if d >= start] or dated
+    for d in dated:                                    # 非交易日发生的改账也要有点
+        if d not in days:
+            days.append(d)
+    days.sort()
+    out, i, cur = [], 0, None
+    peak = None
+    for d in days:
+        while i < len(dated) and dated[i] <= d:
+            cur = by_date[dated[i]]
+            i += 1
+        if cur is None:
+            continue
+        mv, approx, unknown = 0.0, False, False
+        for code, pos in cur["positions"].items():
+            px, exact = closes.at(code, d)
+            if px is None:
+                px, unknown = (pos.get("cost") or 0.0), True
+            elif not exact:
+                approx = True
+            mv += pos["shares"] * px
+        equity = cur["cash"] + mv
+        capital = cur["capital"]
+        nav = equity / capital if capital else None
+        if nav is not None:
+            peak = nav if peak is None else max(peak, nav)
+        dd = None if nav is None or not peak else (nav / peak - 1) * 100
+        out.append({"date": d, "cash": round(cur["cash"], 2), "market_value": round(mv, 2),
+                    "equity": round(equity, 2), "capital": round(capital, 2),
+                    "return_pct": None if nav is None else round((nav - 1) * 100, 2),
+                    "drawdown_pct": None if dd is None else round(dd, 2),
+                    "n_positions": len(cur["positions"]),
+                    "flag": "unknown_price" if unknown else ("approx" if approx else "")})
+    return out
+
+
+def curve_stats(curve):
+    """曲线的几个摘要数字。年化用交易日/244 折算, 样本短时不报年化 (< 60 个交易日)。"""
+    pts = [c for c in curve if c["return_pct"] is not None]
+    if not pts:
+        return None
+    rets = [c["return_pct"] for c in pts]
+    navs = [1 + r / 100 for r in rets]
+    daily = [navs[k] / navs[k - 1] - 1 for k in range(1, len(navs))]
+    n = len(pts)
+    ann = None
+    if n >= 60 and navs[0] > 0:
+        ann = round(((navs[-1] / navs[0]) ** (244 / (n - 1)) - 1) * 100, 2)
+    up = sum(1 for x in daily if x > 0)
+    worst = min(pts, key=lambda c: c["drawdown_pct"] if c["drawdown_pct"] is not None else 0)
+    return {"start": pts[0]["date"], "end": pts[-1]["date"], "n_days": n,
+            "total_return_pct": rets[-1], "peak_return_pct": max(rets), "trough_return_pct": min(rets),
+            "max_drawdown_pct": worst["drawdown_pct"], "max_drawdown_date": worst["date"],
+            "annualized_pct": ann, "up_days": up, "down_days": sum(1 for x in daily if x < 0),
+            "best_day_pct": round(max(daily) * 100, 2) if daily else None,
+            "worst_day_pct": round(min(daily) * 100, 2) if daily else None,
+            "invested_days": sum(1 for c in pts if c["n_positions"] > 0)}
 
 
 def ledger_xlsx(pid: str, display: str, ledger: dict) -> bytes:
@@ -347,22 +434,22 @@ def ledger_xlsx(pid: str, display: str, ledger: dict) -> bytes:
     ws.freeze_panes = "A2"
 
     curve = wb.create_sheet("净值曲线")
-    curve.append(["日期", "现金", "持仓市值", "总资产", "本金", "收益率%"])
+    curve.append(["日期", "现金", "持仓市值", "总资产", "本金", "收益率%", "回撤%", "持仓只数", "备注"])
     for c in curve[1]:
         c.font, c.fill = head_font, head_fill
-    seen = {}
-    for r in ledger["rows"]:
-        if r.get("date") and r.get("equity_after") is not None:
-            seen[r["date"]] = r          # 同一天取最后一条
-    for d in sorted(seen):
-        r = seen[d]
-        curve.append([d, r["cash_after"], r["market_value_after"], r["equity_after"],
-                      r["capital_after"], r["return_pct_after"]])
+    flag_txt = {"approx": "含停牌股, 按前收盘估值", "unknown_price": "有股票无行情, 按成本估值", "": ""}
+    for r in ledger.get("curve") or []:
+        curve.append([r["date"], r["cash"], r["market_value"], r["equity"], r["capital"],
+                      r["return_pct"], r["drawdown_pct"], r["n_positions"], flag_txt.get(r["flag"], r["flag"])])
     for col in "BCDE":
         for c in curve[col][1:]:
             c.number_format = "#,##0.00"
-    for col, w in zip("ABCDEF", (12, 14, 14, 14, 14, 10), strict=True):
+    for col in "FG":
+        for c in curve[col][1:]:
+            c.number_format = "0.00"
+    for col, w in zip("ABCDEFGHI", (12, 14, 14, 14, 14, 10, 10, 9, 28), strict=True):
         curve.column_dimensions[col].width = w
+    curve.freeze_panes = "A2"
 
     info = wb.create_sheet("说明")
     s = ledger["summary"]

@@ -102,6 +102,40 @@ def test_replay_equity_and_return(tmp_path):
     assert s["n_trades"] == 3
 
 
+def test_daily_curve_revalues_between_events(tmp_path):
+    """两次变动之间只换收盘价; 存入现金当天收益率基本不变; 回撤按净值峰值算"""
+    from ledger_history import build_ledger
+    _kline(tmp_path, "600000", [("2026-08-04", 10.5), ("2026-08-05", 12.0), ("2026-08-06", 9.0),
+                                ("2026-08-07", 9.5), ("2026-08-11", 11.0)])
+    _kline(tmp_path, "000001", [("2026-08-04", 51.0), ("2026-08-05", 51.0), ("2026-08-06", 51.0),
+                                ("2026-08-07", 51.0), ("2026-08-11", 52.0)])
+    st = _state()
+    st["initial_capital"] = 10308.0
+    st["calendar"] = ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07",
+                      "2026-08-10", "2026-08-11", "2026-08-12", "2026-08-13"]
+    out = build_ledger(tmp_path, "demo", st, names={})
+    curve = {c["date"]: c for c in out["curve"]}
+    assert min(curve) == "2026-08-04" and max(curve) == "2026-08-13"
+    # 08-04 收盘: 现金 12990, 市值 200*10.5 + 100*51 = 7200 -> 20190 (与明细表同值)
+    assert curve["2026-08-04"]["equity"] == 20190.0
+    # 08-05 盘后存入 1000: 当日快照取当天最后一次变动 -> 现金 13990 / 本金 21000;
+    # 市值 200*12 + 100*51 = 7500 -> 21490; 存入不该明显改变收益率
+    assert curve["2026-08-05"]["cash"] == 13990.0 and curve["2026-08-05"]["capital"] == 21000.0
+    assert curve["2026-08-05"]["equity"] == 21490.0
+    assert curve["2026-08-05"]["return_pct"] == pytest.approx(21490 / 21000 * 100 - 100, abs=0.01)
+    d6 = curve["2026-08-06"]
+    assert d6["cash"] == 13980.0 and d6["capital"] == 21000.0
+    assert d6["equity"] == pytest.approx(13980 + 200 * 9.0 + 100 * 51.0)
+    assert d6["drawdown_pct"] < 0                              # 从 08-05 高点回落
+    # 08-10 停牌(无K线): 沿用 08-07 收盘并打标
+    assert curve["2026-08-10"]["flag"] == "approx"
+    assert curve["2026-08-13"]["n_positions"] == 1 and curve["2026-08-13"]["capital"] == 10308.0
+    stats = out["summary"]["curve_stats"]
+    assert stats["n_days"] == len(out["curve"]) and stats["annualized_pct"] is None
+    assert stats["max_drawdown_pct"] == min(c["drawdown_pct"] for c in out["curve"])
+    assert stats["invested_days"] == len(out["curve"])
+
+
 def test_unreconciled_is_flagged(tmp_path):
     from ledger_history import build_ledger
     _kline(tmp_path, "600000", [("2026-08-04", 10.5), ("2026-08-11", 11.0)])

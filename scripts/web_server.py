@@ -1742,7 +1742,7 @@ async def api_ledger(req: Request, profile: str = None):
     ledger = build_ledger(ROOT, d["profile"], d["state"])
     out = {"profile": d["profile"], "profile_name": d["profile_name"],
            "profiles": list_profiles(_effective_scope(req)),
-           "rows": ledger["rows"], "summary": ledger["summary"],
+           "rows": ledger["rows"], "summary": ledger["summary"], "curve": ledger["curve"],
            "export_url": f"/api/ledger/xlsx?profile={d['profile']}"}
     return _with_viewer(req, out)
 

@@ -2214,6 +2214,78 @@ function histRow(r){
     </div></div>`;
 }
 
+// ── 收益曲线 (纯 SVG, 与 K 线图同风格) ──
+// 曲线点 = 每个交易日的 收益率% (总资产/当时本金 - 1)。存取现金会同额改本金,
+// 所以曲线上不会因为加钱而"跳涨"。回撤线画在下方, 与 curve_stats 同源。
+let CURVE = [], CRANGE = localStorage.getItem('crange') || 'all';
+function setCRange(r){ CRANGE = r; localStorage.setItem('crange', r); drawCurve(); }
+
+function curveSvg(pts){
+  if (pts.length < 2) return '<div class="empty">数据不足两天, 画不出曲线</div>';
+  const W = 560, H = 210, DH = 54, L = 44, R = 10, T = 12, B = 22;
+  const xs = i => L + (W - L - R) * i / (pts.length - 1);
+  const rv = pts.map(p => p.return_pct), dv = pts.map(p => p.drawdown_pct || 0);
+  let lo = Math.min(0, ...rv), hi = Math.max(0, ...rv);
+  if (hi - lo < 1){ hi += 0.5; lo -= 0.5; }
+  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+  const ys = v => T + (H - T - B) * (hi - v) / (hi - lo);
+  const dlo = Math.min(-0.5, ...dv);
+  const yd = v => H + 6 + DH * (0 - v) / (0 - dlo);
+  let s = `<svg viewBox="0 0 ${W} ${H + DH + 16}" xmlns="http://www.w3.org/2000/svg">`;
+  // 网格与刻度 (5 条)
+  for (let k = 0; k <= 4; k++){
+    const v = hi - (hi - lo) * k / 4, y = ys(v);
+    s += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" stroke="#1e222b"/>`;
+    s += `<text x="${L - 5}" y="${y + 4}" text-anchor="end" font-size="10" fill="#6f7889">${v.toFixed(1)}%</text>`;
+  }
+  const y0 = ys(0);
+  s += `<line x1="${L}" y1="${y0}" x2="${W - R}" y2="${y0}" stroke="#4b5567" stroke-dasharray="3 3"/>`;
+  // 面积 + 折线: 红涨绿跌沿用 A 股习惯, 按末值颜色
+  const last = rv[rv.length - 1], col = last >= 0 ? '#f6465d' : '#2ebd85';
+  let path = '';
+  pts.forEach((p, i) => { path += (i ? 'L' : 'M') + xs(i).toFixed(1) + ',' + ys(p.return_pct).toFixed(1); });
+  s += `<path d="${path} L${xs(pts.length-1).toFixed(1)},${y0} L${L},${y0} Z" fill="${col}" opacity="0.10"/>`;
+  s += `<path d="${path}" fill="none" stroke="${col}" stroke-width="1.8"/>`;
+  // 停牌/无行情估值日打小点提示
+  pts.forEach((p, i) => { if (p.flag) s += `<circle cx="${xs(i)}" cy="${ys(p.return_pct)}" r="2.2" fill="#fcd34d"/>`; });
+  // 日期刻度: 首/中/末
+  [0, Math.floor((pts.length - 1) / 2), pts.length - 1].forEach(i => {
+    s += `<text x="${xs(i)}" y="${H - 6}" text-anchor="${i === 0 ? 'start' : (i === pts.length - 1 ? 'end' : 'middle')}" font-size="10" fill="#6f7889">${pts[i].date.slice(5)}</text>`;
+  });
+  // 回撤区
+  let dp = '';
+  pts.forEach((p, i) => { dp += (i ? 'L' : 'M') + xs(i).toFixed(1) + ',' + yd(p.drawdown_pct || 0).toFixed(1); });
+  s += `<path d="${dp} L${xs(pts.length-1).toFixed(1)},${yd(0)} L${L},${yd(0)} Z" fill="#2ebd85" opacity="0.22"/>`;
+  s += `<path d="${dp}" fill="none" stroke="#2ebd85" stroke-width="1"/>`;
+  s += `<text x="${L - 5}" y="${yd(0) + 4}" text-anchor="end" font-size="10" fill="#6f7889">0</text>`;
+  s += `<text x="${L - 5}" y="${yd(dlo) + 4}" text-anchor="end" font-size="10" fill="#6f7889">${dlo.toFixed(1)}%</text>`;
+  s += `<text x="${L + 4}" y="${yd(0) + 12}" font-size="10" fill="#6f7889">回撤</text>`;
+  return s + '</svg>';
+}
+
+function drawCurve(){
+  const box = $('#curvebox'); if (!box) return;
+  const pts = CURVE.filter(p => p.return_pct != null);
+  const n = {'1m': 21, '3m': 63, '6m': 126}[CRANGE];
+  const seg = n ? pts.slice(-n) : pts;
+  // 区间收益: 以区间首日为基准重算, 否则"近1月"显示的还是累计数
+  let shown = seg;
+  if (n && seg.length > 1){
+    const base = 1 + seg[0].return_pct / 100; let pk = 0;
+    shown = seg.map(p => { const nav = (1 + p.return_pct / 100) / base; pk = Math.max(pk, nav);
+      return {...p, return_pct: (nav - 1) * 100, drawdown_pct: (nav / pk - 1) * 100}; });
+  }
+  const tabs = [['all','全部'],['6m','近6月'],['3m','近3月'],['1m','近1月']].map(([k, t]) =>
+    `<div class="ktab ${CRANGE === k ? 'on' : ''}" onclick="setCRange('${k}')">${t}</div>`).join('');
+  const segRet = shown.length ? shown[shown.length - 1].return_pct : null;
+  const segDD = shown.length ? Math.min(...shown.map(p => p.drawdown_pct || 0)) : null;
+  box.innerHTML = `<div class="ktabs">${tabs}</div>
+    <div class="kbody">${curveSvg(shown)}</div>
+    <div class="kinfo">${n ? '区间' : '累计'}收益 ${pctTxt(segRet == null ? null : +segRet.toFixed(2))} ·
+      ${n ? '区间' : ''}最大回撤 ${segDD == null ? '--' : segDD.toFixed(2) + '%'} ·
+      ${shown.length} 个交易日${shown.some(p => p.flag) ? ' · 黄点 = 含停牌/无行情股按前收盘或成本估值' : ''}</div>`;
+}
+
 async function loadHist(){
   let r, d;
   try { r = await fetch('/api/ledger' + dataQuery()); d = await r.json(); }
@@ -2251,6 +2323,26 @@ async function loadHist(){
       (s.approx_quote_dates||[]).length ? `<br>停牌日按前一收盘估值：${s.approx_quote_dates.join('、')}` : ''}
     </div></div>`;
 
+  // 收益曲线卡: 逐交易日净值 + 回撤; 摘要数字与后端 curve_stats 同源
+  CURVE = d.curve || [];
+  const cs = s.curve_stats;
+  if (cs){
+    h += `<div class="card"><h2>收益曲线 · ${esc(cs.start)} ～ ${esc(cs.end)}</h2>
+      <div id="curvebox"></div>
+      <div class="grid" style="margin-top:12px">
+        <div class="kv"><div class="k">累计收益</div><div class="v">${pctTxt(cs.total_return_pct)}</div></div>
+        <div class="kv"><div class="k">最大回撤${cs.max_drawdown_date ? ' · ' + esc(cs.max_drawdown_date.slice(5)) : ''}</div>
+          <div class="v neg">${cs.max_drawdown_pct == null ? '--' : cs.max_drawdown_pct.toFixed(2) + '%'}</div></div>
+        <div class="kv"><div class="k">年化(≥60交易日才算)</div><div class="v">${cs.annualized_pct == null ? '<span style="color:#5e6675">样本太短</span>' : pctTxt(cs.annualized_pct)}</div></div>
+        <div class="kv"><div class="k">上涨/下跌天数</div><div class="v" style="font-size:15px">${cs.up_days} / ${cs.down_days}</div></div>
+        <div class="kv"><div class="k">最好/最差单日</div><div class="v" style="font-size:15px">${pctTxt(cs.best_day_pct)} / ${pctTxt(cs.worst_day_pct)}</div></div>
+        <div class="kv"><div class="k">有持仓天数</div><div class="v" style="font-size:15px">${cs.invested_days} / ${cs.n_days}</div></div>
+      </div>
+      <div class="tipbox" style="margin:10px 0 0">每个交易日按当日收盘估值；两次操作之间只是价格在变。
+        ${s.epochs > 1 ? '这条线换过策略参数，曲线横跨多段配置，看业绩请结合下方「策略配置切换」的日期。' : ''}
+        样本只有 ${cs.n_days} 个交易日，<b>不要拿它外推年化或与回测比</b>。</div></div>`;
+  }
+
   // 按日期倒序分组: 最近的在最上面, 同一天的多笔放一起
   const byDate = {};
   rows.forEach(x => { const k = x.date || '建户'; (byDate[k] = byDate[k] || []).push(x); });
@@ -2265,6 +2357,7 @@ async function loadHist(){
   });
   h += `</div>`;
   $('#app').innerHTML = h;
+  drawCurve();
 }
 
 function load(){ return VIEW === 'rec' ? loadRec() : (VIEW === 'hist' ? loadHist() : loadAct()); }
