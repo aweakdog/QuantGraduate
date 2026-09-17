@@ -70,7 +70,7 @@
 - 09-16空仓核验：当前breadth口径是原始全市场K线中“收盘>各股MA20”的比例，**不是当日涨家数比例，也不是PIT/主板候选池的占比**。40%阈值、双向两交易日确认，T收盘信号/T+1尾盘执行。09-11首次26.90%跌破、09-14第二次28.47%确认，基准账本09-15尾盘regime_exit；09-16虽75.16%股票上涨，站上MA20仍仅1496/5512=27.14%。原始5784文件扫描、22日两广度值/84计划对账均无误触发；这是确认滞后造成踏空的代价，不是模型断言明天跌。
 - 纯读审计不要直接运行live_signal.py，也不要把--dry-run当完全无写入：compute_market_features仍可能删旧缓存并生成新缓存。此次只读plan/state/K线，独立计数并抽取纯build_regime_series核验。缓存输入戳19:38与后续行情重写20:12不同，但复算最近22日广度完全相同；mtime变化不等于当次数值错误。不得为刷新网页而擅自提交空成交确认或切自动记账。
 
-- **网页「历史操作」(2026-09-17 上线, 9fd15aa)**：首页第三标签, `scripts/ledger_history.py` 只读回放 `state_<pid>.json` 的 history(结算批次+改账操作), 总资产按执行日收盘复算、收益率用当时本金, 尾部与当前账本对账(现金 ≤0.10 元取整差视为一致, 持仓逐股相等)。接口 `/api/ledger`、`/api/ledger/xlsx`(内存生成, 不落盘)。**权限比看板严**: 账户口令只看自己名下线, `?all=1` 不放开; 213213 只读口令拒; admin/环境变量 full 看全部。测试 `tests/test_ledger_history.py`。
+- **网页「历史操作」(2026-09-17 上线, 9fd15aa)**：首页第三标签, `scripts/ledger_history.py` 只读回放 `state_<pid>.json` 的 history(结算批次+改账操作), 总资产按执行日收盘复算、收益率用当时本金, 尾部与当前账本对账(现金 ≤0.10 元取整差视为一致, 持仓逐股相等)。接口 `/api/ledger`、`/api/ledger/xlsx`(内存生成, 不落盘)。**权限(09-17 用户改口径)**: 看记录+曲线 = 所有登录身份看所有线(与看板「看全部」同口径); **导出 Excel 只给账户本人名下线与 admin/环境变量 full**, 213213 与看别人线的账户会话 403, 前端按 `can_export` 隐按钮, 后端同样拦。测试 `tests/test_ledger_history.py`。
 - 041 部署纪律再确认: 活树 docs/ 与 main 长期不一致(更新器只 rsync scripts/pipeline/tests), 所以**不要在 041 用 `git merge/pull`**, 照 admin_update.sh 做 `git reset --mixed <commit>` + `git checkout -- scripts pipeline tests`; 09-17 曾因 `checkout -- 文件 && rm && merge` 链式命令在 merge 失败前先回退了刚 scp 的新文件, 重启前必须重新核 sha256。部署后同步写 `~/.local/state/quant-admin/deployed-commit`。
 
 ## 3. 实验方法论约定
