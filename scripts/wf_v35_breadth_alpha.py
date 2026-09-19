@@ -213,8 +213,9 @@ parser.add_argument("--lgb-seed", type=int, default=42,
                     help="LightGBM random_state。不是可调超参 —— 仅供多种子集成实验"
                          "(同一模型训多个种子平均排名, 降低前3名选择方差)使用。"
                          "禁止用它挑好看的单种子结果")
-parser.add_argument("--label-alignment", choices=["legacy", "common", "t1close"], default="legacy",
-                    help="研究标签: legacy原口径; common旧标签+共同样本/6日截断; t1close次日收盘起5日收益+相同截断")
+parser.add_argument("--label-alignment", choices=["legacy", "purge6", "common5", "common", "t1close"], default="legacy",
+                    help="研究标签: legacy原口径; purge6旧标签只多截断一天; common5旧标签只用共同样本(5日截断); "
+                         "common旧标签+共同样本/6日截断(=purge6+common5); t1close次日收盘起5日收益+相同截断")
 parser.add_argument("--label-panel", default="label_alignment_panel.parquet")
 parser.add_argument("--tag", type=str, default=None)
 args = parser.parse_args()
@@ -233,7 +234,7 @@ if args.test_end is None:
     args.test_end = f"{_dmax:%Y-%m-%d}"
     print(f"--test-end 未给, 跟到矩阵最新日 {args.test_end}")
 
-from research_labels import HELPER_COLUMNS, label_horizon, load_panel, validate_cache_contract
+from research_labels import HELPER_COLUMNS, label_horizon, load_panel, uses_panel, validate_cache_contract
 
 LEGACY_LABEL_RAW = {"1d": "fwd_1d_ret", "2d": "fwd_2d_ret", "5d": "fwd_5d_ret"}[args.label]
 LABEL_RAW = "lab1_t1close_5d" if args.label_alignment == "t1close" else LEGACY_LABEL_RAW
@@ -751,11 +752,13 @@ for c in df.select_dtypes(include=[np.number]).columns:
 _lab_ok = df[LEGACY_LABEL_RAW].notna()
 _last_lab_date = df.loc[_lab_ok, "date"].max()
 df = df[_lab_ok | (df["date"] > _last_lab_date)]
-if args.label_alignment != "legacy":
+if uses_panel(args.label_alignment):
     df, LABEL_PANEL_SHA256 = load_panel(DATA_DIR / "processed" / args.label_panel,
                                         TRAIN_PATH, df, args.label_alignment)
     print(f"标签模式 {args.label_alignment}, 闭合间隔 {LABEL_HORIZON} 日, "
           f"共同标签有效 {int(df.lab1_common.sum())}/{len(df)}; 候选行不因新标签缺失而删除")
+elif args.label_alignment != "legacy":
+    print(f"标签模式 {args.label_alignment}: 旧标签, 闭合间隔 {LABEL_HORIZON} 日, 全部有效行参与训练")
 if args.pit_universe:
     df = apply_pit_universe(df, args.pit_universe)
 if SKIP_BOARDS and not args.load_preds:
@@ -777,7 +780,8 @@ ovn_df, ovn_features = compute_overnight_features(df["code"].unique())
 df = df.merge(ovn_df[["date", "code"] + ovn_features], on=["date", "code"], how="left")
 
 # ── 改动 A: 只按日期 demean (保序, 与 raw 收益 corr=1.00) ──
-if args.label_alignment == "legacy":
+# 共同样本口径(common5/common/t1close)只让共同有效行进训练与 demean; legacy/purge6 用全部行。
+if not uses_panel(args.label_alignment):
     df[LABEL] = df.groupby("date")[LABEL_RAW].transform(lambda x: x - x.mean())
 else:
     _target = df[LABEL_RAW].where(df.lab1_common)

@@ -81,7 +81,7 @@ def common_args(model, end, matrix, features=None, test_start="2023-09-19"):
 def make_tasks(root, phase, end, test_start="2023-09-19"):
     tasks = []
     engine = str(root / "scripts/wf_v35_breadth_alpha.py")
-    if phase not in {"corr", "t2a", "label", "prune"}:
+    if phase not in {"corr", "t2a", "label", "prune", "n3"}:
         raise ValueError("unknown study phase")
     matrix = "training_data_pit_v24_tick1_t2a.parquet" if phase == "t2a" else "training_data_pit_v24_tick1.parquet"
 
@@ -91,6 +91,27 @@ def make_tasks(root, phase, end, test_start="2023-09-19"):
     def result(name, model, seed):
         return root / "data/processed" / (f"wf_daily_{name}_s{seed}_ts{test_start}_te{end}_cap{PROFILES[model]['capital']}.json")
 
+    if phase == "n3":
+        # N3 (2026-09-17): 两个接力实验, 同一队列。
+        #  1) NOEXO 20 种子确认: 只补 SEEDS[10:20] 的 FULL/NOEXO, 文件名与 N2 完全同构,
+        #     汇总时与 N2 已有的 10 种子拼成 20 配对 (同快照同 K线, 允许拼接)。
+        #  2) CONTROL 拆解: purge6(只多截断一天) / common5(只筛共同行), 各 10 种子,
+        #     与 N2 已有的 CURRENT/CONTROL 结果配对, 把 CONTROL-CURRENT 的差异归因。
+        for seed in SEEDS[10:20]:
+            for model in PROFILES:
+                for arm in ["FULL", "NOEXO"]:
+                    features = f"features_N2_{model}_{arm}.json" if arm != "FULL" else None
+                    tag = f"N2_F_{model}_{arm}"
+                    base = [sys.executable, "-u", engine, *common_args(model, end, matrix, features, test_start), "--lgb-seed", str(seed)]
+                    add(f"{tag}_s{seed}", [*base, "--tag", tag, "--save-preds", f"preds_{tag}_s{seed}.pkl"], [], result(tag, model, seed))
+        for seed in SEEDS[:10]:
+            for model in PROFILES:
+                for arm, mode in [("PURGE6", "purge6"), ("COMMON5", "common5")]:
+                    tag = f"N2_L_{model}_{arm}"
+                    base = [sys.executable, "-u", engine, *common_args(model, end, matrix, None, test_start), "--lgb-seed", str(seed)]
+                    add(f"{tag}_s{seed}", [*base, "--label-alignment", mode, "--tag", tag, "--save-preds", f"preds_{tag}_s{seed}.pkl"],
+                        [], result(tag, model, seed), 2)
+        return tasks
     if phase in {"label", "prune"}:
         modes = {"CURRENT": "legacy", "CONTROL": "common", "ALIGNED": "t1close"}
         arms = list(modes) if phase == "label" else ["FULL", "NOEXO", "NOMACRO"]
@@ -202,7 +223,69 @@ def summarize_n2(root, phase, end, test_start="2023-09-19"):
     return out
 
 
+N3_GATE = {"stage": "twenty_seed_confirmation", "arm": "NOEXO-FULL", "requires_complete_pairs": 20,
+           "return_delta_pp_min": 5, "positive_pairs_min": 13, "drawdown_delta_pp_min": -2,
+           "recent_126_delta_pp_min": -5, "joint_policy": "both operating points must pass; no per-profile cherry-picking",
+           "automatic_promotion": False,
+           "dissection": "PURGE6-CURRENT and COMMON5-CURRENT attribute CONTROL-CURRENT; attribution only, no gate"}
+
+
+def _paired_rows(root, prefix, model, arm, base, seeds, end, test_start):
+    pairs = []
+    for seed in seeds:
+        suffix = f"_s{seed}_ts{test_start}_te{end}_cap{PROFILES[model]['capital']}.json"
+        pa = root / "data/processed" / f"wf_daily_{prefix}_{model}_{arm}{suffix}"
+        pb = root / "data/processed" / f"wf_daily_{prefix}_{model}_{base}{suffix}"
+        if pa.exists() and pb.exists():
+            pairs.append({"seed": seed, **compare(json.loads(pa.read_text()), json.loads(pb.read_text()))})
+    if not pairs:
+        return None
+    median = {k: float(np.median([p[k] for p in pairs])) for k in pairs[0]
+              if k not in {"seed", "yearly_delta_pp"} and pairs[0][k] is not None}
+    years = sorted({y for p in pairs for y in (p.get("yearly_delta_pp") or {})})
+    yearly = {y: float(np.median([p["yearly_delta_pp"][y] for p in pairs if y in p.get("yearly_delta_pp", {})])) for y in years}
+    return {"model": model, "profile": PROFILES[model], "arm": f"{arm}-{base}", "n_pairs": len(pairs),
+            "median": median, "yearly_median_delta_pp": yearly,
+            "positive_return_differences": sum(p["total_return_pct"] > 0 for p in pairs),
+            "recent_126_positive": sum(p["recent_126_delta_pp"] > 0 for p in pairs), "pairs": pairs}
+
+
+def summarize_n3(root, end, test_start="2023-09-19"):
+    rows, verdict = [], {}
+    for model in PROFILES:
+        row = _paired_rows(root, "N2_F", model, "NOEXO", "FULL", SEEDS[:20], end, test_start)
+        if row is not None:
+            m = row["median"]
+            complete = row["n_pairs"] == N3_GATE["requires_complete_pairs"]
+            row["expected_pairs"] = 20
+            row["passes_gate"] = bool(complete and m["total_return_pct"] >= N3_GATE["return_delta_pp_min"]
+                                      and row["positive_return_differences"] >= N3_GATE["positive_pairs_min"]
+                                      and m["max_dd_pct"] >= N3_GATE["drawdown_delta_pp_min"]
+                                      and m["recent_126_delta_pp"] >= N3_GATE["recent_126_delta_pp_min"])
+            row["complete"] = complete
+            verdict[model] = row["passes_gate"] if complete else None
+            rows.append(row)
+        for arm in ["PURGE6", "COMMON5", "CONTROL"]:
+            row = _paired_rows(root, "N2_L", model, arm, "CURRENT", SEEDS[:10], end, test_start)
+            if row is not None:
+                row["expected_pairs"] = 10
+                row["role"] = "dissection" if arm != "CONTROL" else "reference"
+                rows.append(row)
+    out = {"updated_at": stamp(), "phase": "n3", "test_end": end, "gate": N3_GATE,
+           # 联合判定要求两个操作点都齐 20 配对; 任一点缺席或未满就是 None, 不得用单点宣布通过
+           "noexo_both_points_pass": (all(verdict[m] for m in PROFILES)
+                                      if all(verdict.get(m) is not None for m in PROFILES) else None),
+           "adoption_ready": False, "rows": rows,
+           "interpretation": "NOEXO-FULL rows pool N2's 10 seeds with N3's 10 new seeds (same frozen snapshot/K-lines). "
+                             "Dissection rows share N2 CURRENT baselines; PURGE6 + COMMON5 need not add up to CONTROL. "
+                             "Passing the gate proposes, never performs, a production feature-set change."}
+    write_json(root / "summary_n3.json", out)
+    return out
+
+
 def summarize(root, phase, end, test_start="2023-09-19"):
+    if phase == "n3":
+        return summarize_n3(root, end, test_start)
     if phase in {"label", "prune"}:
         return summarize_n2(root, phase, end, test_start)
     proc = root / "data/processed"
@@ -254,6 +337,18 @@ def run(root, phase, workers, max_load, min_memory):
         smoke = root / "n2_smoke_verified.json"
         if not qc[phase + "_ready"] or qc["test_end"] != end or not smoke.exists():
             raise RuntimeError("N2 input QC/date or smoke verification failed")
+    if phase == "n3":
+        qc = json.loads((root / "n2_inputs.json").read_text())
+        if not (qc["label_ready"] and qc["prune_ready"]) or qc["test_end"] != end or not (root / "n2_smoke_verified.json").exists():
+            raise RuntimeError("N3 needs the verified N2 inputs (label + prune) on this snapshot")
+        # 接力前提: N2 的 10 种子 CURRENT/CONTROL 与 FULL/NOEXO 结果都在本快照里, 否则拼不成配对
+        for prefix, arms in [("N2_L", ["CURRENT", "CONTROL"]), ("N2_F", ["FULL", "NOEXO"])]:
+            for model in PROFILES:
+                for arm in arms:
+                    for seed in SEEDS[:10]:
+                        p = root / "data/processed" / f"wf_daily_{prefix}_{model}_{arm}_s{seed}_ts{info['test_start']}_te{end}_cap{PROFILES[model]['capital']}.json"
+                        if not p.is_file() or p.stat().st_size == 0:
+                            raise RuntimeError("N3 baseline missing: " + p.name)
     if phase == "t2a":
         qc = json.loads((root / "t2a_qc.json").read_text())
         if not qc["ok"] or qc["test_end"] != end:
@@ -270,7 +365,7 @@ def run(root, phase, workers, max_load, min_memory):
     if status_path.exists() or (root / f"plan_{phase}.json").exists():
         raise RuntimeError("existing queue: inspect before restarting; no automatic duplicate launch")
     n2 = phase in {"label", "prune"}
-    gate = ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
+    gate = N3_GATE if phase == "n3" else ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
              "positive_pairs_min": 7, "requires_complete_pairs": 10, "automatic_promotion": False,
              "label_primary": "ALIGNED-CONTROL", "label_practical_check": "ALIGNED-CURRENT must also be nonnegative",
              "joint_policy": "Both operating points must pass before proposing 20-seed confirmation; no posthoc per-profile cherry-picking"}
@@ -331,15 +426,18 @@ def run(root, phase, workers, max_load, min_memory):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("phase", choices=["corr", "t2a", "label", "prune", "manifest", "summary-corr", "summary-t2a", "summary-label", "summary-prune"])
+    ap.add_argument("phase", choices=["corr", "t2a", "label", "prune", "n3", "manifest",
+                                      "summary-corr", "summary-t2a", "summary-label", "summary-prune", "summary-n3"])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-load", type=float, default=85)
     ap.add_argument("--min-memory-gb", type=float, default=96)
     args = ap.parse_args()
     if not (ROOT / "smoke_verified.json").exists() and args.phase == "corr":
         ap.error("smoke_verified.json missing")
-    if not 1 <= args.workers <= 4:
-        ap.error("workers must be between 1 and 4")
+    # 每个训练进程 LightGBM n_jobs=10; 6 worker ≈ 60 线程, 是用户 2026-08-22 放宽后
+    # 041/040 上可接受的上限 (~64 核), 再多就吃满共享机器了
+    if not 1 <= args.workers <= 6:
+        ap.error("workers must be between 1 and 6")
     if args.phase == "manifest":
         print(json.dumps({k: v for k, v in manifest(ROOT).items() if k not in ["files", "code_sha256"]}))
         return

@@ -102,7 +102,33 @@ def test_cache_rejects_label_or_feature_mismatch_and_allows_legacy():
         validate_cache_contract(meta, 'common', 'abc', ['y'])
 
 
-@pytest.mark.parametrize('label,mode', [('1d', 'common'), ('2d', 't1close'), ('5d', 'wrong')])
+@pytest.mark.parametrize('label,mode', [('1d', 'common'), ('2d', 't1close'), ('5d', 'wrong'),
+                                        ('1d', 'purge6'), ('2d', 'common5')])
 def test_invalid_alignment_rejected(label, mode):
     with pytest.raises(ValueError):
         label_horizon(label, mode)
+
+
+def test_dissection_modes_split_control_into_purge_and_row_filter():
+    """N3: CONTROL(common) = purge6(只多截断一天) + common5(只筛共同行), 两者各取其一"""
+    from scripts.research_labels import uses_panel
+    assert label_horizon('5d', 'purge6') == 6 and label_horizon('5d', 'common5') == 5
+    assert not uses_panel('purge6') and not uses_panel('legacy')
+    assert uses_panel('common5') and uses_panel('common') and uses_panel('t1close')
+    with pytest.raises(ValueError):
+        uses_panel('wrong')
+    base, klines, _ = fixture_data()
+    panel = build_alignment_panel(base, klines)
+    assert_frame_equal(apply_alignment(base, panel, 'common5')[base.columns], base)
+    with pytest.raises(ValueError):
+        apply_alignment(base, panel, 'purge6')          # 不需要侧表的口径不得误用侧表
+    # 缓存合同: purge6 用 6 日截断且无侧表; common5 用 5 日截断且必须带侧表指纹
+    validate_cache_contract({'label': '5d', 'label_alignment': 'purge6', 'label_horizon': 6,
+                             'label_panel_sha256': None}, 'purge6', None, ['x'])
+    validate_cache_contract({'label': '5d', 'label_alignment': 'common5', 'label_horizon': 5,
+                             'label_panel_sha256': 'abc'}, 'common5', 'abc', ['x'])
+    with pytest.raises(ValueError):
+        validate_cache_contract({'label': '5d', 'label_alignment': 'common', 'label_horizon': 6,
+                                 'label_panel_sha256': 'abc'}, 'common5', 'abc', ['x'])
+    with pytest.raises(ValueError):
+        validate_cache_contract({'label': '5d'}, 'purge6', None, ['x'])   # legacy 缓存不能冒充 purge6

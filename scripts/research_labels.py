@@ -23,12 +23,30 @@ def file_hash(path):
     return result.hexdigest()
 
 
+# 五种标签口径。N2 的 CONTROL(common) 同时改了两件事: 多截断一天 + 只用共同有效行;
+# purge6 / common5 各取其一, 用来把 CONTROL 相对现行的差异拆开归因 (N3, 2026-09-17)。
+#   legacy  旧标签 C[T+5]/C[T]-1, 5 日截断, 全部行 demean
+#   purge6  旧标签, 6 日截断, 全部行 demean            (只多截断一天)
+#   common5 旧标签, 5 日截断, 仅共同有效行参与训练/demean (只筛行)
+#   common  旧标签, 6 日截断, 仅共同有效行             (N2 CONTROL = purge6 + common5)
+#   t1close 对齐标签 C[T+6]/C[T+1]-1, 6 日截断, 仅共同有效行
+MODES = ("legacy", "purge6", "common5", "common", "t1close")
+PANEL_MODES = {"common5", "common", "t1close"}      # 需要标签侧表(共同有效行)的口径
+SIX_DAY_MODES = {"purge6", "common", "t1close"}     # 训练截断 6 日的口径
+
+
 def label_horizon(label, mode):
-    if mode not in {"legacy", "common", "t1close"}:
+    if mode not in MODES:
         raise ValueError("unknown label alignment")
     if mode != "legacy" and label != "5d":
         raise ValueError("label alignment research supports only 5d")
-    return {"1d": 1, "2d": 2, "5d": 5}[label] + int(mode != "legacy")
+    return {"1d": 1, "2d": 2, "5d": 5}[label] + int(mode in SIX_DAY_MODES)
+
+
+def uses_panel(mode):
+    if mode not in MODES:
+        raise ValueError("unknown label alignment")
+    return mode in PANEL_MODES
 
 
 def build_alignment_panel(base, klines, tolerance=1e-6):
@@ -61,8 +79,8 @@ def build_alignment_panel(base, klines, tolerance=1e-6):
 
 
 def apply_alignment(frame, panel, mode):
-    if mode not in {"common", "t1close"}:
-        raise ValueError("panel is used only for nonlegacy alignment")
+    if mode not in PANEL_MODES:
+        raise ValueError("panel is used only for common-sample alignments")
     if panel.duplicated(["date", "code"]).any():
         raise ValueError("duplicate label panel keys")
     columns = ["date", "code", *sorted(HELPER_COLUMNS)]

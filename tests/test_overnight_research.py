@@ -111,3 +111,52 @@ def test_label_summary_separates_purge_cost_from_target_change(tmp_path, test_st
     values = {r['arm']: r['median']['total_return_pct'] for r in rows}
     assert values == {'CONTROL-CURRENT': -2, 'ALIGNED-CONTROL': 7, 'ALIGNED-CURRENT': 5}
     assert all(r['n_pairs'] == 10 and not r.get('adoption_ready', False) for r in rows)
+
+
+def test_n3_plan_only_adds_new_seeds_and_dissection_arms():
+    """N3: FULL/NOEXO 只补后 10 个种子(文件名与 N2 同构); purge6/common5 只用前 10 个种子;
+    执行层与 N2 一字不改, 不产生任何 load-preds 重放"""
+    tasks = make_tasks(Path('/tmp/research'), 'n3', '2026-09-11', test_start='2023-09-20')
+    assert len(tasks) == len({t['id'] for t in tasks}) == len({t['output'] for t in tasks}) == 80
+    confirm = [t for t in tasks if t['id'].startswith('N2_F_')]
+    dissect = [t for t in tasks if t['id'].startswith('N2_L_')]
+    assert len(confirm) == 40 and len(dissect) == 40
+    assert {int(t['id'].rsplit('_s', 1)[1]) for t in confirm} == set(SEEDS[10:20])
+    assert {int(t['id'].rsplit('_s', 1)[1]) for t in dissect} == set(SEEDS[:10])
+    for task in tasks:
+        command = task['command']
+        assert command[command.index('--test-start') + 1] == '2023-09-20' and '_ts2023-09-20_' in task['output']
+        assert command[command.index('--exec-mode') + 1] == 't1close'
+        assert command[command.index('--hold-days') + 1] == '5'
+        assert command[command.index('--regime-breadth') + 1] == '0.40'
+        assert '--save-preds' in command and '--load-preds' not in command
+    modes = {command[command.index('--label-alignment') + 1] for command in (t['command'] for t in dissect)}
+    assert modes == {'purge6', 'common5'}
+    assert all('--label-alignment' not in t['command'] for t in confirm)
+    noexo = next(t for t in confirm if '_NOEXO_' in t['id'])
+    assert noexo['command'][noexo['command'].index('--features-from') + 1].startswith('features_N2_')
+    # 与 N2 产出的文件名完全同构, 才能拼成 20 种子配对
+    n2 = make_tasks(Path('/tmp/research'), 'prune', '2026-09-11', test_start='2023-09-20')
+    n2_names = {Path(t['output']).name.replace(f'_s{s}_', '_sX_') for t in n2 for s in SEEDS[:10] if f'_s{s}_' in Path(t['output']).name}
+    n3_names = {Path(t['output']).name.replace(f'_s{s}_', '_sX_') for t in confirm for s in SEEDS[10:20] if f'_s{s}_' in Path(t['output']).name}
+    assert n3_names <= n2_names
+
+
+def test_n3_summary_pools_twenty_seeds_and_never_passes_partial(tmp_path):
+    processed = tmp_path / 'data/processed'
+    processed.mkdir(parents=True)
+    suffix = '_ts2023-09-20_te2026-09-11_cap100000.json'
+    for seed in SEEDS[:10]:                       # N2 已有的基线与对照
+        for arm, total in [('CURRENT', 20), ('CONTROL', 30), ('PURGE6', 22), ('COMMON5', 27)]:
+            (processed / f'wf_daily_N2_L_A_{arm}_s{seed}{suffix}').write_text(json.dumps(sample_result(total=total)))
+    for i, seed in enumerate(SEEDS):
+        for arm, result in [('FULL', sample_result()), ('NOEXO', sample_result(28, -8))]:
+            (processed / f'wf_daily_N2_F_A_{arm}_s{seed}{suffix}').write_text(json.dumps(result))
+        out = summarize(tmp_path, 'n3', '2026-09-11', '2023-09-20')
+        row = next(r for r in out['rows'] if r['arm'] == 'NOEXO-FULL')
+        assert row['n_pairs'] == i + 1 and row['passes_gate'] == (i == 19)
+        assert out['adoption_ready'] is False
+    values = {r['arm']: r['median']['total_return_pct'] for r in out['rows']}
+    assert values['PURGE6-CURRENT'] == 2 and values['COMMON5-CURRENT'] == 7 and values['CONTROL-CURRENT'] == 10
+    assert out['noexo_both_points_pass'] is None          # B 点还没有结果, 不能宣布联合通过
+    assert (tmp_path / 'summary_n3.json').exists()
