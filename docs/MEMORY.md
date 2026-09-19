@@ -2,7 +2,7 @@
 
 > **维护约定**：与 `TODO.md` 配套。新增规矩 / 推翻旧约定 / 沉淀重要事实时更新本文件。
 > 按主题组织，不按时间。每条尽量带"为什么"（教训来源）。
-> **最后更新：2026-09-16 Falcon暂缓与生产空仓触发核验**
+> **最后更新：2026-09-17 N2判读、N3启动、dart对训练边界敏感的教训**
 
 ---
 
@@ -72,6 +72,10 @@
 
 - **网页「历史操作」(2026-09-17 上线, 9fd15aa)**：首页第三标签, `scripts/ledger_history.py` 只读回放 `state_<pid>.json` 的 history(结算批次+改账操作), 总资产按执行日收盘复算、收益率用当时本金, 尾部与当前账本对账(现金 ≤0.10 元取整差视为一致, 持仓逐股相等)。接口 `/api/ledger`、`/api/ledger/xlsx`(内存生成, 不落盘)。**权限(09-17 用户改口径)**: 看记录+曲线 = 所有登录身份看所有线(与看板「看全部」同口径); **导出 Excel 只给账户本人名下线与 admin/环境变量 full**, 213213 与看别人线的账户会话 403, 前端按 `can_export` 隐按钮, 后端同样拦。测试 `tests/test_ledger_history.py`。
 - 041 部署纪律再确认: 活树 docs/ 与 main 长期不一致(更新器只 rsync scripts/pipeline/tests), 所以**不要在 041 用 `git merge/pull`**, 照 admin_update.sh 做 `git reset --mixed <commit>` + `git checkout -- scripts pipeline tests`; 09-17 曾因 `checkout -- 文件 && rm && merge` 链式命令在 merge 失败前先回退了刚 scp 的新文件, 重启前必须重新核 sha256。部署后同步写 `~/.local/state/quant-admin/deployed-commit`。
+
+- **N2 判读(09-17)**：标签对齐(次日收盘起 5 日) 20 配对里 8 个为负、两点中位 −21/−17.5pp → 否决，不再改标签相位；删 6 列 `mkt_*` 市场状态输入 → 判死(两点 −29/−37pp, B 0/10)。去 26 列外部宏观(NOEXO) 两点过 10 种子筛查, **但 A 点 2026 年中位 −19.8pp、近 126 日 3/10 正**——增益集中在 2023–25，20 种子门里预注册了近 126 日中位 ≥ −5pp 这一条，别只看全窗。
+- **CONTROL−CURRENT 的教训**：一个“只是对照”的臂跑出 +52.9/+25.9pp，比主假设大得多；它同时改了截断天数、训练行筛选(0.26%)和 demean 口径三件事。烟测显示只多截断一天(purge6)就能让 dart 模型的预测最大差 0.09、30 天里 top5 只有 1 天相同——LightGBM-dart 对训练集边界极敏感，**任何“对照臂”改动训练集都必须单独拆解归因后才能解释**，不能把它当免费午餐直接上线。N3 的 purge6/common5 就是为此。
+- 研究口径新增 `--label-alignment purge6|common5`(`research_labels.MODES`)。legacy 路径逐字不变：041 快照上新旧引擎 legacy 的预测、排序、流水、汇总全部位级一致(n3_smoke_verified.json)。跨机拼接种子只允许同 manifest/同 n2_inputs 哈希的快照(040→041 拷 40 份 N2 结果 JSON 时已核对)。
 
 ## 3. 实验方法论约定
 
