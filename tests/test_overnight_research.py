@@ -157,6 +157,56 @@ def test_n4_plan_confirms_purge6_and_adds_dose_response_only():
     assert by_mode == {'purge6': set(SEEDS[10:20]), 'purge7': set(SEEDS[:10]), 'purge8': set(SEEDS[:10])}
 
 
+def test_compare_aligns_later_start_only_when_asked():
+    """purge7/8 首个预测日顺延: 基线截到臂首日再比, 截掉天数入账; 其他错位一律报错"""
+    base = {'summary': {'total_return_pct': 99, 'max_dd_pct': -50, 'avg_deployed_pct': 90, 'avg_holdings': 3,
+                        'n_trades': 100, 'total_cost_pct': 5},
+            'daily': [{'date': d, 'daily_ret': r} for d, r in
+                      [('2026-08-17', 0.10), ('2026-08-18', 0.02), ('2026-08-19', -0.09), ('2026-08-20', 0.01)]]}
+    arm = {'summary': {'total_return_pct': 1, 'max_dd_pct': -1, 'avg_deployed_pct': 90, 'avg_holdings': 3,
+                       'n_trades': 100, 'total_cost_pct': 5},
+           'daily': [{'date': d, 'daily_ret': r} for d, r in
+                     [('2026-08-18', 0.02), ('2026-08-19', -0.09), ('2026-08-20', 0.01)]]}
+    with pytest.raises(ValueError, match='dates differ'):
+        compare(arm, base)
+    out = compare(arm, base, align_start=True)
+    assert out['aligned_days_dropped'] == 1
+    # 截齐后两条日收益序列完全相同 -> 差为 0 (基线全窗 summary 的 99/-50 不得漏进来)
+    assert out['total_return_pct'] == pytest.approx(0) and out['max_dd_pct'] == pytest.approx(0)
+    assert out['event_0819_delta_pp'] == pytest.approx(0)
+    # 臂比基线【早】开始, 或中间错位, 即使 align_start 也不接受
+    with pytest.raises(ValueError, match='dates differ'):
+        compare(base, arm, align_start=True)
+    shifted = {**arm, 'daily': [{'date': '2026-08-17', 'daily_ret': 0.0}] + arm['daily'][1:]}
+    with pytest.raises(ValueError, match='dates differ'):
+        compare(shifted, base, align_start=True)
+
+
+def test_resume_marks_only_existing_outputs_and_refuses_live_workers(tmp_path):
+    import os
+
+    from scripts.run_overnight_research import resume_status
+    tasks = make_tasks(tmp_path, 'n4', '2026-09-11', test_start='2023-09-20')
+    (tmp_path / 'data/processed').mkdir(parents=True)
+    done = tasks[0]
+    Path(done['output']).write_text('{"ok": true}')
+    Path(tasks[1]['output']).write_text('')                       # 空文件 = 没完成
+    (tmp_path / 'status_n4.json').write_text(json.dumps({'tasks': {
+        tasks[2]['id']: {'state': 'running', 'pid': os.getpid()}}}))   # 活着的 worker -> 拒绝
+    with pytest.raises(RuntimeError, match='still running'):
+        resume_status(tmp_path, 'n4', tasks)
+    (tmp_path / 'status_n4.json').write_text(json.dumps({'tasks': {
+        tasks[2]['id']: {'state': 'running', 'pid': 999999999},
+        done['id']: {'state': 'completed', 'finished_at': 'earlier'}}}))
+    (tmp_path / 'plan_n4.json').write_text('{}')
+    status = resume_status(tmp_path, 'n4', tasks)
+    assert status[done['id']] == {'state': 'completed', 'resumed': True, 'finished_at': 'earlier'}
+    assert status[tasks[1]['id']] == {'state': 'pending'} and status[tasks[2]['id']] == {'state': 'pending'}
+    assert sum(s['state'] == 'completed' for s in status.values()) == 1
+    assert not (tmp_path / 'status_n4.json').exists() and not (tmp_path / 'plan_n4.json').exists()
+    assert len(list(tmp_path.glob('status_n4_crashed_*.json'))) == 1 and len(list(tmp_path.glob('plan_n4_crashed_*.json'))) == 1
+
+
 def test_n4_summary_uses_full_as_equivalent_baseline_for_new_seeds(tmp_path):
     processed = tmp_path / 'data/processed'
     processed.mkdir(parents=True)

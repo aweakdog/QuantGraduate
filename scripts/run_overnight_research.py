@@ -187,13 +187,29 @@ def resources():
     return os.getloadavg()[0], memory["MemAvailable"] / 1024**2
 
 
-def compare(a, b):
+def compare(a, b, align_start=False):
+    """同种子配对差。日期必须逐日相同; align_start=True 时允许臂比基线【晚开始】几天
+    (purge7/8 多截断 1~2 天, 250 日训练窗满足得更晚, FIRST_PRED 顺延), 此时把基线截到
+    臂的首日再比, 并把截掉的天数记进 aligned_days_dropped。总收益/回撤在截短窗内重算,
+    不能拿基线全窗 summary 与臂的短窗直接相减。"""
     da, db = pd.DataFrame(a["daily"]).set_index("date"), pd.DataFrame(b["daily"]).set_index("date")
+    dropped = 0
     if not da.index.equals(db.index):
-        raise ValueError("paired result dates differ")
+        if not (align_start and len(da) < len(db) and db.index[-len(da):].equals(da.index)):
+            raise ValueError("paired result dates differ")
+        dropped = len(db) - len(da)
+        db = db.iloc[dropped:]
     sa, sb = a["summary"], b["summary"]
     fields = ["total_return_pct", "max_dd_pct", "avg_deployed_pct", "avg_holdings", "n_trades", "total_cost_pct"]
+    if dropped:
+        def _window(d):
+            nav = (1 + d.daily_ret).cumprod()
+            return {"total_return_pct": float((nav.iloc[-1] - 1) * 100),
+                    "max_dd_pct": float(((nav / nav.cummax()) - 1).min() * 100)}
+        sa = {**sa, **_window(da)}
+        sb = {**sb, **_window(db)}
     out = {key: float(sa[key] - sb[key]) for key in fields}
+    out["aligned_days_dropped"] = dropped
     out["arm_return"] = sa["total_return_pct"]
     out["base_return"] = sb["total_return_pct"]
     out["n_corr_skip"] = sa.get("n_corr_skip", 0)
@@ -249,9 +265,10 @@ N3_GATE = {"stage": "twenty_seed_confirmation", "arm": "NOEXO-FULL", "requires_c
            "dissection": "PURGE6-CURRENT and COMMON5-CURRENT attribute CONTROL-CURRENT; attribution only, no gate"}
 
 
-def _paired_rows(root, prefix, model, arm, base, seeds, end, test_start, fallback_base=None):
+def _paired_rows(root, prefix, model, arm, base, seeds, end, test_start, fallback_base=None, align_start=False):
     """fallback_base: 基线文件缺失时可用的等价基线 (prefix, arm), 如 N2_F FULL 之于 N2_L CURRENT ——
-    两者是同一 legacy 模型配置, 同种子结果逐位相同, 只是标签不同。"""
+    两者是同一 legacy 模型配置, 同种子结果逐位相同, 只是标签不同。
+    align_start: 见 compare(); 只给 purge7/8 这类首个预测日顺延的臂用。"""
     pairs = []
     for seed in seeds:
         suffix = f"_s{seed}_ts{test_start}_te{end}_cap{PROFILES[model]['capital']}.json"
@@ -260,7 +277,7 @@ def _paired_rows(root, prefix, model, arm, base, seeds, end, test_start, fallbac
         if not pb.exists() and fallback_base is not None:
             pb = root / "data/processed" / f"wf_daily_{fallback_base[0]}_{model}_{fallback_base[1]}{suffix}"
         if pa.exists() and pb.exists():
-            pairs.append({"seed": seed, **compare(json.loads(pa.read_text()), json.loads(pb.read_text()))})
+            pairs.append({"seed": seed, **compare(json.loads(pa.read_text()), json.loads(pb.read_text()), align_start)})
     if not pairs:
         return None
     median = {k: float(np.median([p[k] for p in pairs])) for k in pairs[0]
@@ -326,9 +343,12 @@ def summarize_n4(root, end, test_start="2023-09-19"):
             verdict[model] = row["passes_gate"] if complete else None
             rows.append(row)
         for arm in ["PURGE7", "PURGE8", "COMMON5", "CONTROL"]:
-            row = _paired_rows(root, "N2_L", model, arm, "CURRENT", SEEDS[:10], end, test_start)
+            # purge7/8 的首个预测日比 CURRENT 晚 1~2 天(训练窗满 250 日更晚), 基线截齐后再比
+            row = _paired_rows(root, "N2_L", model, arm, "CURRENT", SEEDS[:10], end, test_start,
+                               align_start=arm in ("PURGE7", "PURGE8"))
             if row is not None:
-                row.update(expected_pairs=10, role="dose_response" if arm.startswith("PURGE") else "reference")
+                row.update(expected_pairs=10, role="dose_response" if arm.startswith("PURGE") else "reference",
+                           aligned_days_dropped=sorted({p.get("aligned_days_dropped", 0) for p in row["pairs"]}))
                 rows.append(row)
     out = {"updated_at": stamp(), "phase": "n4", "test_end": end, "gate": N4_GATE,
            "purge6_both_points_pass": (all(verdict[m] for m in PROFILES)
@@ -386,7 +406,37 @@ def summarize(root, phase, end, test_start="2023-09-19"):
     return out
 
 
-def run(root, phase, workers, max_load, min_memory):
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def resume_status(root, phase, tasks):
+    """队列进程中途死掉后的续跑: 以【产物文件是否存在且非空】为唯一完成判据,
+    旧状态里标 running 的任务若其 worker 进程仍活着则拒绝续跑(否则会重复训练)。
+    旧 status/plan 原样归档为 *_crashed_<时间>.json, 不覆盖。"""
+    status_path = root / f"status_{phase}.json"
+    old = json.loads(status_path.read_text()) if status_path.exists() else {"tasks": {}}
+    alive = [name for name, s in old["tasks"].items() if s.get("state") == "running" and _pid_alive(s.get("pid"))]
+    if alive:
+        raise RuntimeError("workers still running from the previous queue: " + ", ".join(alive))
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    for name in (f"status_{phase}.json", f"plan_{phase}.json"):
+        p = root / name
+        if p.exists():
+            p.rename(root / f"{p.stem}_crashed_{ts}.json")
+    status = {}
+    for t in tasks:
+        out = Path(t["output"])
+        done = out.is_file() and out.stat().st_size > 0
+        status[t["id"]] = {"state": "completed", "resumed": True, "finished_at": old["tasks"].get(t["id"], {}).get("finished_at")} if done else {"state": "pending"}
+    return status
+
+
+def run(root, phase, workers, max_load, min_memory, resume=False):
     info = manifest(root)
     end = info["test_end"]
     if phase == "corr" and not (root / "smoke_verified.json").exists():
@@ -425,8 +475,12 @@ def run(root, phase, workers, max_load, min_memory):
         extra_inputs = {p.name: digest(p) for p in [root / "data/processed/training_data_pit_v24_tick1_t2a.parquet", *sorted((root / "data/processed").glob("features_*_T2A.json"))]}
     tasks = make_tasks(root, phase, end, info["test_start"])
     status_path = root / f"status_{phase}.json"
+    resumed = None
     if status_path.exists() or (root / f"plan_{phase}.json").exists():
-        raise RuntimeError("existing queue: inspect before restarting; no automatic duplicate launch")
+        if not resume:
+            raise RuntimeError("existing queue: inspect before restarting; no automatic duplicate launch")
+        resumed = resume_status(root, phase, tasks)
+        print("RESUME", dict(Counter(s["state"] for s in resumed.values())), flush=True)
     n2 = phase in {"label", "prune"}
     gate = {"n3": N3_GATE, "n4": N4_GATE}.get(phase) or ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
              "positive_pairs_min": 7, "requires_complete_pairs": 10, "automatic_promotion": False,
@@ -436,8 +490,8 @@ def run(root, phase, workers, max_load, min_memory):
                         "corr_window": 20, "corr_min_periods": 15, "missing_pairs": "allow_and_count", "sell_policy": "unchanged"})
     write_json(root / f"plan_{phase}.json", {"created_at": stamp(), "code_sha256": code_hashes, "extra_inputs_sha256": extra_inputs, "workers": workers, "max_load": max_load,
                "min_memory_gb": min_memory, "seeds": SEEDS[:10] if n2 else SEEDS, "profiles": PROFILES, "tasks": tasks,
-               "gate": gate})
-    status = {t["id"]: {"state": "pending"} for t in tasks}
+               "gate": gate, "resumed": resumed is not None})
+    status = resumed if resumed is not None else {t["id"]: {"state": "pending"} for t in tasks}
     active = {}
     env = dict(os.environ, QUANT_DATA_DIR=str(root / "data"), QUANT_MODE="backtest", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
     started = stamp()
@@ -494,6 +548,8 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-load", type=float, default=85)
     ap.add_argument("--min-memory-gb", type=float, default=96)
+    ap.add_argument("--resume", action="store_true",
+                    help="队列进程死后续跑: 已有产物的任务算完成, 其余重排; 旧 status/plan 归档不覆盖")
     args = ap.parse_args()
     if not (ROOT / "smoke_verified.json").exists() and args.phase == "corr":
         ap.error("smoke_verified.json missing")
@@ -510,7 +566,7 @@ def main():
         return
     with (ROOT / f"queue_{args.phase}.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run(ROOT, args.phase, args.workers, args.max_load, args.min_memory_gb)
+        run(ROOT, args.phase, args.workers, args.max_load, args.min_memory_gb, resume=args.resume)
 
 
 if __name__ == "__main__":
