@@ -113,7 +113,8 @@ def test_dissection_modes_split_control_into_purge_and_row_filter():
     """N3: CONTROL(common) = purge6(只多截断一天) + common5(只筛共同行), 两者各取其一"""
     from scripts.research_labels import uses_panel
     assert label_horizon('5d', 'purge6') == 6 and label_horizon('5d', 'common5') == 5
-    assert not uses_panel('purge6') and not uses_panel('legacy')
+    assert label_horizon('5d', 'purge7') == 7 and label_horizon('5d', 'purge8') == 8   # N4 剂量-反应
+    assert not uses_panel('purge6') and not uses_panel('purge7') and not uses_panel('purge8') and not uses_panel('legacy')
     assert uses_panel('common5') and uses_panel('common') and uses_panel('t1close')
     with pytest.raises(ValueError):
         uses_panel('wrong')

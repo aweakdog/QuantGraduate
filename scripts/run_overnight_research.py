@@ -81,7 +81,7 @@ def common_args(model, end, matrix, features=None, test_start="2023-09-19"):
 def make_tasks(root, phase, end, test_start="2023-09-19"):
     tasks = []
     engine = str(root / "scripts/wf_v35_breadth_alpha.py")
-    if phase not in {"corr", "t2a", "label", "prune", "n3"}:
+    if phase not in {"corr", "t2a", "label", "prune", "n3", "n4"}:
         raise ValueError("unknown study phase")
     matrix = "training_data_pit_v24_tick1_t2a.parquet" if phase == "t2a" else "training_data_pit_v24_tick1.parquet"
 
@@ -91,6 +91,25 @@ def make_tasks(root, phase, end, test_start="2023-09-19"):
     def result(name, model, seed):
         return root / "data/processed" / (f"wf_daily_{name}_s{seed}_ts{test_start}_te{end}_cap{PROFILES[model]['capital']}.json")
 
+    if phase == "n4":
+        # N4 (2026-09-20): N3 拆解发现 CONTROL 的增益几乎全来自 purge6 (B 点 +45.4pp, 8/10)。
+        #  1) purge6 20 种子确认: 补 SEEDS[10:20]; 基线用 N3 已有的 N2_F_*_FULL 同种子结果
+        #     (FULL 与 CURRENT 是同一 legacy 模型配置, 同种子逐位相同, 不必重训)。
+        #  2) 剂量-反应: purge7 / purge8 × SEEDS[:10], 与 N2 CURRENT 配对。
+        for seed in SEEDS[10:20]:
+            for model in PROFILES:
+                tag = f"N2_L_{model}_PURGE6"
+                base = [sys.executable, "-u", engine, *common_args(model, end, matrix, None, test_start), "--lgb-seed", str(seed)]
+                add(f"{tag}_s{seed}", [*base, "--label-alignment", "purge6", "--tag", tag, "--save-preds", f"preds_{tag}_s{seed}.pkl"],
+                    [], result(tag, model, seed))
+        for seed in SEEDS[:10]:
+            for model in PROFILES:
+                for arm, mode in [("PURGE7", "purge7"), ("PURGE8", "purge8")]:
+                    tag = f"N2_L_{model}_{arm}"
+                    base = [sys.executable, "-u", engine, *common_args(model, end, matrix, None, test_start), "--lgb-seed", str(seed)]
+                    add(f"{tag}_s{seed}", [*base, "--label-alignment", mode, "--tag", tag, "--save-preds", f"preds_{tag}_s{seed}.pkl"],
+                        [], result(tag, model, seed), 2)
+        return tasks
     if phase == "n3":
         # N3 (2026-09-17): 两个接力实验, 同一队列。
         #  1) NOEXO 20 种子确认: 只补 SEEDS[10:20] 的 FULL/NOEXO, 文件名与 N2 完全同构,
@@ -230,12 +249,16 @@ N3_GATE = {"stage": "twenty_seed_confirmation", "arm": "NOEXO-FULL", "requires_c
            "dissection": "PURGE6-CURRENT and COMMON5-CURRENT attribute CONTROL-CURRENT; attribution only, no gate"}
 
 
-def _paired_rows(root, prefix, model, arm, base, seeds, end, test_start):
+def _paired_rows(root, prefix, model, arm, base, seeds, end, test_start, fallback_base=None):
+    """fallback_base: 基线文件缺失时可用的等价基线 (prefix, arm), 如 N2_F FULL 之于 N2_L CURRENT ——
+    两者是同一 legacy 模型配置, 同种子结果逐位相同, 只是标签不同。"""
     pairs = []
     for seed in seeds:
         suffix = f"_s{seed}_ts{test_start}_te{end}_cap{PROFILES[model]['capital']}.json"
         pa = root / "data/processed" / f"wf_daily_{prefix}_{model}_{arm}{suffix}"
         pb = root / "data/processed" / f"wf_daily_{prefix}_{model}_{base}{suffix}"
+        if not pb.exists() and fallback_base is not None:
+            pb = root / "data/processed" / f"wf_daily_{fallback_base[0]}_{model}_{fallback_base[1]}{suffix}"
         if pa.exists() and pb.exists():
             pairs.append({"seed": seed, **compare(json.loads(pa.read_text()), json.loads(pb.read_text()))})
     if not pairs:
@@ -283,7 +306,43 @@ def summarize_n3(root, end, test_start="2023-09-19"):
     return out
 
 
+N4_GATE = {**N3_GATE, "arm": "PURGE6-CURRENT",
+           "dose_response": "PURGE7/PURGE8-CURRENT (10 seeds) read alongside PURGE6: monotone = systematic; spike at 6 only = boundary chaos",
+           "dissection": None}
+
+
+def summarize_n4(root, end, test_start="2023-09-19"):
+    rows, verdict = [], {}
+    for model in PROFILES:
+        row = _paired_rows(root, "N2_L", model, "PURGE6", "CURRENT", SEEDS[:20], end, test_start, fallback_base=("N2_F", "FULL"))
+        if row is not None:
+            m = row["median"]
+            complete = row["n_pairs"] == N4_GATE["requires_complete_pairs"]
+            row.update(expected_pairs=20, complete=complete, role="gate",
+                       passes_gate=bool(complete and m["total_return_pct"] >= N4_GATE["return_delta_pp_min"]
+                                        and row["positive_return_differences"] >= N4_GATE["positive_pairs_min"]
+                                        and m["max_dd_pct"] >= N4_GATE["drawdown_delta_pp_min"]
+                                        and m["recent_126_delta_pp"] >= N4_GATE["recent_126_delta_pp_min"]))
+            verdict[model] = row["passes_gate"] if complete else None
+            rows.append(row)
+        for arm in ["PURGE7", "PURGE8", "COMMON5", "CONTROL"]:
+            row = _paired_rows(root, "N2_L", model, arm, "CURRENT", SEEDS[:10], end, test_start)
+            if row is not None:
+                row.update(expected_pairs=10, role="dose_response" if arm.startswith("PURGE") else "reference")
+                rows.append(row)
+    out = {"updated_at": stamp(), "phase": "n4", "test_end": end, "gate": N4_GATE,
+           "purge6_both_points_pass": (all(verdict[m] for m in PROFILES)
+                                       if all(verdict.get(m) is not None for m in PROFILES) else None),
+           "adoption_ready": False, "rows": rows,
+           "interpretation": "PURGE6 pools N3's 10 seeds with N4's 10 new seeds; new-seed baselines are N3 FULL runs (identical legacy model). "
+                             "Passing the gate proposes, never performs, a change of the live training cutoff; a mechanism must be stated first."}
+    write_json(root / "summary_n4.json", out)
+    return out
+
+
 def summarize(root, phase, end, test_start="2023-09-19"):
+    if phase == "n4":
+        return summarize_n4(root, end, test_start)
     if phase == "n3":
         return summarize_n3(root, end, test_start)
     if phase in {"label", "prune"}:
@@ -337,18 +396,22 @@ def run(root, phase, workers, max_load, min_memory):
         smoke = root / "n2_smoke_verified.json"
         if not qc[phase + "_ready"] or qc["test_end"] != end or not smoke.exists():
             raise RuntimeError("N2 input QC/date or smoke verification failed")
-    if phase == "n3":
+    if phase in {"n3", "n4"}:
         qc = json.loads((root / "n2_inputs.json").read_text())
         if not (qc["label_ready"] and qc["prune_ready"]) or qc["test_end"] != end or not (root / "n2_smoke_verified.json").exists():
-            raise RuntimeError("N3 needs the verified N2 inputs (label + prune) on this snapshot")
-        # 接力前提: N2 的 10 种子 CURRENT/CONTROL 与 FULL/NOEXO 结果都在本快照里, 否则拼不成配对
-        for prefix, arms in [("N2_L", ["CURRENT", "CONTROL"]), ("N2_F", ["FULL", "NOEXO"])]:
+            raise RuntimeError("N3/N4 need the verified N2 inputs (label + prune) on this snapshot")
+        # 接力前提: 配对所需的基线结果都在本快照里, 否则拼不成配对
+        needed = ([("N2_L", ["CURRENT", "CONTROL"], SEEDS[:10]), ("N2_F", ["FULL", "NOEXO"], SEEDS[:10])] if phase == "n3"
+                  else [("N2_L", ["CURRENT", "PURGE6"], SEEDS[:10]), ("N2_F", ["FULL"], SEEDS[10:20])])
+        if phase == "n4" and not (root / "n3_smoke_verified.json").exists():
+            raise RuntimeError("N4 needs the N3 engine smoke verification")
+        for prefix, arms, seeds in needed:
             for model in PROFILES:
                 for arm in arms:
-                    for seed in SEEDS[:10]:
+                    for seed in seeds:
                         p = root / "data/processed" / f"wf_daily_{prefix}_{model}_{arm}_s{seed}_ts{info['test_start']}_te{end}_cap{PROFILES[model]['capital']}.json"
                         if not p.is_file() or p.stat().st_size == 0:
-                            raise RuntimeError("N3 baseline missing: " + p.name)
+                            raise RuntimeError(f"{phase.upper()} baseline missing: " + p.name)
     if phase == "t2a":
         qc = json.loads((root / "t2a_qc.json").read_text())
         if not qc["ok"] or qc["test_end"] != end:
@@ -365,7 +428,7 @@ def run(root, phase, workers, max_load, min_memory):
     if status_path.exists() or (root / f"plan_{phase}.json").exists():
         raise RuntimeError("existing queue: inspect before restarting; no automatic duplicate launch")
     n2 = phase in {"label", "prune"}
-    gate = N3_GATE if phase == "n3" else ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
+    gate = {"n3": N3_GATE, "n4": N4_GATE}.get(phase) or ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
              "positive_pairs_min": 7, "requires_complete_pairs": 10, "automatic_promotion": False,
              "label_primary": "ALIGNED-CONTROL", "label_practical_check": "ALIGNED-CURRENT must also be nonnegative",
              "joint_policy": "Both operating points must pass before proposing 20-seed confirmation; no posthoc per-profile cherry-picking"}
@@ -426,8 +489,8 @@ def run(root, phase, workers, max_load, min_memory):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("phase", choices=["corr", "t2a", "label", "prune", "n3", "manifest",
-                                      "summary-corr", "summary-t2a", "summary-label", "summary-prune", "summary-n3"])
+    ap.add_argument("phase", choices=["corr", "t2a", "label", "prune", "n3", "n4", "manifest",
+                                      "summary-corr", "summary-t2a", "summary-label", "summary-prune", "summary-n3", "summary-n4"])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-load", type=float, default=85)
     ap.add_argument("--min-memory-gb", type=float, default=96)

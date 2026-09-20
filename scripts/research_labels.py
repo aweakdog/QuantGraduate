@@ -30,9 +30,11 @@ def file_hash(path):
 #   common5 旧标签, 5 日截断, 仅共同有效行参与训练/demean (只筛行)
 #   common  旧标签, 6 日截断, 仅共同有效行             (N2 CONTROL = purge6 + common5)
 #   t1close 对齐标签 C[T+6]/C[T+1]-1, 6 日截断, 仅共同有效行
-MODES = ("legacy", "purge6", "common5", "common", "t1close")
+#   purge7/purge8 (N4 剂量-反应): 旧标签, 7/8 日截断 —— 若 purge6 的增益是"少看最近一天"
+#   的系统性效应, 多截断应单调; 若只有 6 独好而 7/8 不好, 更像模型对训练边界的混沌
+MODES = ("legacy", "purge6", "purge7", "purge8", "common5", "common", "t1close")
 PANEL_MODES = {"common5", "common", "t1close"}      # 需要标签侧表(共同有效行)的口径
-SIX_DAY_MODES = {"purge6", "common", "t1close"}     # 训练截断 6 日的口径
+EXTRA_PURGE = {"purge6": 1, "common": 1, "t1close": 1, "purge7": 2, "purge8": 3}   # 相对 5 日多截断的天数
 
 
 def label_horizon(label, mode):
@@ -40,7 +42,7 @@ def label_horizon(label, mode):
         raise ValueError("unknown label alignment")
     if mode != "legacy" and label != "5d":
         raise ValueError("label alignment research supports only 5d")
-    return {"1d": 1, "2d": 2, "5d": 5}[label] + int(mode in SIX_DAY_MODES)
+    return {"1d": 1, "2d": 2, "5d": 5}[label] + EXTRA_PURGE.get(mode, 0)
 
 
 def uses_panel(mode):

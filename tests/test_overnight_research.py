@@ -142,6 +142,45 @@ def test_n3_plan_only_adds_new_seeds_and_dissection_arms():
     assert n3_names <= n2_names
 
 
+def test_n4_plan_confirms_purge6_and_adds_dose_response_only():
+    tasks = make_tasks(Path('/tmp/research'), 'n4', '2026-09-11', test_start='2023-09-20')
+    assert len(tasks) == len({t['id'] for t in tasks}) == len({t['output'] for t in tasks}) == 60
+    by_mode = {}
+    for task in tasks:
+        command = task['command']
+        mode = command[command.index('--label-alignment') + 1]
+        by_mode.setdefault(mode, set()).add(int(task['id'].rsplit('_s', 1)[1]))
+        assert command[command.index('--test-start') + 1] == '2023-09-20' and '_ts2023-09-20_' in task['output']
+        assert command[command.index('--exec-mode') + 1] == 't1close' and command[command.index('--hold-days') + 1] == '5'
+        assert '--features-from' in command and command[command.index('--features-from') + 1].startswith('features_V24PUT_T1')
+        assert '--save-preds' in command and '--load-preds' not in command
+    assert by_mode == {'purge6': set(SEEDS[10:20]), 'purge7': set(SEEDS[:10]), 'purge8': set(SEEDS[:10])}
+
+
+def test_n4_summary_uses_full_as_equivalent_baseline_for_new_seeds(tmp_path):
+    processed = tmp_path / 'data/processed'
+    processed.mkdir(parents=True)
+    suffix = '_ts2023-09-20_te2026-09-11_cap100000.json'
+    for seed in SEEDS[:10]:
+        (processed / f'wf_daily_N2_L_A_CURRENT_s{seed}{suffix}').write_text(json.dumps(sample_result(20)))
+        (processed / f'wf_daily_N2_L_A_PURGE6_s{seed}{suffix}').write_text(json.dumps(sample_result(30, -8)))
+        (processed / f'wf_daily_N2_L_A_PURGE7_s{seed}{suffix}').write_text(json.dumps(sample_result(21)))
+        (processed / f'wf_daily_N2_L_A_PURGE8_s{seed}{suffix}').write_text(json.dumps(sample_result(19)))
+    out = summarize(tmp_path, 'n4', '2026-09-11', '2023-09-20')
+    row = next(r for r in out['rows'] if r['arm'] == 'PURGE6-CURRENT')
+    assert row['n_pairs'] == 10 and row['passes_gate'] is False and row['complete'] is False
+    for seed in SEEDS[10:20]:                    # 新种子: 基线只有 N3 的 FULL(同 legacy 模型)
+        (processed / f'wf_daily_N2_F_A_FULL_s{seed}{suffix}').write_text(json.dumps(sample_result(20)))
+        (processed / f'wf_daily_N2_L_A_PURGE6_s{seed}{suffix}').write_text(json.dumps(sample_result(30, -8)))
+    out = summarize(tmp_path, 'n4', '2026-09-11', '2023-09-20')
+    row = next(r for r in out['rows'] if r['arm'] == 'PURGE6-CURRENT')
+    assert row['n_pairs'] == 20 and row['passes_gate'] is True
+    assert out['purge6_both_points_pass'] is None       # B 点没有结果, 联合判定不能成立
+    values = {r['arm']: r['median']['total_return_pct'] for r in out['rows']}
+    assert values['PURGE7-CURRENT'] == 1 and values['PURGE8-CURRENT'] == -1
+    assert out['adoption_ready'] is False
+
+
 def test_n3_summary_pools_twenty_seeds_and_never_passes_partial(tmp_path):
     processed = tmp_path / 'data/processed'
     processed.mkdir(parents=True)

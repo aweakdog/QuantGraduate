@@ -213,8 +213,9 @@ parser.add_argument("--lgb-seed", type=int, default=42,
                     help="LightGBM random_state。不是可调超参 —— 仅供多种子集成实验"
                          "(同一模型训多个种子平均排名, 降低前3名选择方差)使用。"
                          "禁止用它挑好看的单种子结果")
-parser.add_argument("--label-alignment", choices=["legacy", "purge6", "common5", "common", "t1close"], default="legacy",
-                    help="研究标签: legacy原口径; purge6旧标签只多截断一天; common5旧标签只用共同样本(5日截断); "
+parser.add_argument("--label-alignment", choices=["legacy", "purge6", "purge7", "purge8", "common5", "common", "t1close"],
+                    default="legacy",
+                    help="研究标签: legacy原口径; purge6/7/8旧标签只多截断1/2/3天; common5旧标签只用共同样本(5日截断); "
                          "common旧标签+共同样本/6日截断(=purge6+common5); t1close次日收盘起5日收益+相同截断")
 parser.add_argument("--label-panel", default="label_alignment_panel.parquet")
 parser.add_argument("--tag", type=str, default=None)
