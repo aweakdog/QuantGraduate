@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 SEEDS = [1, 42, 123, 888, 2024, 7, 31337, 2, 3, 5, 11, 17, 23, 55, 77, 99, 202, 314, 512, 1234]
+# N5 专属确认用的全新种子: 与 SEEDS 不相交, 此前任何实验都没用过 (09-28 预注册)
+FRESH_SEEDS = [8, 13, 19, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101]
 ENSEMBLE = [42, 7, 123, 2024, 31337]
 PROFILES = {
     "A": {"name": "aggr10w", "capital": 100000, "positions": 3, "ind_cap": 2, "features": "features_V24PUT_T1A.json"},
@@ -81,7 +83,7 @@ def common_args(model, end, matrix, features=None, test_start="2023-09-19"):
 def make_tasks(root, phase, end, test_start="2023-09-19"):
     tasks = []
     engine = str(root / "scripts/wf_v35_breadth_alpha.py")
-    if phase not in {"corr", "t2a", "label", "prune", "n3", "n4"}:
+    if phase not in {"corr", "t2a", "label", "prune", "n3", "n4", "n5"}:
         raise ValueError("unknown study phase")
     matrix = "training_data_pit_v24_tick1_t2a.parquet" if phase == "t2a" else "training_data_pit_v24_tick1.parquet"
 
@@ -91,6 +93,17 @@ def make_tasks(root, phase, end, test_start="2023-09-19"):
     def result(name, model, seed):
         return root / "data/processed" / (f"wf_daily_{name}_s{seed}_ts{test_start}_te{end}_cap{PROFILES[model]['capital']}.json")
 
+    if phase == "n5":
+        # N5 (2026-09-28): 只做 B 点(steady5w/T1B) purge6 的专属确认, 20 个全新种子, 基线与臂同批重训。
+        # purge6 是 N3/N4 用 20 种子验证过的口径; 不因 purge7 在 10 种子上更高而改选 (那是事后挑)。
+        for seed in FRESH_SEEDS:
+            for arm, mode in [("CURRENT", None), ("PURGE6", "purge6")]:
+                tag = f"N5_B_{arm}"
+                base = [sys.executable, "-u", engine, *common_args("B", end, matrix, None, test_start), "--lgb-seed", str(seed)]
+                if mode:
+                    base += ["--label-alignment", mode]
+                add(f"{tag}_s{seed}", [*base, "--tag", tag, "--save-preds", f"preds_{tag}_s{seed}.pkl"], [], result(tag, "B", seed))
+        return tasks
     if phase == "n4":
         # N4 (2026-09-20): N3 拆解发现 CONTROL 的增益几乎全来自 purge6 (B 点 +45.4pp, 8/10)。
         #  1) purge6 20 种子确认: 补 SEEDS[10:20]; 基线用 N3 已有的 N2_F_*_FULL 同种子结果
@@ -360,7 +373,37 @@ def summarize_n4(root, end, test_start="2023-09-19"):
     return out
 
 
+N5_GATE = {"stage": "b_only_fresh_seed_confirmation", "arm": "PURGE6-CURRENT", "profile": "B steady5w",
+           "seeds": "FRESH_SEEDS (20, never used before)", "requires_complete_pairs": 20,
+           "return_delta_pp_min": 5, "positive_pairs_min": 13, "drawdown_delta_pp_min": -2, "recent_126_delta_pp_min": -5,
+           "mechanism": "momentum exposure spearman(pred, mom5) lower in >= 15/20 seeds (checked offline, reported separately)",
+           "automatic_promotion": False,
+           "caveat": "same 2023-09..2026-09 history as N3/N4: fresh seeds remove seed luck, not period overfitting"}
+
+
+def summarize_n5(root, end, test_start="2023-09-19"):
+    row = _paired_rows(root, "N5", "B", "PURGE6", "CURRENT", FRESH_SEEDS, end, test_start)
+    rows = []
+    if row is not None:
+        m = row["median"]
+        complete = row["n_pairs"] == N5_GATE["requires_complete_pairs"]
+        row.update(expected_pairs=20, complete=complete, role="gate",
+                   passes_gate=bool(complete and m["total_return_pct"] >= N5_GATE["return_delta_pp_min"]
+                                    and row["positive_return_differences"] >= N5_GATE["positive_pairs_min"]
+                                    and m["max_dd_pct"] >= N5_GATE["drawdown_delta_pp_min"]
+                                    and m["recent_126_delta_pp"] >= N5_GATE["recent_126_delta_pp_min"]))
+        rows.append(row)
+    out = {"updated_at": stamp(), "phase": "n5", "test_end": end, "gate": N5_GATE,
+           "passes_return_gate": rows[0]["passes_gate"] if rows and rows[0]["complete"] else None,
+           "adoption_ready": False, "rows": rows,
+           "interpretation": "B-only; passing proposes a steady5w/T1B training-cutoff change to the user, never performs it."}
+    write_json(root / "summary_n5.json", out)
+    return out
+
+
 def summarize(root, phase, end, test_start="2023-09-19"):
+    if phase == "n5":
+        return summarize_n5(root, end, test_start)
     if phase == "n4":
         return summarize_n4(root, end, test_start)
     if phase == "n3":
@@ -482,14 +525,16 @@ def run(root, phase, workers, max_load, min_memory, resume=False):
         resumed = resume_status(root, phase, tasks)
         print("RESUME", dict(Counter(s["state"] for s in resumed.values())), flush=True)
     n2 = phase in {"label", "prune"}
-    gate = {"n3": N3_GATE, "n4": N4_GATE}.get(phase) or ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
+    if phase == "n5" and not (root / "n3_smoke_verified.json").exists():
+        raise RuntimeError("N5 needs the N3 engine smoke verification")
+    gate = {"n3": N3_GATE, "n4": N4_GATE, "n5": N5_GATE}.get(phase) or ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
              "positive_pairs_min": 7, "requires_complete_pairs": 10, "automatic_promotion": False,
              "label_primary": "ALIGNED-CONTROL", "label_practical_check": "ALIGNED-CURRENT must also be nonnegative",
              "joint_policy": "Both operating points must pass before proposing 20-seed confirmation; no posthoc per-profile cherry-picking"}
             if n2 else {"return_delta_pp_min": -2, "drawdown_delta_pp_min": 2, "loss_seeds_must_not_increase": True,
                         "corr_window": 20, "corr_min_periods": 15, "missing_pairs": "allow_and_count", "sell_policy": "unchanged"})
     write_json(root / f"plan_{phase}.json", {"created_at": stamp(), "code_sha256": code_hashes, "extra_inputs_sha256": extra_inputs, "workers": workers, "max_load": max_load,
-               "min_memory_gb": min_memory, "seeds": SEEDS[:10] if n2 else SEEDS, "profiles": PROFILES, "tasks": tasks,
+               "min_memory_gb": min_memory, "seeds": FRESH_SEEDS if phase == "n5" else (SEEDS[:10] if n2 else SEEDS), "profiles": PROFILES, "tasks": tasks,
                "gate": gate, "resumed": resumed is not None})
     status = resumed if resumed is not None else {t["id"]: {"state": "pending"} for t in tasks}
     active = {}
@@ -543,8 +588,9 @@ def run(root, phase, workers, max_load, min_memory, resume=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("phase", choices=["corr", "t2a", "label", "prune", "n3", "n4", "manifest",
-                                      "summary-corr", "summary-t2a", "summary-label", "summary-prune", "summary-n3", "summary-n4"])
+    ap.add_argument("phase", choices=["corr", "t2a", "label", "prune", "n3", "n4", "n5", "manifest",
+                                      "summary-corr", "summary-t2a", "summary-label", "summary-prune", "summary-n3", "summary-n4",
+                                      "summary-n5"])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-load", type=float, default=85)
     ap.add_argument("--min-memory-gb", type=float, default=96)

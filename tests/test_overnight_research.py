@@ -157,6 +157,29 @@ def test_n4_plan_confirms_purge6_and_adds_dose_response_only():
     assert by_mode == {'purge6': set(SEEDS[10:20]), 'purge7': set(SEEDS[:10]), 'purge8': set(SEEDS[:10])}
 
 
+def test_n5_is_b_only_fresh_seeds_with_same_batch_baseline(tmp_path):
+    from scripts.run_overnight_research import FRESH_SEEDS
+    assert len(FRESH_SEEDS) == len(set(FRESH_SEEDS)) == 20 and not set(FRESH_SEEDS) & set(SEEDS)
+    tasks = make_tasks(Path('/tmp/research'), 'n5', '2026-09-11', test_start='2023-09-20')
+    assert len(tasks) == len({t['output'] for t in tasks}) == 40
+    for task in tasks:
+        command = task['command']
+        assert command[command.index('--initial-capital') + 1] == '50000'
+        assert command[command.index('--features-from') + 1] == 'features_V24PUT_T1B.json'
+        assert int(command[command.index('--lgb-seed') + 1]) in FRESH_SEEDS
+        mode = command[command.index('--label-alignment') + 1] if '--label-alignment' in command else 'legacy'
+        assert mode == ('purge6' if '_PURGE6_' in task['id'] else 'legacy')
+        assert '--load-preds' not in command
+    processed = tmp_path / 'data/processed'
+    processed.mkdir(parents=True)
+    suffix = '_ts2023-09-20_te2026-09-11_cap50000.json'
+    for i, seed in enumerate(FRESH_SEEDS):
+        (processed / f'wf_daily_N5_B_CURRENT_s{seed}{suffix}').write_text(json.dumps(sample_result(20)))
+        (processed / f'wf_daily_N5_B_PURGE6_s{seed}{suffix}').write_text(json.dumps(sample_result(30, -8)))
+        out = summarize(tmp_path, 'n5', '2026-09-11', '2023-09-20')
+        assert out['passes_return_gate'] == (True if i == 19 else None) and out['adoption_ready'] is False
+
+
 def test_compare_aligns_later_start_only_when_asked():
     """purge7/8 首个预测日顺延: 基线截到臂首日再比, 截掉天数入账; 其他错位一律报错"""
     base = {'summary': {'total_return_pct': 99, 'max_dd_pct': -50, 'avg_deployed_pct': 90, 'avg_holdings': 3,
