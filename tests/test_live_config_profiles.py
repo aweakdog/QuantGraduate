@@ -194,13 +194,35 @@ def test_feature_set_lines_use_isolated_preds_cache():
         return a[a.index("--preds-cache") + 1]
 
     assert cache_of("aggr5w") == cache_of("aggr10w")       # 同主板+T1A: 共享
-    assert cache_of("steady5w") == cache_of("fyf100w")     # 同主板+T1B: 共享
+    assert cache_of("steady5w") != cache_of("fyf100w")     # 同主板+T1B 但 steady5w 开 PG1: 分开
     assert cache_of("aggr2w") == cache_of("bench10m")      # 同主板+基线: 共享
     assert cache_of("steady2w") == cache_of("bench10m_fm")  # 同全市场+基线: 共享
     distinct = {cache_of(p) for p in
                 ("aggr5w", "steady5w", "aggr2w", "steady2w",
                  "base5w_aggr", "base5w_steady")}
     assert len(distinct) == 6, f"六类模型的缓存文件必须两两不同: {distinct}"
+
+
+def test_train_purge_only_on_tested_point_and_its_mirror():
+    """PG1 (2026-09-29): 收益证据只在 5万/n5/T1B/主板(steady5w); 基准线按 08-22 口径跟随镜像。
+    3 只线(T1A)同改动 20 种子归零、fyf100w(n8/100万)未测 —— 都不得顺手打开。"""
+    from live_config import PROFILES, signal_args
+
+    def cache_of(pid):
+        a = signal_args(pid)
+        return a[a.index("--preds-cache") + 1]
+
+    on = {pid for pid, p in PROFILES.items() if p.get("train-purge")}
+    assert on == {"steady5w", "base5w_steady"}, on
+    a = signal_args("steady5w")
+    assert a.count("--train-purge") == 1 and a[a.index("--train-purge") + 1] == "1"
+    assert cache_of("steady5w").endswith("_mb_v24put_t1b_p1.json")
+    assert cache_of("base5w_steady").endswith("_v24put_t1b_p1.json") and "_mb_" not in cache_of("base5w_steady")
+    for pid in PROFILES:
+        if pid not in on:
+            assert "--train-purge" not in signal_args(pid), pid
+            assert "_p1" not in cache_of(pid), pid
+    assert PROFILES["base5w_steady"]["train-purge"] == PROFILES["steady5w"]["train-purge"]
 
 
 def test_train_years_plumbing(monkeypatch):

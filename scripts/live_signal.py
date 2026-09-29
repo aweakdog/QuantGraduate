@@ -115,6 +115,11 @@ ap.add_argument("--train-years", type=float, default=None,
                      "生产血统同矩阵对照, 训练历史超过 ~3 年后 alpha 归零(expanding 2019 起 vs "
                      "2022 起 -46.6pp 0/10), 滑窗 3y 不输生产等价; 见 findings_2026-09-05. 不进指纹: "
                      "只改模型不改持仓记账, 删配置即回滚")
+ap.add_argument("--train-purge", type=int, default=0, choices=[0, 1, 2, 3],
+                help="训练截止日在标签闭合要求之外再多往前推 N 个交易日 (与 wf_v35 "
+                     "--label-alignment purge6/7/8 的 N=1/2/3 同义)。证据: N3~N5 研究 (2026-09-28), "
+                     "5万/n5/T1B 点位 purge6 在 40 个种子上两批独立确认, 且单调降低模型对近5日涨幅的"
+                     "追涨暴露。不进指纹: 只改模型不改持仓记账, 删配置即回滚")
 ap.add_argument("--features-from",
                 default="wf_daily_REGRESS_CHK_ts2022-09-01_te2026-07-27_cap50000.json",
                 help="直接复用回测结果 json 里的 selected_features (data/processed/ 下); "
@@ -1578,7 +1583,9 @@ else:
 
 # ── 训练 + 预测 ──
 seq = date_pos[SIGNAL_DATE]
-cutoff = all_dates[seq - LABEL_HORIZON]
+# train-purge: 在标签闭合所需的 LABEL_HORIZON 之外再丢掉最新 N 个已闭合标签日
+# (与回测引擎 cutoff = all_dates[gpos - LABEL_HORIZON] 且 purge6 时 LABEL_HORIZON=6 逐字对应)
+cutoff = all_dates[seq - LABEL_HORIZON - args.train_purge]
 _tr_mask = (df["date"] < cutoff) & df[LABEL].notna()
 TRAIN_FROM = None
 if args.train_years is not None:
@@ -1601,6 +1608,8 @@ if args.preds_cache:
         "skip_boards": list(SKIP_BOARDS),
         "train_years": args.train_years,
         "rows": int(len(train_df)),
+        # 只在开启时入键: 未开的线缓存键逐位不变, 部署当晚不会白白重训
+        **({"train_purge": args.train_purge} if args.train_purge else {}),
     }, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 # tm 在缓存命中时也要用(下面算 blocked 靠它), 所以放在分支外
@@ -1622,6 +1631,7 @@ if _cache_key:
 if ranked is None:
     print(f"\n[训练] 样本 < {pd.Timestamp(cutoff).date()}"
           + (f" 且 >= {TRAIN_FROM.date()} (滑窗 {args.train_years:g} 年)" if TRAIN_FROM is not None else " (expanding)")
+          + (f" | 多截断 {args.train_purge} 天(train-purge)" if args.train_purge else "")
           + f" | {train_df['date'].nunique()} 天 {len(train_df):,} 行 {len(features_used)} 特征 | "
           f"{len(ENSEMBLE_SEEDS)} 种子集成"
           + (f" | 门控: {'弱势态→CGO模型' if gate_weak else '强势态→base模型'}"
