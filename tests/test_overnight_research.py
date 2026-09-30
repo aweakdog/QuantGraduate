@@ -180,6 +180,62 @@ def test_n5_is_b_only_fresh_seeds_with_same_batch_baseline(tmp_path):
         assert out['passes_return_gate'] == (True if i == 19 else None) and out['adoption_ready'] is False
 
 
+def test_n6_is_replay_only_over_forty_cached_pairs():
+    from scripts.run_overnight_research import EXEC_POINTS, FRESH_SEEDS, N6_SEEDS, n6_caches
+    assert len(N6_SEEDS) == len(set(N6_SEEDS)) == 40
+    tasks = make_tasks(Path('/tmp/research'), 'n6', '2026-09-11', test_start='2023-09-20')
+    assert len(tasks) == len({t['output'] for t in tasks}) == 160
+    for task in tasks:
+        c = task['command']
+        assert '--load-preds' in c and '--save-preds' not in c          # 零训练
+        cache = c[c.index('--load-preds') + 1]
+        seed = int(c[c.index('--lgb-seed') + 1])
+        legacy, purge6, batch = n6_caches(seed)
+        assert batch == ('N5' if seed in FRESH_SEEDS else 'N4')
+        assert c[c.index('--features-from') + 1] == 'features_V24PUT_T1B.json'
+        if task['id'].startswith('N6_F_'):
+            assert c[c.index('--tranche-n') + 1] == '8' and c[c.index('--initial-capital') + 1] == str(EXEC_POINTS['F']['capital'])
+            assert c[c.index('--ind-cap') + 1] == '0' and '--mom-neutral' not in c
+            p6 = task['id'].startswith('N6_F_P6_')
+            assert cache == (purge6 if p6 else legacy)
+            assert ('--label-alignment' in c) == p6 and (not p6 or c[c.index('--label-alignment') + 1] == 'purge6')
+            assert '_cap1000000.json' in task['output']
+        else:
+            assert c[c.index('--tranche-n') + 1] == '5' and c[c.index('--initial-capital') + 1] == '50000'
+            assert cache == legacy and '--label-alignment' not in c
+            assert c[c.index('--mom-neutral') + 1] == ('0.34' if '_M34_' in task['id'] else '1.0')
+    # SEEDS[10:20] 的 legacy 缓存是 N3 的 FULL (同 legacy 模型)
+    assert n6_caches(11)[0] == 'preds_N2_F_B_FULL_s11.pkl' and n6_caches(1)[0] == 'preds_N2_L_B_CURRENT_s1.pkl'
+
+
+def test_n6_summary_gate_needs_forty_pairs_and_both_batches_positive(tmp_path):
+    from scripts.run_overnight_research import FRESH_SEEDS, N6_SEEDS, n6_baselines
+    proc = tmp_path / 'data/processed'
+    proc.mkdir(parents=True)
+    ts, te = '2023-09-20', '2026-09-11'
+
+    def w(tag, seed, cap, res):
+        (proc / f'wf_daily_{tag}_s{seed}_ts{ts}_te{te}_cap{cap}.json').write_text(json.dumps(res))
+
+    for seed in N6_SEEDS:
+        good = seed not in FRESH_SEEDS                # N5 批次故意做负: 全池中位为正也不得过门
+        w('N6_F_CUR', seed, 1000000, sample_result(20))
+        w('N6_F_P6', seed, 1000000, sample_result(40 if good else 10))
+        legacy, purge6 = n6_baselines(seed)
+        w(legacy, seed, 50000, sample_result(20))
+        w(purge6, seed, 50000, sample_result(30))
+        w('N6_B_M34', seed, 50000, {**sample_result(30), 'mom_neutral': {'k': 0.34, 'expo_before': 0.08, 'expo_after': 0.055}})
+    out = summarize(tmp_path, 'n6', te, ts)
+    rows = {r['arm']: r for r in out['rows']}
+    a = rows['N6_F_P6-N6_F_CUR']
+    assert a['n_pairs'] == 40 and a['batch_median'] == {'N4': 20.0, 'N5': -10.0}
+    assert a['passes_gate'] is False and out['A_fyf_pg1_passes'] is False
+    b = rows['N6_B_M34-legacy']
+    assert b['passes_gate'] is True and b['mom_expo'] == pytest.approx({'before': 0.08, 'after': 0.055})
+    assert rows['N6_B_M34-PURGE6']['median']['total_return_pct'] == 0 and rows['N6_B_M34-PURGE6']['passes_gate'] is None
+    assert 'N6_B_M100-legacy' not in rows and out['adoption_ready'] is False
+
+
 def test_compare_aligns_later_start_only_when_asked():
     """purge7/8 首个预测日顺延: 基线截到臂首日再比, 截掉天数入账; 其他错位一律报错"""
     base = {'summary': {'total_return_pct': 99, 'max_dd_pct': -50, 'avg_deployed_pct': 90, 'avg_holdings': 3,

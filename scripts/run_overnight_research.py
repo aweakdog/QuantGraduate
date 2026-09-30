@@ -70,8 +70,35 @@ def manifest(root):
     return value
 
 
-def common_args(model, end, matrix, features=None, test_start="2023-09-19"):
-    p = PROFILES[model]
+# N6 (2026-10-01) 的额外执行点位: 只用于回放, 不进 PROFILES (否则 N2~N5 的任务表会变)
+EXEC_POINTS = {"F": {"name": "fyf100w", "capital": 1000000, "positions": 8, "ind_cap": 0,
+                     "features": "features_V24PUT_T1B.json"}}
+N6_SEEDS = SEEDS + FRESH_SEEDS
+
+
+def n6_caches(seed):
+    """B 点(T1B 主板)已存的 legacy / purge6 预测缓存与所属批次。
+    SEEDS[10:20] 的 legacy 缓存来自 N3 的 FULL(与 CURRENT 同一 legacy 模型配置)。"""
+    if seed in SEEDS[:10]:
+        return f"preds_N2_L_B_CURRENT_s{seed}.pkl", f"preds_N2_L_B_PURGE6_s{seed}.pkl", "N4"
+    if seed in SEEDS[10:20]:
+        return f"preds_N2_F_B_FULL_s{seed}.pkl", f"preds_N2_L_B_PURGE6_s{seed}.pkl", "N4"
+    if seed in FRESH_SEEDS:
+        return f"preds_N5_B_CURRENT_s{seed}.pkl", f"preds_N5_B_PURGE6_s{seed}.pkl", "N5"
+    raise ValueError(f"no N6 cache for seed {seed}")
+
+
+def n6_baselines(seed):
+    """B 点已有训练产物的结果文件名前缀 (legacy, purge6)。"""
+    if seed in SEEDS[:10]:
+        return "N2_L_B_CURRENT", "N2_L_B_PURGE6"
+    if seed in SEEDS[10:20]:
+        return "N2_F_B_FULL", "N2_L_B_PURGE6"
+    return "N5_B_CURRENT", "N5_B_PURGE6"
+
+
+def common_args(model, end, matrix, features=None, test_start="2023-09-19", profile=None):
+    p = profile or PROFILES[model]
     return ["--train-file", matrix, "--pit-universe", "universe_pit.parquet", "--label", "5d", "--objective", "l2",
             "--features-from", features or p["features"], "--hold-days", "5", "--portfolio-mode", "periodic",
             "--exec-mode", "t1close", "--slippage", "0.002", "--regime-filter", "breadth", "--regime-ma", "20",
@@ -83,7 +110,7 @@ def common_args(model, end, matrix, features=None, test_start="2023-09-19"):
 def make_tasks(root, phase, end, test_start="2023-09-19"):
     tasks = []
     engine = str(root / "scripts/wf_v35_breadth_alpha.py")
-    if phase not in {"corr", "t2a", "label", "prune", "n3", "n4", "n5"}:
+    if phase not in {"corr", "t2a", "label", "prune", "n3", "n4", "n5", "n6"}:
         raise ValueError("unknown study phase")
     matrix = "training_data_pit_v24_tick1_t2a.parquet" if phase == "t2a" else "training_data_pit_v24_tick1.parquet"
 
@@ -93,6 +120,26 @@ def make_tasks(root, phase, end, test_start="2023-09-19"):
     def result(name, model, seed):
         return root / "data/processed" / (f"wf_daily_{name}_s{seed}_ts{test_start}_te{end}_cap{PROFILES[model]['capital']}.json")
 
+    if phase == "n6":
+        # N6 (2026-10-01): 纯回放, 零训练, 复用 N4/N5 的 40 对 B 点预测缓存。
+        #  A) fyf100w 点位(100万/n8/T1B): legacy vs purge6 两臂都回放, 回答 PG1 该不该跟进 fyf100w
+        #  B) MN1: B 点 legacy 缓存 + --mom-neutral 0.34(预注册主臂, 与 purge6 的暴露降幅对齐)
+        #     与 1.0(剂量臂); 基线直接用已有训练产物(无旗标回放位级一致已烟测)
+        fyf = EXEC_POINTS["F"]
+        for seed in N6_SEEDS:
+            legacy, purge6, _ = n6_caches(seed)
+            for arm, cache, extra in [("CUR", legacy, []), ("P6", purge6, ["--label-alignment", "purge6"])]:
+                tag = f"N6_F_{arm}"
+                cmd = [sys.executable, "-u", engine, *common_args("F", end, matrix, None, test_start, profile=fyf),
+                       "--lgb-seed", str(seed), *extra, "--tag", tag, "--load-preds", cache]
+                out = root / "data/processed" / f"wf_daily_{tag}_s{seed}_ts{test_start}_te{end}_cap{fyf['capital']}.json"
+                add(f"{tag}_s{seed}", cmd, [], out)
+            for arm, k in [("M34", "0.34"), ("M100", "1.0")]:
+                tag = f"N6_B_{arm}"
+                cmd = [sys.executable, "-u", engine, *common_args("B", end, matrix, None, test_start),
+                       "--lgb-seed", str(seed), "--mom-neutral", k, "--tag", tag, "--load-preds", legacy]
+                add(f"{tag}_s{seed}", cmd, [], result(tag, "B", seed), 2 if arm == "M100" else 1)
+        return tasks
     if phase == "n5":
         # N5 (2026-09-28): 只做 B 点(steady5w/T1B) purge6 的专属确认, 20 个全新种子, 基线与臂同批重训。
         # purge6 是 N3/N4 用 20 种子验证过的口径; 不因 purge7 在 10 种子上更高而改选 (那是事后挑)。
@@ -401,7 +448,82 @@ def summarize_n5(root, end, test_start="2023-09-19"):
     return out
 
 
+N6_GATE = {"stage": "replay_only", "pairs_required": 40, "return_delta_pp_min": 5, "positive_pairs_min": 26,
+           "drawdown_delta_pp_min": -2, "recent_126_delta_pp_min": -5, "each_batch_median_positive": True,
+           "A": "fyf100w point (1M/n8/T1B): PURGE6 vs legacy replay; pass = propose enabling PG1 on fyf100w (user decides)",
+           "B": "MN1 k=0.34 vs legacy at steady5w point; pass = causal support for the momentum-exposure mechanism, "
+                "no production change; k=1.0 and M34-vs-PURGE6 are descriptive only",
+           "automatic_promotion": False,
+           "caveat": "same 2023-09..2026-09 history as N3~N5 and the same 40 cached models"}
+
+
+def _pairs_from_files(items):
+    """items: [(seed, batch, 臂文件, 基线文件)], 两份都在才配对; 附批次中位与 MN1 暴露统计。"""
+    pairs, batches, expo = [], {}, []
+    for seed, batch, pa, pb in items:
+        if pa.exists() and pb.exists():
+            a = json.loads(pa.read_text())
+            pairs.append({"seed": seed, "batch": batch, **compare(a, json.loads(pb.read_text()))})
+            batches.setdefault(batch, []).append(pairs[-1]["total_return_pct"])
+            if a.get("mom_neutral"):
+                expo.append(a["mom_neutral"])
+    if not pairs:
+        return None
+    median = {k: float(np.median([p[k] for p in pairs])) for k in pairs[0]
+              if k not in {"seed", "batch", "yearly_delta_pp"} and pairs[0][k] is not None}
+    years = sorted({y for p in pairs for y in p.get("yearly_delta_pp", {})})
+    return {"n_pairs": len(pairs), "median": median,
+            "positive_return_differences": sum(p["total_return_pct"] > 0 for p in pairs),
+            "recent_126_positive": sum(p["recent_126_delta_pp"] > 0 for p in pairs),
+            "batch_median": {b: float(np.median(v)) for b, v in batches.items()},
+            "batch_positive": {b: int(sum(x > 0 for x in v)) for b, v in batches.items()},
+            "yearly_median_delta_pp": {y: float(np.median([p["yearly_delta_pp"][y] for p in pairs if y in p["yearly_delta_pp"]]))
+                                       for y in years},
+            "mom_expo": ({"before": float(np.mean([e["expo_before"] for e in expo])),
+                          "after": float(np.mean([e["expo_after"] for e in expo]))} if expo else None),
+            "pairs": pairs}
+
+
+def _n6_gate(row):
+    if row is None or row["n_pairs"] != N6_GATE["pairs_required"]:
+        return None
+    m = row["median"]
+    return bool(m["total_return_pct"] >= N6_GATE["return_delta_pp_min"]
+                and row["positive_return_differences"] >= N6_GATE["positive_pairs_min"]
+                and m["max_dd_pct"] >= N6_GATE["drawdown_delta_pp_min"]
+                and m["recent_126_delta_pp"] >= N6_GATE["recent_126_delta_pp_min"]
+                and all(v > 0 for v in row["batch_median"].values()))
+
+
+def summarize_n6(root, end, test_start="2023-09-19"):
+    proc = root / "data/processed"
+
+    def out(tag, seed, cap):
+        return proc / f"wf_daily_{tag}_s{seed}_ts{test_start}_te{end}_cap{cap}.json"
+
+    cap_f, cap_b = EXEC_POINTS["F"]["capital"], PROFILES["B"]["capital"]
+    rows = []
+    for arm, base, gate, items in [
+        ("N6_F_P6", "N6_F_CUR", "A", [(s, n6_caches(s)[2], out("N6_F_P6", s, cap_f), out("N6_F_CUR", s, cap_f)) for s in N6_SEEDS]),
+        ("N6_B_M34", "legacy", "B", [(s, n6_caches(s)[2], out("N6_B_M34", s, cap_b), out(n6_baselines(s)[0], s, cap_b)) for s in N6_SEEDS]),
+        ("N6_B_M100", "legacy", None, [(s, n6_caches(s)[2], out("N6_B_M100", s, cap_b), out(n6_baselines(s)[0], s, cap_b)) for s in N6_SEEDS]),
+        ("N6_B_M34", "PURGE6", None, [(s, n6_caches(s)[2], out("N6_B_M34", s, cap_b), out(n6_baselines(s)[1], s, cap_b)) for s in N6_SEEDS]),
+    ]:
+        row = _pairs_from_files(items)
+        if row is not None:
+            row.update(arm=f"{arm}-{base}", gate=gate, expected_pairs=40, passes_gate=_n6_gate(row) if gate else None)
+            rows.append(row)
+    verdict = {r["gate"]: r["passes_gate"] for r in rows if r["gate"]}
+    out_json = {"updated_at": stamp(), "phase": "n6", "test_end": end, "gate": N6_GATE,
+                "A_fyf_pg1_passes": verdict.get("A"), "B_mn1_passes": verdict.get("B"),
+                "adoption_ready": False, "rows": rows}
+    write_json(root / "summary_n6.json", out_json)
+    return out_json
+
+
 def summarize(root, phase, end, test_start="2023-09-19"):
+    if phase == "n6":
+        return summarize_n6(root, end, test_start)
     if phase == "n5":
         return summarize_n5(root, end, test_start)
     if phase == "n4":
@@ -527,14 +649,26 @@ def run(root, phase, workers, max_load, min_memory, resume=False):
     n2 = phase in {"label", "prune"}
     if phase == "n5" and not (root / "n3_smoke_verified.json").exists():
         raise RuntimeError("N5 needs the N3 engine smoke verification")
-    gate = {"n3": N3_GATE, "n4": N4_GATE, "n5": N5_GATE}.get(phase) or ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
+    if phase == "n6":
+        if not (root / "n6_smoke_verified.json").exists():
+            raise RuntimeError("N6 needs its replay smoke verification (no-flag replay == training output)")
+        proc = root / "data/processed"
+        for seed in N6_SEEDS:
+            for name in n6_caches(seed)[:2]:
+                if not (proc / name).is_file():
+                    raise RuntimeError("N6 cache missing: " + name)
+            for prefix in n6_baselines(seed):
+                p = proc / f"wf_daily_{prefix}_s{seed}_ts{info['test_start']}_te{end}_cap{PROFILES['B']['capital']}.json"
+                if not p.is_file():
+                    raise RuntimeError("N6 baseline missing: " + p.name)
+    gate = {"n3": N3_GATE, "n4": N4_GATE, "n5": N5_GATE, "n6": N6_GATE}.get(phase) or ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
              "positive_pairs_min": 7, "requires_complete_pairs": 10, "automatic_promotion": False,
              "label_primary": "ALIGNED-CONTROL", "label_practical_check": "ALIGNED-CURRENT must also be nonnegative",
              "joint_policy": "Both operating points must pass before proposing 20-seed confirmation; no posthoc per-profile cherry-picking"}
             if n2 else {"return_delta_pp_min": -2, "drawdown_delta_pp_min": 2, "loss_seeds_must_not_increase": True,
                         "corr_window": 20, "corr_min_periods": 15, "missing_pairs": "allow_and_count", "sell_policy": "unchanged"})
     write_json(root / f"plan_{phase}.json", {"created_at": stamp(), "code_sha256": code_hashes, "extra_inputs_sha256": extra_inputs, "workers": workers, "max_load": max_load,
-               "min_memory_gb": min_memory, "seeds": FRESH_SEEDS if phase == "n5" else (SEEDS[:10] if n2 else SEEDS), "profiles": PROFILES, "tasks": tasks,
+               "min_memory_gb": min_memory, "seeds": {"n5": FRESH_SEEDS, "n6": N6_SEEDS}.get(phase) or (SEEDS[:10] if n2 else SEEDS), "profiles": PROFILES, "tasks": tasks,
                "gate": gate, "resumed": resumed is not None})
     status = resumed if resumed is not None else {t["id"]: {"state": "pending"} for t in tasks}
     active = {}
@@ -553,7 +687,11 @@ def run(root, phase, workers, max_load, min_memory, resume=False):
             status[name].update(state="completed" if good else "failed", returncode=rc, finished_at=stamp())
             del active[name]
             print(name, status[name]["state"], flush=True)
-            summarize(root, phase, end, info["test_start"])
+            # 中途汇总只是便利: 出错就记下继续排队 (N4 教训: 汇总抛错带崩整条队列, worker 成孤儿)
+            try:
+                summarize(root, phase, end, info["test_start"])
+            except Exception as exc:  # noqa: BLE001
+                print("SUMMARY ERROR (queue continues):", repr(exc), flush=True)
         for task in tasks:
             s = status[task["id"]]
             if s["state"] == "pending" and any(status[d]["state"] in ["failed", "blocked"] for d in task["deps"]):
@@ -588,9 +726,9 @@ def run(root, phase, workers, max_load, min_memory, resume=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("phase", choices=["corr", "t2a", "label", "prune", "n3", "n4", "n5", "manifest",
+    ap.add_argument("phase", choices=["corr", "t2a", "label", "prune", "n3", "n4", "n5", "n6", "manifest",
                                       "summary-corr", "summary-t2a", "summary-label", "summary-prune", "summary-n3", "summary-n4",
-                                      "summary-n5"])
+                                      "summary-n5", "summary-n6"])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-load", type=float, default=85)
     ap.add_argument("--min-memory-gb", type=float, default=96)

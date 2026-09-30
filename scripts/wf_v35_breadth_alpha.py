@@ -197,6 +197,9 @@ parser.add_argument("--ind-cap", type=int, default=0,
                     help="行业集中度上限: 组合内每个申万一级行业最多持 N 只。0 = 不限。"
                     " 买入候选与续持名单都受约束: 超限的候选顺位递补下一名(不同行业),"
                     " 已持仓超限的到期不续持。无行业归属的股(罕见)不计数不受限")
+parser.add_argument("--mom-neutral", type=float, default=0.0,
+                    help="MN1 研究口径: 每个信号日从预测值里去掉与近5日涨幅(截面秩)线性相关部分的比例 k"
+                         "(0~1, 0=关闭逐位不变)。在排序/门槛/续持/补买之前统一生效。见 research_mom.py")
 parser.add_argument("--corr-cap", type=float, default=0.0,
                     help="新买入与现持仓的正相关上限; 仅用信号日及以前的日收益, 0=关闭, 不强制卖出旧仓")
 parser.add_argument("--corr-window", type=int, default=20)
@@ -1068,6 +1071,28 @@ if _kl_last is None or _kl_last < pd.Timestamp(TEST_END) - pd.Timedelta(days=4):
           f"先同步 {KLINE_DIR} 再跑 (或显式 --test-end 到 K线末日)")
     sys.exit(2)
 
+# ── MN1 (--mom-neutral k): 排序前压低追涨暴露, 所有下游层(门槛/续持/补买)统一用调整后的预测 ──
+MOM_NEUTRAL = None
+if args.mom_neutral:
+    if not 0 < args.mom_neutral <= 1:
+        raise SystemExit("ERROR: --mom-neutral 取值须在 (0, 1]")
+    if daily_preds and daily_preds[0].get("pred_vals") is None:
+        raise SystemExit("ERROR: --mom-neutral 需要带 pred_vals 的 v2 预测缓存")
+    from research_mom import mom5_panel, neutralize_day
+    _mom = mom5_panel(klines, {c for dp in daily_preds for c in dp["ranked"]})
+    _eb, _ea = [], []
+    for dp in daily_preds:
+        _d = pd.Timestamp(dp["date"])
+        _row = _mom.loc[_d] if _d in _mom.index else None
+        dp["ranked"], dp["pred_vals"], _b, _a = neutralize_day(dp["ranked"], dp["pred_vals"], _row, args.mom_neutral)
+        _eb.append(_b)
+        _ea.append(_a)
+    MOM_NEUTRAL = {"k": args.mom_neutral, "days": len(daily_preds),
+                   "expo_before": float(np.nanmean(_eb)) if _eb else None,
+                   "expo_after": float(np.nanmean(_ea)) if _ea else None}
+    print(f"  MN1 追涨暴露中性化 k={args.mom_neutral:g}: spearman(pred, mom5) 日均 "
+          f"{MOM_NEUTRAL['expo_before']:+.4f} -> {MOM_NEUTRAL['expo_after']:+.4f} ({len(daily_preds)} 天)")
+
 # ═══════════════════════════════════════════════════════════════
 # 执行: 5日分档, 每天只换 1/HOLD_DAYS 仓位
 # ═══════════════════════════════════════════════════════════════
@@ -1608,6 +1633,7 @@ json.dump({
     "label_alignment": args.label_alignment, "label_horizon": LABEL_HORIZON,
     "label_panel_sha256": LABEL_PANEL_SHA256,
     "neutralization": "date_demean_only",
+    **({"mom_neutral": MOM_NEUTRAL} if MOM_NEUTRAL else {}),
     "objective": args.objective,
     "exec_mode": args.exec_mode,
     "slippage": SLIPPAGE, "trade_cost": TRADE_COST, "min_fee": MIN_FEE,
