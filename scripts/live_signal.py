@@ -118,8 +118,8 @@ ap.add_argument("--train-years", type=float, default=None,
 ap.add_argument("--train-purge", type=int, default=0, choices=[0, 1, 2, 3],
                 help="训练截止日在标签闭合要求之外再多往前推 N 个交易日 (与 wf_v35 "
                      "--label-alignment purge6/7/8 的 N=1/2/3 同义)。证据: N3~N5 研究 (2026-09-28), "
-                     "5万/n5/T1B 点位 purge6 在 40 个种子上两批独立确认, 且单调降低模型对近5日涨幅的"
-                     "追涨暴露。不进指纹: 只改模型不改持仓记账, 删配置即回滚")
+                     "5万/n5/T1B 点位 purge6 在 40 个种子上两批独立确认。伴随追涨暴露下降, 但 N6 显示"
+                     "那不是收益来源, 机制未知。不进指纹: 只改模型不改持仓记账, 删配置即回滚")
 ap.add_argument("--features-from",
                 default="wf_daily_REGRESS_CHK_ts2022-09-01_te2026-07-27_cap50000.json",
                 help="直接复用回测结果 json 里的 selected_features (data/processed/ 下); "
