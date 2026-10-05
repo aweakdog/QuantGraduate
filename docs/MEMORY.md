@@ -152,6 +152,9 @@
 
 ## 6. 线上系统现状（2026-08-16 V24PUT 上线，08-18 叠 FDRR8 执行层；**08-27 GF1 门控已全线关闭**）
 
+- **QMT 机（2026-10-06 摸底）**：华泰 QMT 实盘机 = DESKTOP-NTRMANG（Win11 家庭中文版, i5-10400F/16GB, C 盘只剩 23.5GB、D 盘 126GB, 中国标准时间, 高性能电源方案且永不睡眠）。与旧 `qmt-win` 是同一台（host key ED25519 `2b8DGUy…` 相同）；Mac 侧 NetBird 已断，`ssh qmt-win` 已改走 Tailscale 100.78.204.117（旧地址留作 `qmt-win-netbird`）。QMT 装在 `D:\迅投极速策略交易系统交易终端 华泰证券QMT实盘`（含 XtMiniQmt.exe / XtItClient.exe, userdata_mini 有 09-22/09-28 极简模式登录日志）。新装 Python 3.11.9 → `D:\Python311`，venv `D:\qmtcode\.venv` + xtquant 250807.1.2（清华镜像）。能直连 041 网页（8737）与 PyPI。GUI 登录只能本人在机器上或向日葵里做，SSH 会话起不了界面。
+- **QMT 路线（10-06 用户定）**：新建一条专用线（按该账户实际本金从零记账）；阶段一只读对账（`qmt_bridge/readonly_probe.py`，ReadOnlyTrader 白名单只放 query_* 与连接类方法，下单/撤单一律 PermissionError）；下单阶段用收盘集合竞价（14:57 后挂可成交限价，按收盘价撮合，与回测 t1close 口径一致，解决漏买）。
+
 - **PG1 训练多截断 1 天（2026-09-29 上线, `14bdc7b`）**：`--train-purge 1` 只开 steady5w + base5w_steady(镜像)。证据: 5万/n5/T1B 点位 N4 20 种子 +28.65pp 17/20 + N5 20 个全新种子 +24.8pp 13/20(预注册门全过), 机制=追涨暴露 40/40 种子下降。fyf100w 与 3 只线不开。预测缓存 `_p1` 文件隔离；不进指纹，回滚=删 profile 的 `train-purge` 行。回测期与研究同段历史，前向靠 steady5w vs fyf100w 对照。
 
 
