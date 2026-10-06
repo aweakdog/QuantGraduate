@@ -50,6 +50,21 @@ def test_collect_masks_account_and_only_queries():
     assert collect(ReadOnlyTrader(FakeTrader()), "acc", masked=False)["asset"]["account_id"] == "1234567890"
 
 
+def test_connect_timeout_returns_none_instead_of_hanging():
+    import time
+
+    from qmt_bridge.readonly_probe import connect_with_timeout
+
+    class Hangs:
+        def connect(self):
+            time.sleep(5)
+            return 0
+
+    t0 = time.monotonic()
+    assert connect_with_timeout(Hangs(), 0.2) is None and time.monotonic() - t0 < 2
+    assert connect_with_timeout(ReadOnlyTrader(FakeTrader()), 2) == 0
+
+
 def test_pick_stock_account_and_mask():
     infos = [SimpleNamespace(account_type=3, account_id="999"), SimpleNamespace(account_type=2, account_id="12345678")]
     assert pick_stock_account(infos).account_id == "12345678"

@@ -10,6 +10,7 @@ order_* / cancel_* 等任何其他调用直接抛 PermissionError —— 即使�
 """
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -69,6 +70,16 @@ def pick_stock_account(infos, wanted=None, security_type=2):
     return stock[0]
 
 
+def connect_with_timeout(trader, seconds):
+    """connect() 在 QMT 不是极简模式时会无限阻塞(10-06 实测); 超时返回 None。"""
+    import threading
+    box = {}
+    worker = threading.Thread(target=lambda: box.setdefault("rc", trader.connect()), daemon=True)
+    worker.start()
+    worker.join(seconds)
+    return box.get("rc")
+
+
 def collect(trader, account, masked=True):
     """读快照。trader 必须已 start/connect; 返回可 JSON 化的 dict。"""
     rc = trader.subscribe(account)
@@ -89,6 +100,7 @@ def main(argv=None):
     ap.add_argument("--account", default=None, help="资金账号; 缺省取第一个股票账户")
     ap.add_argument("--out", default=None, help="另存 JSON 文件")
     ap.add_argument("--no-mask", action="store_true", help="输出完整资金账号 (只在本机看时用)")
+    ap.add_argument("--timeout", type=float, default=20.0, help="连接超时秒数")
     args = ap.parse_args(argv)
 
     from xtquant import xtconstant
@@ -100,9 +112,12 @@ def main(argv=None):
     raw = XtQuantTrader(args.userdata, int(time.time()) % 100000 + 100000)
     trader = ReadOnlyTrader(raw)
     trader.start()
-    rc = trader.connect()
+    rc = connect_with_timeout(trader, args.timeout)
     if rc != 0:
-        raise SystemExit(f"连接 miniQMT 失败 (rc={rc}): QMT 客户端需先以「极简模式」登录")
+        why = f"{args.timeout:g} 秒未连上" if rc is None else f"rc={rc}"
+        sys.stderr.write(f"连接 miniQMT 失败 ({why}): QMT 客户端需先以「极简模式」登录\n")
+        sys.stderr.flush()
+        os._exit(2)      # xtquant 后台线程可能卡住正常退出, 直接结束进程
     try:
         infos = trader.query_account_infos()
         info = pick_stock_account(infos, args.account, xtconstant.SECURITY_ACCOUNT)
