@@ -66,7 +66,10 @@ def pick_stock_account(infos, wanted=None, security_type=2):
         if not stock:
             raise SystemExit(f"找不到股票账户 {mask(wanted)}")
     if not stock:
-        raise SystemExit("QMT 里没有已登录的股票账户 (检查是否以极简模式登录)")
+        # 10-06 实测: 极简模式已连上(connect=0)、QMT 用户鉴权成功, 但客户端日志 account_num=0 ——
+        # 资金账号没挂上。09-28 盘后 17:56 与 10-06 假期都是这样, 伴随柜台地址 10061/10060 连接失败。
+        raise SystemExit("已连上 miniQMT, 但客户端没有加载到任何资金账号: 常见原因是非交易时段券商柜台未开放, "
+                         "或资金账号没在 QMT 里登录成功 (客户端日志 refreshAccounts account_num = 0)")
     return stock[0]
 
 
