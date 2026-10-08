@@ -236,8 +236,9 @@ def test_qmt_line_is_steady5w_strategy_with_its_own_capital():
         assert a.get(k) == b.get(k), f"steady5w 与 qmt11w 的 {k} 不一致"
     assert b["capital"] == 110000.0 and not b.get("locked")
     sa, sb = signal_args("steady5w"), signal_args("qmt11w")
-    strip = lambda xs: [x for x in xs if not x.startswith("state_")]  # noqa: E731
-    assert strip(sa) == strip(sb)          # 同一份命令行(除状态文件), 也就共用预测缓存
+    # 状态文件与 --require-confirm(记账方式, 运行时设置不是策略参数)之外, 命令行必须逐字相同
+    strip = lambda xs: [x for x in xs if not x.startswith("state_") and x != "--require-confirm"]  # noqa: E731
+    assert strip(sa) == strip(sb)          # 同一份命令行, 也就共用预测缓存
     # 线归属待用户指定前, 不挂到任何账户口令下(只有管理员能改账)
     assert not any("qmt11w" in v.get("pids", ()) for v in ACCESS_CODES.values())
 
