@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import access_log  # noqa: E402
 from action_page import (ACTION_HTML, _exec_window, build_recommend,  # noqa: E402
                          build_today, list_profiles)
+import qmt_sync  # noqa: E402
 from ledger_history import build_ledger, ledger_xlsx  # noqa: E402
 from live_config import (ACCESS_CODES, DEFAULT_PROFILE, PROFILES,  # noqa: E402
                          capital_of, display_name, init_args, is_auto,
@@ -71,7 +72,10 @@ VIEW_COOKIE = "view_token"
 VIEW_TTL = 30 * 24 * 3600
 
 # 这些路径不需要登录。必须严格控制在"登录本身所需"和"不含任何数据"的范围内。
-VIEW_PUBLIC = ("/login", "/api/view/login", "/api/view/status", "/favicon.ico")
+VIEW_PUBLIC = ("/login", "/api/view/login", "/api/view/status", "/favicon.ico",
+               # QMT 桥(Windows 机器)推送快照: 机器对机器, 不走登录 cookie,
+               # 由 HMAC 签名 + 时间戳窗口把关(见 qmt_sync.verify), 且只存数据不碰账本
+               "/api/qmt/snapshot")
 
 # 防爆破。当前口令是 6 位纯数字(共 100 万种), 字典跑得动, 所以限得比
 # 一般情况紧: 5 次/30 分钟使单 IP 每天最多试 240 次, 穷举完要十年量级。
@@ -1729,6 +1733,58 @@ def _ledger_payload(req: Request, pid, export=False):
     if st is None:
         return None, JSONResponse({"error": "这条线还没建立账本"}, status_code=404)
     return {"profile": pid, "profile_name": display_name(pid), "state": st}, None
+
+
+def _qmt_alert(key, text):
+    """QMT 相关告警, 同一 key(日期+类别)只发一次。发送失败不影响接口返回。"""
+    return qmt_sync.alert_once(LIVE_DIR, key, text)
+
+
+@app.post("/api/qmt/snapshot")
+async def api_qmt_snapshot(req: Request):
+    """QMT 桥推送只读快照(9:35 开盘检查 / 15:10 收盘)。只存数据、做对账, 不写任何账本。"""
+    body = await req.body()
+    if len(body) > qmt_sync.MAX_BODY:
+        return JSONResponse({"error": "快照过大"}, status_code=413)
+    ok, why = qmt_sync.verify(body, req.headers.get("x-qmt-ts", ""),
+                              req.headers.get("x-qmt-sig", ""), qmt_sync.load_key())
+    if not ok:
+        return JSONResponse({"error": why}, status_code=401 if "未配置" not in why else 503)
+    try:
+        snap = json.loads(body)
+    except ValueError:
+        return JSONResponse({"error": "不是合法 JSON"}, status_code=400)
+    if probs := qmt_sync.validate_snapshot(snap):
+        return JSONResponse({"error": "; ".join(probs)}, status_code=400)
+    path = qmt_sync.store_snapshot(snap, LIVE_DIR)
+    day = str(snap["probe_at"])[:10]
+    rec = {pid: qmt_sync.reconcile(snap, st) for pid in qmt_sync.QMT_LINES if (st := _state_of(pid)) is not None}
+    if not snap.get("account_online"):
+        _qmt_alert(f"{day}:{snap['kind']}:offline",
+                   f"【QMT】{day} {snap['kind']} 检查: 资金账号未在线 ({snap.get('error') or '无账户'})。"
+                   "请在柜台开放后重新登录 QMT 再切极简模式, 否则当天读不到成交、无法自动对账。")
+    elif snap["kind"] == "close":
+        for pid, r in rec.items():
+            if not r["positions_match"]:
+                _qmt_alert(f"{day}:close:mismatch:{pid}",
+                           f"【QMT】{day} 收盘对账: {display_name(pid)} 持仓与券商不一致 {r['diffs']}。"
+                           "自动确认会停下等人工核对。")
+    return {"ok": True, "stored": path.name, "reconcile": rec}
+
+
+@app.get("/api/qmt/status")
+async def api_qmt_status(profile: str = "qmt10w"):
+    """QMT 线的最新快照与对账结果(只读)。"""
+    if profile not in qmt_sync.QMT_LINES:
+        return JSONResponse({"error": "这条线不由 QMT 记账"}, status_code=400)
+    latest = LIVE_DIR / "qmt" / "latest.json"
+    if not latest.exists():
+        return {"profile": profile, "snapshot": None, "reconcile": None}
+    snap = json.loads(latest.read_text(encoding="utf-8"))
+    st = _state_of(profile)
+    return {"profile": profile, "snapshot": {k: snap.get(k) for k in ("probe_at", "kind", "account_online", "error")},
+            "reconcile": qmt_sync.reconcile(snap, st) if st is not None else None,
+            "awaiting_confirm": (st or {}).get("awaiting_confirm")}
 
 
 @app.get("/api/ledger")

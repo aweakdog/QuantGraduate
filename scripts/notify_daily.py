@@ -37,6 +37,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import trading_calendar  # noqa: E402
 from action_page import PROFILES, build_today, display_name, is_auto  # noqa: E402
 from notify_channels import get_channel, load_config  # noqa: E402
+from qmt_sync import QMT_LINES  # noqa: E402
 
 SENT_PATH = ROOT / "data" / "live" / "notify_sent.json"
 SITE_URL = "http://eez041.ece.ust.hk:8737/"
@@ -197,6 +198,9 @@ def compose(slot, items, now=None):
         # 只提醒真的在等确认的线。can_confirm 为假时提交也没用(没有执行日
         # 行情, 结算不了), 催了只会让人白跑一趟。
         hit = [x for x in items if x["awaiting"] and x["can_confirm"]]
+        # QMT 线由 qmt_autoconfirm(18:50/20:50)用券商真实成交自动确认, 当天不催;
+        # 已逾期说明自动确认被拦下了(对不上/没快照), 这时才需要人来处理
+        hit = [x for x in hit if x["pid"] not in QMT_LINES or x["overdue"]]
         if not hit:
             return None
         lines = ["**该回填成交了**",

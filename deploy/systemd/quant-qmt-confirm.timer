@@ -1,0 +1,11 @@
+[Unit]
+# 日更 17:30 起跑、通常 18:10 前完成; 18:50 主跑, 20:50 补跑(日更晚了/首跑被拦后人工修正的情形)
+Description=Quant QMT auto-confirm timer
+
+[Timer]
+OnCalendar=Mon..Fri 18:50
+OnCalendar=Mon..Fri 20:50
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+# 日更之后用 QMT 真实成交替 QMT 线完成「确认成交」; 对不上就停在待确认并告警。与 timer 同名。
+Description=Quant QMT auto-confirm (real fills -> live_signal --confirm)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/quant-strategy
+ExecStart=%h/quant-strategy/.venv/bin/python -u %h/quant-strategy/scripts/qmt_autoconfirm.py
+TimeoutStartSec=2400
+StandardOutput=append:%h/quant-strategy/data/live/qmt_autoconfirm.log
+StandardError=append:%h/quant-strategy/data/live/qmt_autoconfirm.log
