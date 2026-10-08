@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 MAIN_BOARD_ONLY = ("aggr2w", "aggr2w_px2", "steady5w", "aggr5w", "aggr10w",
-                   "fyf100w", "bench10m", "qmt11w")
+                   "fyf100w", "bench10m", "qmt10w")
 FULL_MARKET = ("steady2w", "base5w_steady", "base5w_aggr", "bench10m_fm")
 
 
@@ -134,7 +134,7 @@ def test_hold_days_pinned_to_five():
 # 分配是逐点判决不是全线一刀切, 改任何一条前先读 factor_family_ledger「T1A/T1B」。
 
 T1A_LINES = ("aggr5w", "aggr10w", "base5w_aggr")
-T1B_LINES = ("steady5w", "fyf100w", "base5w_steady", "qmt11w")
+T1B_LINES = ("steady5w", "fyf100w", "base5w_steady", "qmt10w")
 NO_T1_LINES = ("steady2w", "aggr2w", "aggr2w_px2", "bench10m", "bench10m_fm")
 
 
@@ -213,9 +213,9 @@ def test_train_purge_only_on_tested_point_and_its_mirror():
         return a[a.index("--preds-cache") + 1]
 
     on = {pid for pid, p in PROFILES.items() if p.get("train-purge")}
-    # qmt11w (10-08 用户定开): 与 steady5w 同点位(n5/T1B/主板), 只是本金 11 万
-    assert on == {"steady5w", "base5w_steady", "qmt11w"}, on
-    assert cache_of("qmt11w") == cache_of("steady5w")          # 同模型共用缓存
+    # qmt10w (10-08 用户定开): 与 steady5w 同点位(n5/T1B/主板), 只是本金 10 万
+    assert on == {"steady5w", "base5w_steady", "qmt10w"}, on
+    assert cache_of("qmt10w") == cache_of("steady5w")          # 同模型共用缓存
     a = signal_args("steady5w")
     assert a.count("--train-purge") == 1 and a[a.index("--train-purge") + 1] == "1"
     assert cache_of("steady5w").endswith("_mb_v24put_t1b_p1.json")
@@ -230,17 +230,17 @@ def test_train_purge_only_on_tested_point_and_its_mirror():
 def test_qmt_line_is_steady5w_strategy_with_its_own_capital():
     """QMT 专用线声称"参数与稳妥 5万相同", 那就必须逐项相同 —— 只允许本金/名字/文案/开户日不同"""
     from live_config import ACCESS_CODES, PROFILES, signal_args
-    a, b = PROFILES["steady5w"], PROFILES["qmt11w"]
+    a, b = PROFILES["steady5w"], PROFILES["qmt10w"]
     for k in ("tranche-n", "skip-boards", "fill-daily", "roll-rank", "features-from", "train-purge",
               "ind-cap", "lot-flex", "gate-ma60"):
-        assert a.get(k) == b.get(k), f"steady5w 与 qmt11w 的 {k} 不一致"
-    assert b["capital"] == 110000.0 and not b.get("locked")
-    sa, sb = signal_args("steady5w"), signal_args("qmt11w")
+        assert a.get(k) == b.get(k), f"steady5w 与 qmt10w 的 {k} 不一致"
+    assert b["capital"] == 100000.0 and not b.get("locked")
+    sa, sb = signal_args("steady5w"), signal_args("qmt10w")
     # 状态文件与 --require-confirm(记账方式, 运行时设置不是策略参数)之外, 命令行必须逐字相同
     strip = lambda xs: [x for x in xs if not x.startswith("state_") and x != "--require-confirm"]  # noqa: E731
     assert strip(sa) == strip(sb)          # 同一份命令行, 也就共用预测缓存
     # 线归属待用户指定前, 不挂到任何账户口令下(只有管理员能改账)
-    assert not any("qmt11w" in v.get("pids", ()) for v in ACCESS_CODES.values())
+    assert not any("qmt10w" in v.get("pids", ()) for v in ACCESS_CODES.values())
 
 
 def test_train_years_plumbing(monkeypatch):
