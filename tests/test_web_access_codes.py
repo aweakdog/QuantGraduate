@@ -43,7 +43,7 @@ def test_user_specified_codes_present():
     assert ACCESS_CODES["213213"]["role"] == "ro"
     assert ACCESS_CODES["611611"]["role"] == "admin"
     assert set(ACCESS_CODES["px"]["pids"]) == {"steady5w", "aggr2w_px2"}
-    assert ACCESS_CODES["llx"]["pids"] == ("aggr5w",)
+    assert ACCESS_CODES["llx"]["pids"] == ("qmt10w", "aggr5w")   # 10-08: 改用 QMT 专用线, 旧线保留
     assert ACCESS_CODES["phy"]["pids"] == ("aggr2w",)
     assert ACCESS_CODES["xjb"]["pids"] == ("aggr10w",)
     assert ACCESS_CODES["fyf"]["pids"] == ("fyf100w",)

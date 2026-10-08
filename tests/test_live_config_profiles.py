@@ -239,8 +239,9 @@ def test_qmt_line_is_steady5w_strategy_with_its_own_capital():
     # 状态文件与 --require-confirm(记账方式, 运行时设置不是策略参数)之外, 命令行必须逐字相同
     strip = lambda xs: [x for x in xs if not x.startswith("state_") and x != "--require-confirm"]  # noqa: E731
     assert strip(sa) == strip(sb)          # 同一份命令行, 也就共用预测缓存
-    # 线归属待用户指定前, 不挂到任何账户口令下(只有管理员能改账)
-    assert not any("qmt10w" in v.get("pids", ()) for v in ACCESS_CODES.values())
+    # 10-08 用户定: 归 llx, 且排第一(llx 登录后默认看这条); 不得同时挂到别人名下
+    owners = [code for code, v in ACCESS_CODES.items() if "qmt10w" in v.get("pids", ())]
+    assert owners == ["llx"] and ACCESS_CODES["llx"]["pids"][0] == "qmt10w"
 
 
 def test_train_years_plumbing(monkeypatch):

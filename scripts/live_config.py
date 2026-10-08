@@ -577,7 +577,8 @@ ACCESS_CODES = {
     "213213": {"role": "ro"},
     "611611": {"role": "admin"},
     "px":  {"role": "acct", "pids": ("steady5w", "aggr2w_px2")},  # Px 本尊 + PX2
-    "llx": {"role": "acct", "pids": ("aggr5w",)},
+    # 10-08: llx 改用华泰 QMT 专用线 qmt10w(排第一 = 默认线); 旧线 aggr5w 暂停使用但保留可见
+    "llx": {"role": "acct", "pids": ("qmt10w", "aggr5w")},
     "phy": {"role": "acct", "pids": ("aggr2w",)},
     "xjb": {"role": "acct", "pids": ("aggr10w",)},
     "fyf": {"role": "acct", "pids": ("fyf100w",)},
