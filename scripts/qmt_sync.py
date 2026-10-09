@@ -167,6 +167,78 @@ def reconcile(snap, state):
                              else round(float(acct_cash) - float(line_cash), 2))}
 
 
+# ── 阶段二: 下单单据 / 总开关 / 执行回报 ─────────────────────────
+def load_switch(live_dir):
+    """网页总开关(双钥匙之一)。默认关; 文件坏了也当关。"""
+    p = Path(live_dir) / "qmt" / "trading_switch.json"
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"enabled": False}
+    return {"enabled": d.get("enabled") is True, "by": d.get("by"), "at": d.get("at")}
+
+
+def save_switch(live_dir, enabled, by):
+    p = Path(live_dir) / "qmt" / "trading_switch.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    d = {"enabled": bool(enabled), "by": str(by), "at": datetime.now().isoformat(timespec="seconds")}
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
+    log = Path(live_dir) / "qmt" / "switch_log.jsonl"
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(d, ensure_ascii=False) + "\n")
+    return d
+
+
+def build_ticket(pid, state, plan, today, exec_date_of, switch, tranche_n):
+    """当天要执行的单据。返回 (ticket, problems); problems 非空 = 今天不得下单。
+
+    exec_date_of(signal_date) -> 该信号的执行日(交易日历)。单据只在以下全部成立时有效:
+      计划的信号日 = 挂单信号日, 其执行日 = today; 线不在「待确认」(上一笔已按真实成交入账);
+      计划不是空仓却要买入之类的自相矛盾不存在。
+    """
+    probs = []
+    pend = (state or {}).get("pending") or {}
+    if (state or {}).get("awaiting_confirm"):
+        probs.append(f"线还在待确认 {state['awaiting_confirm'].get('exec_date')}, 账本未更新, 不下单")
+    if not plan:
+        probs.append("找不到挂单对应的计划文件")
+    sig = str((plan or {}).get("signal_date") or "")
+    if plan and str(pend.get("signal_date") or "") != sig:
+        probs.append(f"计划信号日 {sig} 与挂单 {pend.get('signal_date')} 不一致")
+    exec_date = exec_date_of(sig) if sig else None
+    if str(exec_date) != str(today):
+        probs.append(f"计划执行日 {exec_date} 不是今天 {today}")
+    if plan and plan.get("in_cash") and plan.get("buy"):
+        probs.append("空仓计划里却有买入, 计划自相矛盾")
+    sells = [{"code": code6(s["code"]), "shares": int(s["shares"]), "ref_close": s.get("ref_close")}
+             for s in (plan or {}).get("sell") or []]
+    buys = [{"code": code6(b["code"]), "shares": int(b["shares"]), "ref_close": b.get("ref_close"),
+             "budget": b.get("budget"), "pred": b.get("pred")} for b in (plan or {}).get("buy") or []]
+    held = line_positions(state)
+    for s in sells:
+        if s["shares"] > held.get(s["code"], 0):
+            probs.append(f"计划卖出 {s['code']} {s['shares']} 股超过线持仓 {held.get(s['code'], 0)}")
+    line_cash = float((state or {}).get("cash") or 0)
+    equity = float((plan or {}).get("equity") or line_cash)
+    ticket = {"profile": pid, "today": str(today), "signal_date": sig, "exec_date": str(exec_date),
+              "trading_enabled": bool(switch.get("enabled")), "line_cash": round(line_cash, 2),
+              "slot_cap": round(equity / max(1, tranche_n) * 1.3, 2),
+              "lots": [{"code": c, "shares": s} for c, s in sorted(held.items())],
+              "sell": sells, "buy": buys, "in_cash": bool((plan or {}).get("in_cash")),
+              "plan_generated_at": (plan or {}).get("generated_at")}
+    return ticket, probs
+
+
+def store_exec_report(live_dir, report):
+    d = Path(live_dir) / "qmt"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"exec_{str(report['today']).replace('-', '')}_{report.get('mode', 'shadow')}.json"
+    p.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    return p
+
+
 # ── 自动确认 ──────────────────────────────────────────────────────
 def _trade_date(t):
     v = t.get("traded_time")

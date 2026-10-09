@@ -2141,6 +2141,8 @@ async function loadAct(){
       <div class="kv"><div class="k">现金</div><div class="v">${money(a.cash)}</div></div>
       <div class="kv"><div class="k">持仓市值</div><div class="v">${money(a.market_value)}</div></div>
     </div>${epochNote(d)}</div>`;
+  // QMT 实盘连接卡 (只有由 QMT 记账的线有): 内容由 loadQmt 异步填
+  if (d.profile === 'qmt10w') h += `<div class="card" id="qmtcard"><h2>QMT 实盘连接</h2><div class="empty">读取中…</div></div>`;
 
   // 宏观日历: 未来两周的例行大事 + A股长假。模型对它们全盲, 这里只是
   // 把日子摆出来给人看, 不做任何预测或建议。
@@ -2180,6 +2182,51 @@ async function loadAct(){
       </div></div>`;
 
   $('#app').innerHTML = h;
+  if (d.profile === 'qmt10w') loadQmt();
+}
+
+// ── QMT 实盘连接卡: 券商快照/持仓对账/线外现金/自动下单开关(网页钥匙)/最近一次执行 ──
+async function loadQmt(){
+  const box = $('#qmtcard'); if (!box) return;
+  let s;
+  try { s = await (await fetch('/api/qmt/status?profile=qmt10w')).json(); }
+  catch(e){ box.innerHTML = '<h2>QMT 实盘连接</h2><div class="empty">读取失败</div>'; return; }
+  const sw = s.switch || {}, r = s.reconcile || {}, sn = s.snapshot || {}, ex = s.last_exec || {};
+  const on = sw.enabled === true;
+  const small = 'style="font-size:14px"';
+  let h = `<h2>QMT 实盘连接</h2><div class="grid">
+    <div class="kv"><div class="k">券商快照</div><div class="v" ${small}>${sn.probe_at ? esc(sn.probe_at.replace('T',' ').slice(5,16)) : '--'}${
+      sn.account_online === false ? ' <span class="neg">账号离线</span>' : ''}</div></div>
+    <div class="kv"><div class="k">持仓对账</div><div class="v" ${small}>${
+      r.positions_match === true ? '<span class="pos">一致</span>' : (r.positions_match === false ? '<span class="neg">不一致</span>' : '--')}</div></div>
+    <div class="kv"><div class="k">线外现金</div><div class="v" ${small}>${r.outside_cash == null ? '--' : money(r.outside_cash)}</div></div>
+    <div class="kv"><div class="k">自动下单</div><div class="v" ${small}>${on ? '<span class="pos">网页钥匙已开</span>' : '关 · 影子演算'}</div></div>
+  </div>`;
+  if ((r.diffs || []).length) h += `<div class="lockbox" style="margin:10px 0 0">不一致：${
+    r.diffs.map(x => esc(x.code) + ' 券商 ' + x.qmt + ' / 账本 ' + x.line).join('；')}。自动确认会停下等人工。</div>`;
+  if (ex.today){
+    const mode = ex.mode === 'live' ? '实盘' : (ex.mode === 'shadow' ? '影子' : '未下单');
+    const extra = [...(ex.problems || []), ...(ex.errors || [])];
+    h += `<div class="tipbox" style="margin:10px 0 0">最近一次执行 ${esc(ex.today)} · ${mode} · ${(ex.orders || []).length} 笔委托${
+      extra.length ? ' · ' + esc(extra.join('；')) : ''}</div>`;
+  }
+  if (SCOPE == null || SCOPE.includes('qmt10w')){
+    h += `<div class="acts" style="margin:12px 0 0"><div class="btn ${on ? '' : 'btn-pri'}" onclick="setQmtSwitch(${!on})">${
+      on ? '关闭自动下单' : '开启自动下单（网页钥匙）'}</div></div>`;
+  }
+  h += `<div class="tipbox" style="margin:8px 0 0">自动下单要两把钥匙：这里的网页开关 + Windows 机器上的本地开关文件，
+    两把都开才会在 14:55（卖）/ 14:57（收盘竞价买）真下单；任何一把关着都只做影子演算并推送「会下什么单」。${
+    sw.at ? '开关最近由 ' + esc(sw.by || '') + ' 于 ' + esc(String(sw.at).replace('T',' ').slice(5,16)) + ' 改动。' : ''}</div>`;
+  box.innerHTML = h;
+}
+
+async function setQmtSwitch(on){
+  if (on && !confirm('开启网页钥匙后，只要 Windows 本地开关也开着，系统会在 14:55/14:57 按计划自动下单。确定开启？')) return;
+  const r = await fetch('/api/profile/qmt_switch', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                   body: JSON.stringify({enabled: on})});
+  const j = await r.json();
+  if (!r.ok){ alert(j.error || '操作失败'); return; }
+  loadQmt();
 }
 
 // ── 历史操作: 从建户起每一笔买卖/续持/存取/修账, 附当时总资产与收益率 ──

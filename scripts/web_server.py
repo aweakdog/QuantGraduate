@@ -73,9 +73,9 @@ VIEW_TTL = 30 * 24 * 3600
 
 # 这些路径不需要登录。必须严格控制在"登录本身所需"和"不含任何数据"的范围内。
 VIEW_PUBLIC = ("/login", "/api/view/login", "/api/view/status", "/favicon.ico",
-               # QMT 桥(Windows 机器)推送快照: 机器对机器, 不走登录 cookie,
-               # 由 HMAC 签名 + 时间戳窗口把关(见 qmt_sync.verify), 且只存数据不碰账本
-               "/api/qmt/snapshot")
+               # QMT 桥(Windows 机器)的三个机器接口: 不走登录 cookie,
+               # 由 HMAC 签名 + 时间戳窗口把关(见 qmt_sync.verify), 都不碰账本
+               "/api/qmt/snapshot", "/api/qmt/ticket", "/api/qmt/exec_report")
 
 # 防爆破。当前口令是 6 位纯数字(共 100 万种), 字典跑得动, 所以限得比
 # 一般情况紧: 5 次/30 分钟使单 IP 每天最多试 240 次, 穷举完要十年量级。
@@ -1772,19 +1772,105 @@ async def api_qmt_snapshot(req: Request):
     return {"ok": True, "stored": path.name, "reconcile": rec}
 
 
+async def _qmt_signed_json(req: Request):
+    """机器接口公共部分: 验签 + 解析; 返回 (body_dict, 错误响应)。"""
+    body = await req.body()
+    if len(body) > qmt_sync.MAX_BODY:
+        return None, JSONResponse({"error": "请求过大"}, status_code=413)
+    ok, why = qmt_sync.verify(body, req.headers.get("x-qmt-ts", ""),
+                              req.headers.get("x-qmt-sig", ""), qmt_sync.load_key())
+    if not ok:
+        return None, JSONResponse({"error": why}, status_code=401 if "未配置" not in why else 503)
+    try:
+        d = json.loads(body)
+    except ValueError:
+        return None, JSONResponse({"error": "不是合法 JSON"}, status_code=400)
+    if not isinstance(d, dict):
+        return None, JSONResponse({"error": "必须是 JSON 对象"}, status_code=400)
+    return d, None
+
+
+def _exec_date_of(signal_date):
+    import trading_calendar
+    d = trading_calendar.next_trading_day(signal_date)
+    return d.isoformat() if d else None
+
+
+@app.post("/api/qmt/ticket")
+async def api_qmt_ticket(req: Request):
+    """Windows 执行器 14:53 取当天单据: 计划买卖 + 线持仓/现金 + 网页总开关。只读。"""
+    d, err = await _qmt_signed_json(req)
+    if err is not None:
+        return err
+    pid, today = d.get("profile"), str(d.get("today") or "")
+    if pid not in qmt_sync.QMT_LINES:
+        return JSONResponse({"error": "这条线不由 QMT 记账"}, status_code=400)
+    st = _state_of(pid)
+    sig = ((st or {}).get("pending") or {}).get("signal_date")
+    plan_p = LIVE_DIR / f"plan_{pid}_{sig}.json"
+    plan = json.loads(plan_p.read_text(encoding="utf-8")) if sig and plan_p.exists() else None
+    ticket, probs = qmt_sync.build_ticket(pid, st, plan, today, _exec_date_of,
+                                          qmt_sync.load_switch(LIVE_DIR), int(PROFILES[pid]["tranche-n"]))
+    return {"ticket": ticket, "problems": probs}
+
+
+@app.post("/api/qmt/exec_report")
+async def api_qmt_exec_report(req: Request):
+    """Windows 执行器回报(影子或实盘)。只存档并推送摘要, 不写账本(账本由 18:50 自动确认按真实成交写)。"""
+    rep, err = await _qmt_signed_json(req)
+    if err is not None:
+        return err
+    if not rep.get("today") or rep.get("mode") not in ("shadow", "live", "skipped"):
+        return JSONResponse({"error": "回报缺 today/mode"}, status_code=400)
+    path = qmt_sync.store_exec_report(LIVE_DIR, rep)
+    if rep.get("orders") or rep.get("errors") or rep.get("problems"):
+        tag = {"shadow": "【QMT 影子】若开启自动下单, 今天会", "live": "【QMT】自动下单", "skipped": "【QMT】今天没有下单"}[rep["mode"]]
+        lines = [f"{tag}:"]
+        for o in rep.get("orders") or []:
+            act = "卖" if o.get("side") == "sell" else "买"
+            done = f" → 成交 {o['traded_volume']}@{o.get('traded_price')}" if o.get("traded_volume") else ""
+            lines.append(f"{act} {o['code']} ×{o['volume']} 限价 {o['price']} ({o.get('phase')}){done}")
+        for s in rep.get("skips") or []:
+            lines.append(f"跳过 {s.get('code')}: {s.get('reason')}")
+        for e in (rep.get("problems") or []) + (rep.get("errors") or []):
+            lines.append(f"⚠ {e}")
+        _qmt_alert(f"{rep['today']}:exec:{rep['mode']}", "\n".join(lines))
+    return {"ok": True, "stored": path.name}
+
+
+@app.post("/api/profile/qmt_switch")
+async def api_qmt_switch(req: Request):
+    """自动下单网页总开关(双钥匙之一)。只有管理员和该线账户(llx)能改。"""
+    pid = "qmt10w"
+    if (deny := _check_profile(pid)) is not None or (deny := _write_deny(req, pid)) is not None:
+        return deny
+    body = await req.json()
+    if not isinstance(body.get("enabled"), bool):
+        return JSONResponse({"error": "enabled 必须是 true/false"}, status_code=400)
+    role = _view_role(req)
+    by = role[1] if isinstance(role, tuple) else str(role)
+    return {"ok": True, "switch": qmt_sync.save_switch(LIVE_DIR, body["enabled"], by)}
+
+
 @app.get("/api/qmt/status")
 async def api_qmt_status(profile: str = "qmt10w"):
-    """QMT 线的最新快照与对账结果(只读)。"""
+    """QMT 线的最新快照、对账结果、自动下单开关与最近一次执行回报(只读)。"""
     if profile not in qmt_sync.QMT_LINES:
         return JSONResponse({"error": "这条线不由 QMT 记账"}, status_code=400)
+    out = {"profile": profile, "snapshot": None, "reconcile": None,
+           "switch": qmt_sync.load_switch(LIVE_DIR), "last_exec": None}
+    reps = sorted((LIVE_DIR / "qmt").glob("exec_*.json"))
+    if reps:
+        r = json.loads(reps[-1].read_text(encoding="utf-8"))
+        out["last_exec"] = {k: r.get(k) for k in ("today", "mode", "status", "orders", "skips", "problems", "errors")}
     latest = LIVE_DIR / "qmt" / "latest.json"
-    if not latest.exists():
-        return {"profile": profile, "snapshot": None, "reconcile": None}
-    snap = json.loads(latest.read_text(encoding="utf-8"))
     st = _state_of(profile)
-    return {"profile": profile, "snapshot": {k: snap.get(k) for k in ("probe_at", "kind", "account_online", "error")},
-            "reconcile": qmt_sync.reconcile(snap, st) if st is not None else None,
-            "awaiting_confirm": (st or {}).get("awaiting_confirm")}
+    out["awaiting_confirm"] = (st or {}).get("awaiting_confirm")
+    if latest.exists():
+        snap = json.loads(latest.read_text(encoding="utf-8"))
+        out["snapshot"] = {k: snap.get(k) for k in ("probe_at", "kind", "account_online", "error")}
+        out["reconcile"] = qmt_sync.reconcile(snap, st) if st is not None else None
+    return out
 
 
 @app.get("/api/ledger")

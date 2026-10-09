@@ -130,6 +130,38 @@ def test_reconcile_reports_position_diffs_and_outside_cash():
     assert reconcile(snap(), state())["positions_match"] is True
 
 
+def _plan(sig="2026-10-08", buys=(), sells=(), in_cash=False):
+    return {"signal_date": sig, "in_cash": in_cash, "equity": 100000.0, "generated_at": "2026-10-08T18:51:00",
+            "buy": [{"code": c, "shares": s, "ref_close": 10.0, "budget": 20000} for c, s in buys],
+            "sell": [{"code": c, "shares": s, "ref_close": 10.0} for c, s in sells]}
+
+
+def test_ticket_valid_only_for_today_and_confirmed_ledger(tmp_path):
+    from qmt_sync import build_ticket, load_switch, save_switch
+    nxt = {"2026-10-08": "2026-10-09"}.get
+    st = {"cash": 80000.0, "pending": {"signal_date": "2026-10-08"}, "awaiting_confirm": None,
+          "lots": [{"code": "000001", "shares": 200, "buy_price": 10.0}]}
+    plan = _plan(buys=[("600000", 300)], sells=[("000001", 200)])
+    t, probs = build_ticket("qmt10w", st, plan, "2026-10-09", nxt, {"enabled": False}, 5)
+    assert probs == [] and t["exec_date"] == "2026-10-09" and t["trading_enabled"] is False
+    assert t["sell"] == [{"code": "000001", "shares": 200, "ref_close": 10.0}] and t["buy"][0]["code"] == "600000"
+    assert t["slot_cap"] == 26000.0 and t["lots"] == [{"code": "000001", "shares": 200}]
+    # 不是今天 / 待确认 / 信号日对不上 / 卖超 / 空仓却买 / 没计划
+    assert build_ticket("qmt10w", st, plan, "2026-10-10", nxt, {}, 5)[1]
+    assert build_ticket("qmt10w", {**st, "awaiting_confirm": {"exec_date": "2026-10-08"}}, plan, "2026-10-09", nxt, {}, 5)[1]
+    assert build_ticket("qmt10w", {**st, "pending": {"signal_date": "2026-09-30"}}, plan, "2026-10-09", nxt, {}, 5)[1]
+    assert build_ticket("qmt10w", st, _plan(sells=[("000001", 300)]), "2026-10-09", nxt, {}, 5)[1]
+    assert build_ticket("qmt10w", st, _plan(buys=[("600000", 100)], in_cash=True), "2026-10-09", nxt, {}, 5)[1]
+    assert build_ticket("qmt10w", st, None, "2026-10-09", nxt, {}, 5)[1]
+    # 开关: 默认关, 存取往返, 坏文件当关
+    assert load_switch(tmp_path) == {"enabled": False}
+    save_switch(tmp_path, True, "llx")
+    assert load_switch(tmp_path)["enabled"] is True and load_switch(tmp_path)["by"] == "llx"
+    (tmp_path / "qmt" / "trading_switch.json").write_text("{bad")
+    assert load_switch(tmp_path) == {"enabled": False}
+    assert len((tmp_path / "qmt" / "switch_log.jsonl").read_text().splitlines()) == 1
+
+
 def test_sign_is_stable_across_processes():
     # Windows 侧用同一算法: HMAC-SHA256(key, ts + "\n" + body)
     import hashlib

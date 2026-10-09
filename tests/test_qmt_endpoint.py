@@ -71,3 +71,62 @@ def test_offline_and_mismatch_trigger_alerts(client):
 
 def test_status_needs_login(client):
     assert client.get("/api/qmt/status").status_code == 401
+
+
+def _signed(client, path, payload, key=KEY):
+    from qmt_sync import sign
+    body = json.dumps(payload).encode()
+    ts = str(int(time.time()))
+    return client.post(path, content=body, headers={"x-qmt-ts": ts, "x-qmt-sig": sign(body, ts, key),
+                                                    "content-type": "application/json"})
+
+
+def test_ticket_requires_signature_and_returns_problems_when_not_today(client, tmp_path, monkeypatch):
+    import web_server as ws
+    st = {"cash": 100000.0, "lots": [], "pending": {"signal_date": "2026-10-08"}, "awaiting_confirm": None}
+    monkeypatch.setattr(ws, "_state_of", lambda pid: st)
+    monkeypatch.setattr(ws, "_exec_date_of", lambda s: "2026-10-09")
+    (tmp_path / "plan_qmt10w_2026-10-08.json").write_text(json.dumps(
+        {"signal_date": "2026-10-08", "in_cash": False, "equity": 100000.0,
+         "buy": [{"code": "600000", "shares": 300, "ref_close": 10.0}], "sell": []}))
+    assert client.post("/api/qmt/ticket", content=b'{"profile": "qmt10w"}').status_code == 401
+    r = _signed(client, "/api/qmt/ticket", {"profile": "qmt10w", "today": "2026-10-09"})
+    assert r.status_code == 200 and r.json()["problems"] == []
+    t = r.json()["ticket"]
+    assert t["buy"][0]["code"] == "600000" and t["trading_enabled"] is False     # 开关默认关
+    assert _signed(client, "/api/qmt/ticket", {"profile": "qmt10w", "today": "2026-10-10"}).json()["problems"]
+    assert _signed(client, "/api/qmt/ticket", {"profile": "steady5w", "today": "2026-10-09"}).status_code == 400
+
+
+def test_exec_report_stored_and_summarised(client, tmp_path):
+    rep = {"today": "2026-10-09", "mode": "shadow", "status": "done",
+           "orders": [{"code": "600000", "side": "buy", "volume": 300, "price": 10.2, "phase": "auction"}],
+           "skips": [{"code": "600111", "reason": "涨停买不进"}]}
+    r = _signed(client, "/api/qmt/exec_report", rep)
+    assert r.status_code == 200 and (tmp_path / "qmt" / "exec_20261009_shadow.json").exists()
+    key, text = client.alerts[-1]
+    assert key == "2026-10-09:exec:shadow" and "买 600000 ×300" in text and "涨停买不进" in text
+    assert _signed(client, "/api/qmt/exec_report", {"today": "2026-10-09", "mode": "yolo"}).status_code == 400
+
+
+def test_switch_only_admin_or_owner(client, tmp_path):
+    import web_server as ws
+
+    def login(code):
+        c = ws.app
+        from fastapi.testclient import TestClient
+        tc = TestClient(c)
+        tc.cookies.set(ws.VIEW_COOKIE, _view_token(ws, code))
+        return tc
+
+    assert login("px").post("/api/profile/qmt_switch", json={"enabled": True}).status_code == 403
+    assert login("213213").post("/api/profile/qmt_switch", json={"enabled": True}).status_code == 403
+    r = login("llx").post("/api/profile/qmt_switch", json={"enabled": True})
+    assert r.status_code == 200 and r.json()["switch"]["enabled"] is True and r.json()["switch"]["by"] == "llx"
+    assert login("611611").post("/api/profile/qmt_switch", json={"enabled": "yes"}).status_code == 400
+    assert login("611611").post("/api/profile/qmt_switch", json={"enabled": False}).json()["switch"]["enabled"] is False
+
+
+def _view_token(ws, code):
+    exp = int(time.time()) + 3600
+    return f"{exp}.c.{ws._code_id(code)}.{ws._view_sign_code(exp, code)}"
