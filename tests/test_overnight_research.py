@@ -236,6 +236,31 @@ def test_n6_summary_gate_needs_forty_pairs_and_both_batches_positive(tmp_path):
     assert 'N6_B_M100-legacy' not in rows and out['adoption_ready'] is False
 
 
+def test_n7_replays_same_predictions_n3_vs_n5_at_100k(tmp_path):
+    from scripts.run_overnight_research import N6_SEEDS, n6_caches
+    tasks = make_tasks(Path('/tmp/research'), 'n7', '2026-09-11', test_start='2023-09-20')
+    assert len(tasks) == len({t['output'] for t in tasks}) == 80
+    for task in tasks:
+        c = task['command']
+        seed = int(c[c.index('--lgb-seed') + 1])
+        assert c[c.index('--load-preds') + 1] == n6_caches(seed)[1] and '--save-preds' not in c
+        assert c[c.index('--label-alignment') + 1] == 'purge6'
+        assert c[c.index('--initial-capital') + 1] == '100000'
+        n3 = '_Q3_' in task['id']
+        assert c[c.index('--tranche-n') + 1] == ('3' if n3 else '5') and c[c.index('--ind-cap') + 1] == ('2' if n3 else '0')
+    # 汇总: 40 对齐才判, 3 只更好且两批都正才过
+    proc = tmp_path / 'data/processed'
+    proc.mkdir(parents=True)
+    for seed in N6_SEEDS:
+        for arm, total in (('N7_Q5', 20), ('N7_Q3', 30)):
+            (proc / f'wf_daily_{arm}_s{seed}_ts2023-09-20_te2026-09-11_cap100000.json').write_text(
+                json.dumps(sample_result(total=total)))
+    out = summarize(tmp_path, 'n7', '2026-09-11', '2023-09-20')
+    row = out['rows'][0]
+    assert row['n_pairs'] == 40 and row['passes_gate'] is True and out['adoption_ready'] is False
+    assert set(row['arms']) == {'Q3', 'Q5'} and row['arms']['Q3']['return_worst'] is not None
+
+
 def test_compare_aligns_later_start_only_when_asked():
     """purge7/8 首个预测日顺延: 基线截到臂首日再比, 截掉天数入账; 其他错位一律报错"""
     base = {'summary': {'total_return_pct': 99, 'max_dd_pct': -50, 'avg_deployed_pct': 90, 'avg_holdings': 3,

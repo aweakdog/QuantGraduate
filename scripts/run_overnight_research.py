@@ -72,7 +72,12 @@ def manifest(root):
 
 # N6 (2026-10-01) 的额外执行点位: 只用于回放, 不进 PROFILES (否则 N2~N5 的任务表会变)
 EXEC_POINTS = {"F": {"name": "fyf100w", "capital": 1000000, "positions": 8, "ind_cap": 0,
-                     "features": "features_V24PUT_T1B.json"}}
+                     "features": "features_V24PUT_T1B.json"},
+               # N7 (10-09): qmt10w 的模型(T1B+PG1)在 10 万本金下持 5 只(现行) vs 持 3 只(3 只线惯例 ind-cap 2)
+               "Q5": {"name": "qmt10w_n5", "capital": 100000, "positions": 5, "ind_cap": 0,
+                      "features": "features_V24PUT_T1B.json"},
+               "Q3": {"name": "qmt10w_n3", "capital": 100000, "positions": 3, "ind_cap": 2,
+                      "features": "features_V24PUT_T1B.json"}}
 N6_SEEDS = SEEDS + FRESH_SEEDS
 
 
@@ -110,7 +115,7 @@ def common_args(model, end, matrix, features=None, test_start="2023-09-19", prof
 def make_tasks(root, phase, end, test_start="2023-09-19"):
     tasks = []
     engine = str(root / "scripts/wf_v35_breadth_alpha.py")
-    if phase not in {"corr", "t2a", "label", "prune", "n3", "n4", "n5", "n6"}:
+    if phase not in {"corr", "t2a", "label", "prune", "n3", "n4", "n5", "n6", "n7"}:
         raise ValueError("unknown study phase")
     matrix = "training_data_pit_v24_tick1_t2a.parquet" if phase == "t2a" else "training_data_pit_v24_tick1.parquet"
 
@@ -120,6 +125,19 @@ def make_tasks(root, phase, end, test_start="2023-09-19"):
     def result(name, model, seed):
         return root / "data/processed" / (f"wf_daily_{name}_s{seed}_ts{test_start}_te{end}_cap{PROFILES[model]['capital']}.json")
 
+    if phase == "n7":
+        # N7 (2026-10-09): 用户观察「每日推荐前三比较准」-> 问 qmt10w 是否改持 3 只。纯回放:
+        # 同一份 T1B+PG1 预测(N4/N5 的 40 个 purge6 缓存), 10 万本金, 持 5 只 vs 持 3 只(+ind-cap 2)
+        for seed in N6_SEEDS:
+            purge6 = n6_caches(seed)[1]
+            for arm in ("Q5", "Q3"):
+                p = EXEC_POINTS[arm]
+                tag = f"N7_{arm}"
+                cmd = [sys.executable, "-u", engine, *common_args("B", end, matrix, None, test_start, profile=p),
+                       "--lgb-seed", str(seed), "--label-alignment", "purge6", "--tag", tag, "--load-preds", purge6]
+                add(f"{tag}_s{seed}", cmd, [],
+                    root / "data/processed" / f"wf_daily_{tag}_s{seed}_ts{test_start}_te{end}_cap{p['capital']}.json")
+        return tasks
     if phase == "n6":
         # N6 (2026-10-01): 纯回放, 零训练, 复用 N4/N5 的 40 对 B 点预测缓存。
         #  A) fyf100w 点位(100万/n8/T1B): legacy vs purge6 两臂都回放, 回答 PG1 该不该跟进 fyf100w
@@ -521,7 +539,57 @@ def summarize_n6(root, end, test_start="2023-09-19"):
     return out_json
 
 
+N7_GATE = {"stage": "replay_only", "arm": "Q3 (n3, ind-cap 2) vs Q5 (n5) at 100k, same T1B+PG1 predictions",
+           "pairs_required": 40, "return_delta_pp_min": 5, "positive_pairs_min": 26,
+           "drawdown_delta_pp_min": -3, "recent_126_delta_pp_min": -5, "each_batch_median_positive": True,
+           "pass_means": "propose switching qmt10w to 3 positions (user decides); fail = keep 5",
+           "caveat": "same 2023-09..2026-09 history; concentration raises single-stock risk not captured by medians"}
+
+
+def _daily_stats(path):
+    d = pd.DataFrame(json.loads(path.read_text())["daily"])
+    r = d["daily_ret"].astype(float)
+    sharpe = float(r.mean() / r.std() * np.sqrt(244)) if r.std() > 0 else None
+    return sharpe, float(((1 + r).prod() - 1) * 100)
+
+
+def summarize_n7(root, end, test_start="2023-09-19"):
+    proc = root / "data/processed"
+
+    def out(tag, seed):
+        return proc / f"wf_daily_{tag}_s{seed}_ts{test_start}_te{end}_cap100000.json"
+
+    items = [(s, n6_caches(s)[2], out("N7_Q3", s), out("N7_Q5", s)) for s in N6_SEEDS]
+    row = _pairs_from_files(items)
+    rows = []
+    if row is not None:
+        stats = {"Q3": [], "Q5": []}
+        for _s, _, p3, p5 in items:
+            if p3.exists() and p5.exists():
+                stats["Q3"].append(_daily_stats(p3))
+                stats["Q5"].append(_daily_stats(p5))
+        m = row["median"]
+        complete = row["n_pairs"] == N7_GATE["pairs_required"]
+        row.update(arm="N7_Q3-N7_Q5", expected_pairs=40, complete=complete,
+                   passes_gate=bool(complete and m["total_return_pct"] >= N7_GATE["return_delta_pp_min"]
+                                    and row["positive_return_differences"] >= N7_GATE["positive_pairs_min"]
+                                    and m["max_dd_pct"] >= N7_GATE["drawdown_delta_pp_min"]
+                                    and m["recent_126_delta_pp"] >= N7_GATE["recent_126_delta_pp_min"]
+                                    and all(v > 0 for v in row["batch_median"].values())) if complete else None,
+                   arms={k: {"sharpe_median": float(np.median([x[0] for x in v if x[0] is not None])) if v else None,
+                             "return_median": float(np.median([x[1] for x in v])) if v else None,
+                             "return_worst": float(min(x[1] for x in v)) if v else None,
+                             "return_best": float(max(x[1] for x in v)) if v else None} for k, v in stats.items()})
+        rows.append(row)
+    res = {"updated_at": stamp(), "phase": "n7", "test_end": end, "gate": N7_GATE,
+           "passes": rows[0]["passes_gate"] if rows else None, "adoption_ready": False, "rows": rows}
+    write_json(root / "summary_n7.json", res)
+    return res
+
+
 def summarize(root, phase, end, test_start="2023-09-19"):
+    if phase == "n7":
+        return summarize_n7(root, end, test_start)
     if phase == "n6":
         return summarize_n6(root, end, test_start)
     if phase == "n5":
@@ -649,7 +717,7 @@ def run(root, phase, workers, max_load, min_memory, resume=False):
     n2 = phase in {"label", "prune"}
     if phase == "n5" and not (root / "n3_smoke_verified.json").exists():
         raise RuntimeError("N5 needs the N3 engine smoke verification")
-    if phase == "n6":
+    if phase in {"n6", "n7"}:
         if not (root / "n6_smoke_verified.json").exists():
             raise RuntimeError("N6 needs its replay smoke verification (no-flag replay == training output)")
         proc = root / "data/processed"
@@ -661,14 +729,14 @@ def run(root, phase, workers, max_load, min_memory, resume=False):
                 p = proc / f"wf_daily_{prefix}_s{seed}_ts{info['test_start']}_te{end}_cap{PROFILES['B']['capital']}.json"
                 if not p.is_file():
                     raise RuntimeError("N6 baseline missing: " + p.name)
-    gate = {"n3": N3_GATE, "n4": N4_GATE, "n5": N5_GATE, "n6": N6_GATE}.get(phase) or ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
+    gate = {"n3": N3_GATE, "n4": N4_GATE, "n5": N5_GATE, "n6": N6_GATE, "n7": N7_GATE}.get(phase) or ({"stage": "ten_seed_screen_only", "return_delta_pp_min": 3, "drawdown_delta_pp_min": -2,
              "positive_pairs_min": 7, "requires_complete_pairs": 10, "automatic_promotion": False,
              "label_primary": "ALIGNED-CONTROL", "label_practical_check": "ALIGNED-CURRENT must also be nonnegative",
              "joint_policy": "Both operating points must pass before proposing 20-seed confirmation; no posthoc per-profile cherry-picking"}
             if n2 else {"return_delta_pp_min": -2, "drawdown_delta_pp_min": 2, "loss_seeds_must_not_increase": True,
                         "corr_window": 20, "corr_min_periods": 15, "missing_pairs": "allow_and_count", "sell_policy": "unchanged"})
     write_json(root / f"plan_{phase}.json", {"created_at": stamp(), "code_sha256": code_hashes, "extra_inputs_sha256": extra_inputs, "workers": workers, "max_load": max_load,
-               "min_memory_gb": min_memory, "seeds": {"n5": FRESH_SEEDS, "n6": N6_SEEDS}.get(phase) or (SEEDS[:10] if n2 else SEEDS), "profiles": PROFILES, "tasks": tasks,
+               "min_memory_gb": min_memory, "seeds": {"n5": FRESH_SEEDS, "n6": N6_SEEDS, "n7": N6_SEEDS}.get(phase) or (SEEDS[:10] if n2 else SEEDS), "profiles": PROFILES, "tasks": tasks,
                "gate": gate, "resumed": resumed is not None})
     status = resumed if resumed is not None else {t["id"]: {"state": "pending"} for t in tasks}
     active = {}
@@ -726,9 +794,9 @@ def run(root, phase, workers, max_load, min_memory, resume=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("phase", choices=["corr", "t2a", "label", "prune", "n3", "n4", "n5", "n6", "manifest",
+    ap.add_argument("phase", choices=["corr", "t2a", "label", "prune", "n3", "n4", "n5", "n6", "n7", "manifest",
                                       "summary-corr", "summary-t2a", "summary-label", "summary-prune", "summary-n3", "summary-n4",
-                                      "summary-n5", "summary-n6"])
+                                      "summary-n5", "summary-n6", "summary-n7"])
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--max-load", type=float, default=85)
     ap.add_argument("--min-memory-gb", type=float, default=96)
