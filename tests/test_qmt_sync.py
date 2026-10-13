@@ -162,6 +162,33 @@ def test_ticket_valid_only_for_today_and_confirmed_ledger(tmp_path):
     assert len((tmp_path / "qmt" / "switch_log.jsonl").read_text().splitlines()) == 1
 
 
+def test_manual_confirm_gate_only_after_autoconfirm_had_its_chance(tmp_path):
+    from qmt_sync import manual_confirm_gate
+    aw = {"awaiting_confirm": {"signal_date": "2026-10-08", "exec_date": "2026-10-09"}}
+    at = lambda hms, day="2026-10-09": datetime.fromisoformat(f"{day}T{hms}")  # noqa: E731
+    # 普通线 / 没在待确认: 不管
+    assert manual_confirm_gate(tmp_path, "steady5w", aw, at("18:34:00")) == (True, "")
+    assert manual_confirm_gate(tmp_path, "qmt10w", {"awaiting_confirm": None}, at("18:34:00")) == (True, "")
+    # 执行日当晚 21:00 之前: 只认自动确认 (10-09 18:34 那次手点就该被拦)
+    ok, note = manual_confirm_gate(tmp_path, "qmt10w", aw, at("18:34:00"))
+    assert ok is False and "18:50" in note
+    assert manual_confirm_gate(tmp_path, "qmt10w", aw, at("20:59:59"))[0] is False
+    # 21:00 之后 / 执行日已过: 放人工
+    assert manual_confirm_gate(tmp_path, "qmt10w", aw, at("21:00:00"))[0] is True
+    assert manual_confirm_gate(tmp_path, "qmt10w", aw, at("09:30:00", "2026-10-12"))[0] is True
+    # 自动确认被拦下/失败: 立刻放人工, 并带上原因; 别的日子/别的线的记录不算
+    log = tmp_path / "qmt" / "autoconfirm.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text(json.dumps({"pid": "qmt10w", "exec_date": "2026-10-08", "status": "blocked", "problems": ["旧"]}) + "\n"
+                   + json.dumps({"pid": "qmt10w", "exec_date": "2026-10-09", "status": "confirmed"}) + "\n")
+    assert manual_confirm_gate(tmp_path, "qmt10w", aw, at("19:00:00"))[0] is False
+    with log.open("a") as fh:
+        fh.write("garbage\n" + json.dumps({"pid": "qmt10w", "exec_date": "2026-10-09", "status": "blocked",
+                                           "problems": ["买入了计划外代码 688001"]}) + "\n")
+    ok, note = manual_confirm_gate(tmp_path, "qmt10w", aw, at("19:00:00"))
+    assert ok is True and "计划外代码 688001" in note
+
+
 def test_sign_is_stable_across_processes():
     # Windows 侧用同一算法: HMAC-SHA256(key, ts + "\n" + body)
     import hashlib

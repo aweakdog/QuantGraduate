@@ -127,6 +127,40 @@ def test_switch_only_admin_or_owner(client, tmp_path):
     assert login("611611").post("/api/profile/qmt_switch", json={"enabled": False}).json()["switch"]["enabled"] is False
 
 
+def test_manual_confirm_blocked_in_backend_for_qmt_line(client, tmp_path, monkeypatch):
+    import web_server as ws
+    from fastapi.testclient import TestClient
+    seen = []
+    monkeypatch.setattr(ws.qmt_sync, "manual_confirm_gate",
+                        lambda live, pid, st, now=None: seen.append(pid) or (False, "由系统 18:50 自动确认"))
+    tc = TestClient(ws.app)
+    tc.cookies.set(ws.VIEW_COOKIE, _view_token(ws, "611611"))
+    r = tc.post("/api/profile/confirm", json={"profile": "qmt10w", "fills": []})
+    assert r.status_code == 409 and r.json()["auto_confirm"] is True and "18:50" in r.json()["error"]
+    assert seen == ["qmt10w"] and not list(tmp_path.glob("confirm_qmt10w_*"))   # 一个回报文件都没写
+
+
+def test_build_today_hides_manual_confirm_when_gate_closed(tmp_path, monkeypatch):
+    import action_page
+    live = tmp_path / "data" / "live"
+    live.mkdir(parents=True)
+    st = {"cash": 100000.0, "initial_capital": 100000.0, "lots": [], "calendar": ["2026-10-08", "2026-10-09"],
+          "config": {"hold_days": 5, "tranche_n": 5}, "last_signal_date": "2026-10-08",
+          "pending": {"signal_date": "2026-10-08", "in_cash": True},
+          "awaiting_confirm": {"signal_date": "2026-10-08", "exec_date": "2026-10-09", "since": "x"}}
+    (live / "state_qmt10w.json").write_text(json.dumps(st))
+    (live / "plan_qmt10w_2026-10-08.json").write_text(json.dumps(
+        {"signal_date": "2026-10-08", "generated_at": "2026-10-08T18:51:00", "in_cash": True,
+         "hold": [], "sell": [], "buy": [], "config": {"hold_days": 5}}))
+    monkeypatch.setattr(action_page, "is_auto", lambda pid: False)     # 线上 qmt10w 是实盘手动确认模式(设置文件)
+    monkeypatch.setattr(action_page, "manual_confirm_gate", lambda live, pid, st, now=None: (False, "自动确认中"))
+    d = action_page.build_today(tmp_path, "qmt10w")
+    assert d["awaiting_confirm"] and d["can_confirm"] is False and d["confirm_note"] == "自动确认中"
+    monkeypatch.setattr(action_page, "manual_confirm_gate", lambda live, pid, st, now=None: (True, "被拦下, 请人工"))
+    d = action_page.build_today(tmp_path, "qmt10w")
+    assert d["can_confirm"] is True and d["confirm_note"] == "被拦下, 请人工"
+
+
 def _view_token(ws, code):
     exp = int(time.time()) + 3600
     return f"{exp}.c.{ws._code_id(code)}.{ws._view_sign_code(exp, code)}"

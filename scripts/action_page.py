@@ -21,6 +21,7 @@ import pandas as pd
 
 import macro_calendar
 import trading_calendar
+from qmt_sync import manual_confirm_gate
 from live_config import (DEFAULT_PROFILE, PROFILES, capital_of, display_name,
                          is_auto, is_locked, main_board_only, state_file)
 
@@ -691,6 +692,7 @@ def build_today(root: Path, pid=None, allowed=None):
             "side": side,
         }
 
+    confirm_ok, confirm_note = manual_confirm_gate(live, pid, state)
     return {
         "profile": pid,
         "profile_name": display_name(pid),
@@ -702,7 +704,9 @@ def build_today(root: Path, pid=None, allowed=None):
         # 现在能不能提交成交回报。只有系统确实在等确认时才能提交 ——
         # 计划刚出、执行日还没到时提交是没法结算的(没有执行日行情),
         # 前端据此把打勾锁住, 免得用户白填一遍。
-        "can_confirm": (not is_auto(pid)) and bool(state.get("awaiting_confirm")),
+        "can_confirm": (not is_auto(pid)) and bool(state.get("awaiting_confirm")) and confirm_ok,
+        # QMT 线的人工确认闸门说明(为空=普通线)。前端在 can_confirm 为假时用它替换确认按钮
+        "confirm_note": confirm_note,
         "profiles": list_profiles(allowed),
         "action": action,
         "headline": headline,
@@ -2010,9 +2014,14 @@ async function loadAct(){
 
   // 实盘模式在等你确认时, 整条线都停着, 所以置顶提示。
   // 有买卖单时确认入口在下面的操作清单里(打勾); 没有单时这里直接给个按钮。
-  if (d.awaiting_confirm){
+  if (d.awaiting_confirm && !d.can_confirm && d.confirm_note){
+    // QMT 线: 执行日当晚只认按券商真实成交的自动确认, 不给人工按钮
+    h += `<div class="cf"><h3>等系统确认 ${d.awaiting_confirm.exec_date} 的成交</h3>
+      <div class="cfs">${esc(d.confirm_note)}</div></div>`;
+  } else if (d.awaiting_confirm){
     const ac = d.awaiting_confirm;
     const hasOrders = d.sell.length || d.buy.length;
+    if (d.confirm_note) h += `<div class="warn">${esc(d.confirm_note)}</div>`;
     h += `<div class="cf">
       <h3>等你确认 ${ac.exec_date} 的成交</h3>
       <div class="cfs">这条线是<b style="color:#fcd34d">实盘模式</b>，

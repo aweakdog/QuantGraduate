@@ -1415,6 +1415,10 @@ async def api_confirm(req: Request):
         return bad
     if (deny := _write_deny(req, pid)) is not None:
         return deny
+    # QMT 线执行日当晚只认自动确认(见 qmt_sync.manual_confirm_gate); 拦在后端, 不只靠前端藏按钮
+    ok, note = qmt_sync.manual_confirm_gate(LIVE_DIR, pid, _state_of(pid))
+    if not ok:
+        return JSONResponse({"error": note, "auto_confirm": True}, status_code=409)
     if _running["active"]:
         return JSONResponse({"error": "已有任务在跑, 请稍候"}, status_code=409)
 

@@ -167,6 +167,47 @@ def reconcile(snap, state):
                              else round(float(acct_cash) - float(line_cash), 2))}
 
 
+# ── 人工确认闸门 ──────────────────────────────────────────────────
+MANUAL_AFTER = "21:00:00"   # 最后一次自动确认 20:50, 之后才放人工
+
+
+def _autoconfirm_records(live_dir):
+    p = Path(live_dir) / "qmt" / "autoconfirm.jsonl"
+    if not p.exists():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def manual_confirm_gate(live_dir, pid, state, now=None):
+    """QMT 线能不能人工「确认成交」。返回 (允许, 说明)。
+
+    10-09 有人在 18:34 手点了「一笔都没成交」, 抢在 18:50 自动确认之前 —— 那天确实没成交所以无害,
+    但一旦有真实成交, 人工抢先报「未成交」会让账本和券商对不上。所以 QMT 线在执行日当晚只认自动确认,
+    下面三种情况才放人工: 自动确认被拦下/执行失败; 21:00 之后仍没确认; 执行日已过(错过了当晚)。
+    """
+    aw = (state or {}).get("awaiting_confirm")
+    if pid not in QMT_LINES or not aw:
+        return True, ""
+    now = now or datetime.now()
+    exec_date = str(aw.get("exec_date") or "")
+    if exec_date < now.date().isoformat():
+        return True, "执行日当晚没有完成自动确认, 请对照券商成交人工确认。"
+    for rec in _autoconfirm_records(live_dir):
+        if rec.get("pid") == pid and str(rec.get("exec_date")) == exec_date and rec.get("status") in ("blocked", "failed"):
+            why = "; ".join(rec.get("problems") or []) or f"returncode={rec.get('returncode')}"
+            return True, f"自动确认没有通过 ({why}), 请对照券商成交人工确认。"
+    if now.strftime("%H:%M:%S") >= MANUAL_AFTER:
+        return True, "今晚自动确认没有完成, 请对照券商成交人工确认。"
+    return False, ("这条线由系统在 18:50 按券商真实成交自动确认 (20:50 补跑), 不用手动确认。"
+                   "自动确认被拦下、或 21:00 后仍未确认时, 才开放人工确认。")
+
+
 # ── 阶段二: 下单单据 / 总开关 / 执行回报 ─────────────────────────
 def load_switch(live_dir):
     """网页总开关(双钥匙之一)。默认关; 文件坏了也当关。"""
