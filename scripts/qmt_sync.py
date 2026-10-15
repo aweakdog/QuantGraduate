@@ -58,6 +58,35 @@ def load_key(path=None):
     return k.encode() if k else b""
 
 
+SITE_URL = "http://eez041.ece.ust.hk:8737"
+_KIND_TEXT = {"morning": "开盘检查", "close": "收盘检查", "manual": "手动检查"}
+
+
+def email_summary(key, text=""):
+    """邮件版告警: 只说发生了什么、去网页看, 不含股票代码/股数/价格/金额/线名 (10-15 用户要求)。
+
+    邮件会经过系里的中继(有投递日志), 退信也会落到 EEZ041 地址, 所以细节只留在需登录的网页和企业微信群。"""
+    parts = str(key).split(":")
+    day, kind = (parts + ["", ""])[:2]
+    md = day[5:] if len(day) >= 10 else day
+    if kind in _KIND_TEXT and parts[2:3] == ["offline"]:
+        line = f"【QMT】{md} {_KIND_TEXT[kind]}: 资金账号离线, 请检查 QMT 是否已登录(极简模式)。"
+    elif kind == "close" and parts[2:3] == ["mismatch"]:
+        line = f"【QMT】{md} 收盘对账: 持仓与券商不一致, 自动确认会停下等人工核对。"
+    elif kind == "autoconfirm_ok":
+        line = f"【QMT】{md} 已按券商成交自动确认。"
+    elif kind == "autoconfirm_blocked":
+        line = f"【QMT】{md} 自动确认被拦下, 需要人工核对后在网页上确认。"
+    elif kind == "autoconfirm_failed":
+        line = f"【QMT】{md} 自动确认执行失败, 需要人工处理。"
+    elif kind == "exec":
+        mode = {"shadow": "影子演算", "live": "自动下单", "skipped": "未下单"}.get(parts[2] if len(parts) > 2 else "", "执行")
+        line = f"【QMT】{md} {mode}有新结果或问题。"
+    else:
+        line = "【QMT】有一条新告警。"
+    return f"{line}\n详情请登录网页查看: {SITE_URL}"
+
+
 def _default_senders():
     """主推送通道 + (配置了 qmt_email_to 时) 邮件。返回 [(名字, send)]。"""
     from notify_channels import EmailChannel, get_channel, load_config
@@ -87,7 +116,7 @@ def alert_once(live_dir, key, text, send=None):
     results = {}
     for name, fn in senders:
         try:
-            results[name] = bool(fn(text))
+            results[name] = bool(fn(email_summary(key, text) if name == "email" else text))
         except Exception as e:  # noqa: BLE001
             print(f"[qmt] 告警发送失败 ({name}): {e}")
             results[name] = False

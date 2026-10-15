@@ -190,10 +190,10 @@ def test_manual_confirm_gate_only_after_autoconfirm_had_its_chance(tmp_path):
 
 
 class _FakeSMTP:
-    sent = []
+    sent, tls_capable = [], True
 
     def __init__(self, host, port, timeout):
-        self.addr = (host, port)
+        self.addr, self.tls = (host, port), False
 
     def __enter__(self):
         return self
@@ -201,26 +201,58 @@ class _FakeSMTP:
     def __exit__(self, *a):
         return False
 
+    def ehlo(self):
+        return 250, b"ok"
+
+    def has_extn(self, name):
+        return name == "starttls" and _FakeSMTP.tls_capable
+
+    def starttls(self, context=None):
+        self.tls = True
+
     def send_message(self, msg):
-        _FakeSMTP.sent.append((self.addr, msg))
+        _FakeSMTP.sent.append((self.addr, msg, self.tls))
         return {}
 
 
-def test_email_channel_builds_a_proper_message():
+def test_email_channel_requires_tls_and_sets_reply_to():
     from notify_channels import EmailChannel
     _FakeSMTP.sent.clear()
-    ok = EmailChannel("yliog@connect.ust.hk", smtp=_FakeSMTP).send("【QMT】2026-10-14 morning 检查: 资金账号未在线\n第二行 **加粗**")
+    _FakeSMTP.tls_capable = True
+    ok = EmailChannel("yliog@connect.ust.hk", smtp=_FakeSMTP).send("【QMT】10-14 开盘检查: 资金账号离线\n第二行 **加粗**")
     assert ok is True
-    addr, msg = _FakeSMTP.sent[0]
-    assert addr == ("smtp.ece.ust.hk", 25) and msg["To"] == "yliog@connect.ust.hk"
-    assert msg["Subject"] == "【QMT】2026-10-14 morning 检查: 资金账号未在线" and "EEZ041@ece.ust.hk" in msg["From"]
-    assert msg["Message-ID"] and msg["Date"] and "**" not in msg.get_content()
+    addr, msg, tls = _FakeSMTP.sent[0]
+    assert tls is True and addr == ("smtp.ece.ust.hk", 25) and msg["To"] == "yliog@connect.ust.hk"
+    assert msg["Reply-To"] == "yliog@connect.ust.hk" and "EEZ041@ece.ust.hk" in msg["From"]
+    assert msg["Subject"] == "【QMT】10-14 开盘检查: 资金账号离线" and msg["Message-ID"] and "**" not in msg.get_content()
+    _FakeSMTP.tls_capable = False                                   # 中继不支持加密 -> 不发明文
+    assert EmailChannel("yliog@connect.ust.hk", smtp=_FakeSMTP).send("x") is False and len(_FakeSMTP.sent) == 1
+    _FakeSMTP.tls_capable = True
 
 
-def test_alert_goes_to_main_and_email_and_records_each(tmp_path, monkeypatch):
+def test_email_summary_never_leaks_codes_amounts_or_line_name():
+    from qmt_sync import email_summary
+    detailed = "【QMT】华泰QMT 10万 2026-10-14 收盘对账: 持仓与券商不一致 [{'code': '600000', 'qmt': 400, 'line': 300}] ¥103,121.80"
+    for key in ("2026-10-14:morning:offline", "2026-10-14:close:mismatch:qmt10w", "2026-10-14:autoconfirm_ok:qmt10w",
+                "2026-10-14:autoconfirm_blocked:qmt10w", "2026-10-14:autoconfirm_failed:qmt10w",
+                "2026-10-14:exec:live", "2026-10-14:exec:shadow", "weird-key"):
+        s = email_summary(key, detailed)
+        assert s.startswith("【QMT】") and "eez041.ece.ust.hk:8737" in s
+        for leak in ("600000", "400", "300", "103", "10万", "华泰"):
+            assert leak not in s.split("\n")[0], (key, s)
+    assert "开盘检查" in email_summary("2026-10-14:morning:offline") and "10-14" in email_summary("2026-10-14:morning:offline")
+    assert "自动下单" in email_summary("2026-10-14:exec:live")
+
+
+def test_alert_main_gets_details_email_gets_summary_each_recorded(tmp_path, monkeypatch):
     import qmt_sync
     from qmt_sync import alert_once
     got = []
+    monkeypatch.setattr(qmt_sync, "_default_senders",
+                        lambda: [("main", lambda t: got.append(("main", t)) or True),
+                                 ("email", lambda t: got.append(("email", t)) or True)])
+    assert alert_once(tmp_path, "2026-10-14:close:mismatch:qmt10w", "不一致 600000 400 vs 300") is True
+    assert got[0] == ("main", "不一致 600000 400 vs 300") and "600000" not in got[1][1] and got[1][0] == "email"
     monkeypatch.setattr(qmt_sync, "_default_senders",
                         lambda: [("main", lambda t: got.append(("main", t)) or True),
                                  ("email", lambda t: (_ for _ in ()).throw(OSError("relay down")))])
@@ -228,7 +260,6 @@ def test_alert_goes_to_main_and_email_and_records_each(tmp_path, monkeypatch):
     rec = json.loads((tmp_path / "qmt" / "alerts_sent.json").read_text())["2026-10-14:morning:offline"]
     assert rec["ok"] is True and rec["channels"] == {"main": True, "email": False}
     assert alert_once(tmp_path, "2026-10-14:morning:offline", "离线") is False    # 同 key 不重发
-    assert got == [("main", "离线")]
 
 
 def test_sign_is_stable_across_processes():

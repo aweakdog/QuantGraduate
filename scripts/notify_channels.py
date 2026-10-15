@@ -206,7 +206,11 @@ class WecomChannel(Channel):
 
 class EmailChannel(Channel):
     """邮件。041 由系里配好了免认证中继 smtp.ece.ust.hk:25 (/etc/msmtprc, 发件人 EEZ041@ece.ust.hk),
-    所以不需要任何密码; 收件人在 notify_config.json 的 qmt_email_to (10-15 起只用于 QMT 告警)。"""
+    所以不需要任何密码; 收件人在 notify_config.json 的 qmt_email_to (10-15 起只用于 QMT 告警)。
+
+    隐私 (10-15 用户关心): 041 -> 中继这一跳强制 STARTTLS 且校验证书, 中继不支持加密就不发;
+    Reply-To 设成收件人自己, 免得回复落到 EEZ041 这个不知谁在收的地址。内容由调用方精简(见 qmt_sync.email_summary)。
+    """
 
     name = "email"
 
@@ -219,15 +223,23 @@ class EmailChannel(Channel):
 
     def send(self, text, meta=None):
         import smtplib
+        import ssl
         from email.message import EmailMessage
         from email.utils import formatdate, make_msgid
         msg = EmailMessage()
         subject = (meta or {}).get("subject") or text.replace("**", "").strip().splitlines()[0][:80]
         msg["Subject"], msg["From"], msg["To"] = subject, f"量化系统 <{self.sender}>", ", ".join(self.to)
+        msg["Reply-To"] = self.to[0]
         msg["Date"], msg["Message-ID"] = formatdate(localtime=True), make_msgid(domain="ece.ust.hk")
         msg.set_content(text.replace("**", "") + "\n\n—— 由 041 量化系统自动发送, 无需回复。\n")
         try:
             with (self._smtp or smtplib.SMTP)(self.host, self.port, timeout=20) as s:
+                s.ehlo()
+                if not s.has_extn("starttls"):
+                    print("[notify] 邮件中继不支持 STARTTLS, 不发明文邮件")
+                    return False
+                s.starttls(context=ssl.create_default_context())
+                s.ehlo()
                 refused = s.send_message(msg)
             if refused:
                 print(f"[notify] 邮件部分收件人被拒: {refused}")
