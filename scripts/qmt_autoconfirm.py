@@ -52,12 +52,18 @@ def run_one(pid, live=LIVE, dry_run=False, runner=subprocess.run, send=None):
     plan_p = live / f"plan_{pid}_{aw['signal_date']}.json"
     plan = json.loads(plan_p.read_text(encoding="utf-8")) if plan_p.exists() else None
     snap = qmt_sync.final_snapshot_for(live, exec_date)
-    fills, probs, notes = qmt_sync.build_autoconfirm(snap, st, plan, exec_date)
+    fallback = snap is None
+    if fallback:
+        # 执行日 QMT 离线没有收盘快照: 用之后第一份在线快照的持仓推断「执行日无成交」, 推不出就停下
+        snap = qmt_sync.first_online_snapshot_after(live, exec_date)
+        fills, probs, notes = qmt_sync.build_fallback_confirm(snap, st, exec_date)
+    else:
+        fills, probs, notes = qmt_sync.build_autoconfirm(snap, st, plan, exec_date)
     if plan is None:
         probs = [f"找不到计划文件 {plan_p.name}"] + probs
     rec = {"at": datetime.now().isoformat(timespec="seconds"), "pid": pid, "exec_date": exec_date,
            "signal_date": aw["signal_date"], "snapshot_at": (snap or {}).get("probe_at"),
-           "fills": fills, "problems": probs, "notes": notes}
+           "fallback": fallback, "fills": fills, "problems": probs, "notes": notes}
     name = display_name(pid)
     if probs:
         rec["status"] = "blocked"
@@ -79,8 +85,9 @@ def run_one(pid, live=LIVE, dry_run=False, runner=subprocess.run, send=None):
     if ok:
         desc = "无成交" if not fills else "、".join(
             f"{'买' if f['action'] == 'buy' else '卖'}{f['code']}×{f['shares']}@{f['price']}" for f in fills)
+        how = f"按 {notes[0]}" if fallback and notes else "已按券商真实成交"
         qmt_sync.alert_once(live, f"{exec_date}:autoconfirm_ok:{pid}",
-                            f"【QMT】{name} {exec_date} 已按券商真实成交自动确认: {desc}。", send=send)
+                            f"【QMT】{name} {exec_date} {how}自动确认: {desc}。", send=send)
     else:
         qmt_sync.alert_once(live, f"{exec_date}:autoconfirm_failed:{pid}",
                             f"【QMT】{name} {exec_date} 自动确认执行失败(rc={r.returncode}), 线仍在待确认, 请查看。",

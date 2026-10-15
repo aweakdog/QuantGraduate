@@ -361,3 +361,36 @@ def build_autoconfirm(snap, state, plan, exec_date):
         diff = {c: (q.get(c, 0), after.get(c, 0)) for c in sorted(set(q) | set(after)) if q.get(c, 0) != after.get(c, 0)}
         probs.append(f"按回报改完后的持仓与 QMT 不一致 (代码: QMT 股数, 线账本股数): {diff}")
     return fills, probs, notes
+
+
+def first_online_snapshot_after(live_dir, date):
+    """执行日之后(严格晚于那天)第一份账户在线的快照, 任何 kind; 没有返回 None。"""
+    day = str(date).replace("-", "")
+    for p in sorted((Path(live_dir) / "qmt").glob("snap_*.json")):
+        stamp = p.name[5:13]
+        if not stamp.isdigit() or stamp <= day:
+            continue
+        try:
+            s = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if s.get("account_online"):
+            return s
+    return None
+
+
+def build_fallback_confirm(later_snap, state, exec_date):
+    """执行日没有收盘快照(QMT 离线, 如 10-14 Windows 更新重启)时的兜底。返回 (fills, problems, notes)。
+
+    当日成交第二天就查不到了, 但持仓查得到: A 股 T+1, 执行日的买入次日一定体现为持仓, 卖出一定体现为减仓。
+    所以之后第一份在线快照的持仓若与线账本逐只一致 -> 执行日什么都没成交, 按「无成交」确认;
+    不一致 -> 推不出成交价, 停下等人工。
+    """
+    if not later_snap:
+        return [], [f"没有 {exec_date} 收盘后的 QMT 快照, 之后也还没有在线快照"], []
+    q, ln = qmt_positions(later_snap), line_positions(state)
+    if q != ln:
+        diff = {c: (q.get(c, 0), ln.get(c, 0)) for c in sorted(set(q) | set(ln)) if q.get(c, 0) != ln.get(c, 0)}
+        return [], [f"没有 {exec_date} 收盘快照, 且 {later_snap.get('probe_at')} 的持仓与线账本不一致 "
+                    f"(代码: QMT 股数, 线账本股数) {diff}, 推不出执行日成交"], []
+    return [], [], [f"{exec_date} 没有收盘快照 (QMT 离线); {later_snap.get('probe_at')} 的持仓与线账本一致, 执行日无成交"]

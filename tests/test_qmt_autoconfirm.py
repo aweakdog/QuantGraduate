@@ -85,6 +85,38 @@ def test_failed_live_signal_is_reported(tmp_path):
     assert rec["status"] == "failed" and "rc=1" in sent[0]
 
 
+def _offline_exec_day(tmp_path, lots=(), next_positions=(), next_online=True):
+    """执行日 QMT 离线(只有 offline 快照), 次日早上有一份快照。"""
+    _setup(tmp_path, lots=lots)
+    for p in (tmp_path / "qmt").glob("snap_*"):
+        p.unlink()
+    store_snapshot({"probe_at": f"{EXEC}T15:10:04", "kind": "close", "account_online": False,
+                    "error": "连接 miniQMT 失败(rc=-1)"}, tmp_path)
+    store_snapshot({"probe_at": "2026-10-12T09:35:01", "kind": "morning", "account_online": next_online,
+                    "asset": {"cash": 100000.0}, "orders": [], "trades": [],
+                    "positions": [{"stock_code": c, "volume": v} for c, v in next_positions]}, tmp_path)
+
+
+def test_offline_exec_day_confirms_empty_when_next_snapshot_matches_ledger(tmp_path):
+    _offline_exec_day(tmp_path, lots=[("600000", 300)], next_positions=[("600000.SH", 300)])
+    calls, sent = [], []
+    rec = qa.run_one(PID, live=tmp_path, runner=_runner_that_settles(tmp_path, calls), send=lambda t: sent.append(t) or True)
+    assert rec["status"] == "confirmed" and rec["fallback"] is True and rec["fills"] == []
+    assert rec["snapshot_at"] == "2026-10-12T09:35:01" and "QMT 离线" in sent[0] and "无成交" in sent[0]
+    assert json.loads((tmp_path / rec["confirm_file"]).read_text()) == []
+
+
+def test_offline_exec_day_blocks_when_positions_changed_or_no_later_snapshot(tmp_path):
+    _offline_exec_day(tmp_path, lots=[("600000", 300)], next_positions=[("600000.SH", 300), ("601111.SH", 100)])
+    calls = []
+    rec = qa.run_one(PID, live=tmp_path, runner=_runner_that_settles(tmp_path, calls), send=lambda t: True)
+    assert rec["status"] == "blocked" and calls == [] and "推不出执行日成交" in rec["problems"][0]
+    (tmp_path / "b").mkdir()
+    _offline_exec_day(tmp_path / "b", next_online=False)
+    rec = qa.run_one(PID, live=tmp_path / "b", runner=_runner_that_settles(tmp_path / "b", calls), send=lambda t: True)
+    assert rec["status"] == "blocked" and calls == [] and "之后也还没有在线快照" in rec["problems"][0]
+
+
 def test_dry_run_writes_nothing(tmp_path):
     _setup(tmp_path)
     rec = qa.run_one(PID, live=tmp_path, dry_run=True, runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError))
