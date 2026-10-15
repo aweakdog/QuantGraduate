@@ -521,12 +521,24 @@ if __name__ == "__main__":
         lowkey("mltask/etl")
     except Exception:
         pass
+    rc = 1
     try:
-        sys.exit(main())
+        rc = main()
     except Exception as e:
         status["ok"] = False
         status["error"] = str(e)[:2000]
         status["finished_at"] = datetime.now().isoformat(timespec="seconds")
         save_status()
         log(f"FAILED: {e}")
-        sys.exit(1)
+        rc = 1
+    finally:
+        # 运行摘要 + 当场告警(硬失败/软失败环节/token·权限/信号失败/逐笔陈旧), 见 ops_watch。
+        # 告警环节自己出错只记一行, 绝不改变日更本身的结果。
+        try:
+            import ops_watch
+            _rec, _sent = ops_watch.report_run(status)
+            if _sent:
+                log(f"已发告警: {_sent}")
+        except Exception as e:  # noqa: BLE001
+            log(f"WARN 告警环节异常(不影响日更结果): {e}")
+    sys.exit(rc)

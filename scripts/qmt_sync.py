@@ -97,10 +97,11 @@ def _default_senders():
     return out
 
 
-def alert_once(live_dir, key, text, send=None):
+def alert_once(live_dir, key, text, send=None, email_text=None):
     """同一 key(日期+类别)只推送一次, 结果记在 data/live/qmt/alerts_sent.json。返回是否至少一个通道成功。
 
-    send=None 时发到主通道和邮件(若配置), 每个通道单独记成败; 一个通道失败不影响另一个。"""
+    send=None 时发到主通道和邮件(若配置), 每个通道单独记成败; 一个通道失败不影响另一个。
+    邮件内容: 调用方给了 email_text 就用它(数据告警), 否则按 key 生成精简版(QMT 告警, 不含交易细节)。"""
     sent_p = Path(live_dir) / "qmt" / "alerts_sent.json"
     try:
         sent = json.loads(sent_p.read_text(encoding="utf-8")) if sent_p.exists() else {}
@@ -116,7 +117,11 @@ def alert_once(live_dir, key, text, send=None):
     results = {}
     for name, fn in senders:
         try:
-            results[name] = bool(fn(email_summary(key, text) if name == "email" else text))
+            if name == "email":
+                payload = f"{email_text}\n详情请登录网页查看: {SITE_URL}" if email_text else email_summary(key, text)
+            else:
+                payload = text
+            results[name] = bool(fn(payload))
         except Exception as e:  # noqa: BLE001
             print(f"[qmt] 告警发送失败 ({name}): {e}")
             results[name] = False

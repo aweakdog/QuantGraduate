@@ -1,0 +1,12 @@
+[Unit]
+# 交易日截止检查: 到点仍没有一次成功且推进到当天的日更 -> 企业微信 + 邮件告警。与 timer 同名。
+Description=Quant ops deadline watch (daily rebuild must have succeeded today)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/quant-strategy
+ExecStart=%h/quant-strategy/.venv/bin/python -u %h/quant-strategy/scripts/ops_watch.py --deadline
+TimeoutStartSec=300
+StandardOutput=append:%h/quant-strategy/data/live/ops_watch.log
+StandardError=append:%h/quant-strategy/data/live/ops_watch.log

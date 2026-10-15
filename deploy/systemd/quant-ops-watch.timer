@@ -1,0 +1,11 @@
+[Unit]
+# 日更 17:30 主跑(通常 18:40 前完成), 19:30 / 21:30 补跑(各约 1 小时)。21:15 查主跑+首次补跑, 23:45 做当天最终判定。
+Description=Quant ops deadline watch timer
+
+[Timer]
+OnCalendar=Mon..Fri 21:15
+OnCalendar=Mon..Fri 23:45
+Persistent=false
+
+[Install]
+WantedBy=timers.target
