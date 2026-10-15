@@ -58,8 +58,20 @@ def load_key(path=None):
     return k.encode() if k else b""
 
 
+def _default_senders():
+    """主推送通道 + (配置了 qmt_email_to 时) 邮件。返回 [(名字, send)]。"""
+    from notify_channels import EmailChannel, get_channel, load_config
+    cfg = load_config()
+    out = [("main", get_channel(cfg=cfg).send)]
+    if cfg.get("qmt_email_to"):
+        out.append(("email", EmailChannel(cfg["qmt_email_to"]).send))
+    return out
+
+
 def alert_once(live_dir, key, text, send=None):
-    """同一 key(日期+类别)只推送一次, 结果记在 data/live/qmt/alerts_sent.json。返回是否发送成功。"""
+    """同一 key(日期+类别)只推送一次, 结果记在 data/live/qmt/alerts_sent.json。返回是否至少一个通道成功。
+
+    send=None 时发到主通道和邮件(若配置), 每个通道单独记成败; 一个通道失败不影响另一个。"""
     sent_p = Path(live_dir) / "qmt" / "alerts_sent.json"
     try:
         sent = json.loads(sent_p.read_text(encoding="utf-8")) if sent_p.exists() else {}
@@ -68,14 +80,19 @@ def alert_once(live_dir, key, text, send=None):
     if key in sent:
         return False
     try:
-        if send is None:
-            from notify_channels import get_channel
-            send = get_channel().send
-        ok = bool(send(text))
+        senders = [("main", send)] if send is not None else _default_senders()
     except Exception as e:  # noqa: BLE001 —— 告警失败不能拖垮调用方
-        print(f"[qmt] 告警发送失败: {e}")
-        ok = False
-    sent[key] = {"at": datetime.now().isoformat(timespec="seconds"), "ok": ok}
+        print(f"[qmt] 告警通道配置有误: {e}")
+        senders = []
+    results = {}
+    for name, fn in senders:
+        try:
+            results[name] = bool(fn(text))
+        except Exception as e:  # noqa: BLE001
+            print(f"[qmt] 告警发送失败 ({name}): {e}")
+            results[name] = False
+    ok = any(results.values())
+    sent[key] = {"at": datetime.now().isoformat(timespec="seconds"), "ok": ok, "channels": results}
     sent_p.parent.mkdir(parents=True, exist_ok=True)
     sent_p.write_text(json.dumps(sent, ensure_ascii=False, indent=1), encoding="utf-8")
     return ok

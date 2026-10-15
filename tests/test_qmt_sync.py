@@ -189,6 +189,48 @@ def test_manual_confirm_gate_only_after_autoconfirm_had_its_chance(tmp_path):
     assert ok is True and "计划外代码 688001" in note
 
 
+class _FakeSMTP:
+    sent = []
+
+    def __init__(self, host, port, timeout):
+        self.addr = (host, port)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def send_message(self, msg):
+        _FakeSMTP.sent.append((self.addr, msg))
+        return {}
+
+
+def test_email_channel_builds_a_proper_message():
+    from notify_channels import EmailChannel
+    _FakeSMTP.sent.clear()
+    ok = EmailChannel("yliog@connect.ust.hk", smtp=_FakeSMTP).send("【QMT】2026-10-14 morning 检查: 资金账号未在线\n第二行 **加粗**")
+    assert ok is True
+    addr, msg = _FakeSMTP.sent[0]
+    assert addr == ("smtp.ece.ust.hk", 25) and msg["To"] == "yliog@connect.ust.hk"
+    assert msg["Subject"] == "【QMT】2026-10-14 morning 检查: 资金账号未在线" and "EEZ041@ece.ust.hk" in msg["From"]
+    assert msg["Message-ID"] and msg["Date"] and "**" not in msg.get_content()
+
+
+def test_alert_goes_to_main_and_email_and_records_each(tmp_path, monkeypatch):
+    import qmt_sync
+    from qmt_sync import alert_once
+    got = []
+    monkeypatch.setattr(qmt_sync, "_default_senders",
+                        lambda: [("main", lambda t: got.append(("main", t)) or True),
+                                 ("email", lambda t: (_ for _ in ()).throw(OSError("relay down")))])
+    assert alert_once(tmp_path, "2026-10-14:morning:offline", "离线") is True     # 邮件挂了不影响主通道
+    rec = json.loads((tmp_path / "qmt" / "alerts_sent.json").read_text())["2026-10-14:morning:offline"]
+    assert rec["ok"] is True and rec["channels"] == {"main": True, "email": False}
+    assert alert_once(tmp_path, "2026-10-14:morning:offline", "离线") is False    # 同 key 不重发
+    assert got == [("main", "离线")]
+
+
 def test_sign_is_stable_across_processes():
     # Windows 侧用同一算法: HMAC-SHA256(key, ts + "\n" + body)
     import hashlib

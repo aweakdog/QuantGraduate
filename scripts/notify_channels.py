@@ -204,6 +204,39 @@ class WecomChannel(Channel):
             return False
 
 
+class EmailChannel(Channel):
+    """邮件。041 由系里配好了免认证中继 smtp.ece.ust.hk:25 (/etc/msmtprc, 发件人 EEZ041@ece.ust.hk),
+    所以不需要任何密码; 收件人在 notify_config.json 的 qmt_email_to (10-15 起只用于 QMT 告警)。"""
+
+    name = "email"
+
+    def __init__(self, to, host="smtp.ece.ust.hk", port=25, sender="EEZ041@ece.ust.hk", smtp=None):
+        self.to = [to] if isinstance(to, str) else list(to or [])
+        if not self.to:
+            raise ValueError("email 通道需要收件人")
+        self.host, self.port, self.sender = host, int(port), sender
+        self._smtp = smtp            # 测试注入
+
+    def send(self, text, meta=None):
+        import smtplib
+        from email.message import EmailMessage
+        from email.utils import formatdate, make_msgid
+        msg = EmailMessage()
+        subject = (meta or {}).get("subject") or text.replace("**", "").strip().splitlines()[0][:80]
+        msg["Subject"], msg["From"], msg["To"] = subject, f"量化系统 <{self.sender}>", ", ".join(self.to)
+        msg["Date"], msg["Message-ID"] = formatdate(localtime=True), make_msgid(domain="ece.ust.hk")
+        msg.set_content(text.replace("**", "") + "\n\n—— 由 041 量化系统自动发送, 无需回复。\n")
+        try:
+            with (self._smtp or smtplib.SMTP)(self.host, self.port, timeout=20) as s:
+                refused = s.send_message(msg)
+            if refused:
+                print(f"[notify] 邮件部分收件人被拒: {refused}")
+            return not refused
+        except (OSError, smtplib.SMTPException) as e:
+            print(f"[notify] 邮件发送失败: {e}")
+            return False
+
+
 def get_channel(name=None, cfg=None):
     """按配置取通道。未知名字直接报错而不是悄悄退回 stdout ——
 
