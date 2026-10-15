@@ -1,0 +1,12 @@
+[Unit]
+# 040 逐笔供数到货检查: 上一交易日的 tick_micro / t1a_daily 面板没到 041 -> 企业微信 + 邮件告警。与 timer 同名。
+Description=Quant tick panel arrival watch (eez040 -> eez041)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/quant-strategy
+ExecStart=%h/quant-strategy/.venv/bin/python -u %h/quant-strategy/scripts/ops_watch.py --tick
+TimeoutStartSec=300
+StandardOutput=append:%h/quant-strategy/data/live/ops_watch.log
+StandardError=append:%h/quant-strategy/data/live/ops_watch.log

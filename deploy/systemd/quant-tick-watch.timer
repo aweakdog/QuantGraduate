@@ -1,0 +1,11 @@
+[Unit]
+# 040 cron 7:40 / 12:40 / 16:40 抽取并推送, 正常 8:05 前到。13:05 查早班+午班, 17:05 是 17:30 日更前最后一查。
+Description=Quant tick panel arrival watch timer
+
+[Timer]
+OnCalendar=Mon..Fri 13:05
+OnCalendar=Mon..Fri 17:05
+Persistent=false
+
+[Install]
+WantedBy=timers.target

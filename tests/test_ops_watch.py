@@ -61,7 +61,41 @@ def test_signal_failures_and_tick_staleness():
                stages={"build_tick1": {"ok": True, "log": "新鲜度: 基矩阵末日 2026-10-15, 逐笔面板末日 2026-10-13, 陈旧 2 个交易日; ..."}})
     alerts = {k: (t, e) for k, t, e in ow.evaluate_run(ow.summarize_run(s))}
     assert set(alerts) == {"signal", "tick_stale"}
-    assert "fyf100w" in alerts["signal"][1] and "断供 2 个交易日" in alerts["tick_stale"][1]
+    assert "fyf100w" in alerts["signal"][1] and "断供 1 个交易日" in alerts["tick_stale"][1]
+
+
+def test_normal_lag1_staleness_is_not_an_alert():
+    # lag1 设计: 重建日当天的包次日才到, 陈旧 1 是每天的常态, 不能天天报
+    s = status(stages={"build_tick1": {"ok": True, "log": "新鲜度: 基矩阵末日 2026-10-15, 逐笔面板末日 2026-10-14, 陈旧 1 个交易日; ..."}})
+    assert ow.evaluate_run(ow.summarize_run(s)) == []
+
+
+def _panels(proc, *stamps, only=None):
+    for d in ("tick_micro", "t1a_daily"):
+        (proc / d).mkdir(parents=True, exist_ok=True)
+        if only and d != only:
+            continue
+        for s in stamps:
+            (proc / d / f"{s}.parquet").write_bytes(b"x")
+
+
+def test_tick_arrival_check(tmp_path):
+    from datetime import date
+    days = [date(2026, 10, 9), date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15)]
+    proc, sent = tmp_path / "processed", []
+    send = lambda t: sent.append(t) or True  # noqa: E731
+    noon = datetime.fromisoformat("2026-10-15T13:05:00")
+    _panels(proc, "20261012", "20261013", "20261014")
+    assert ow.tick_arrival_check(noon, proc, tmp_path, days, send) == [] and sent == []     # 上一交易日 10-14 都到了
+    assert ow.tick_arrival_check(datetime.fromisoformat("2026-10-17T13:05:00"), proc, tmp_path, days, send) == []  # 非交易日
+    # 周一(10-12)查的是上周五(10-09): 跨周末取上一交易日
+    assert ow.tick_arrival_check(datetime.fromisoformat("2026-10-12T13:05:00"), proc, tmp_path, days, send) == ["逐笔(tk_*)", "订单结构(T1A)"]
+    assert "20261009 的包" in sent[-1]
+    # 10-16 查 10-15: 逐笔到了、T1A 没到; 17:05 是最后一查
+    days.append(date(2026, 10, 16))
+    _panels(proc, "20261015", only="tick_micro")
+    miss = ow.tick_arrival_check(datetime.fromisoformat("2026-10-16T17:05:00"), proc, tmp_path, days, send)
+    assert miss == ["订单结构(T1A)"] and "前值兜底" in sent[-1] and "连续缺 1 个交易日" in sent[-1]
 
 
 def test_report_run_appends_history_and_alerts_once(tmp_path, monkeypatch):

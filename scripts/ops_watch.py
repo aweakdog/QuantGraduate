@@ -7,6 +7,8 @@
      摘要历史才留得住 17:30 主跑的细节。
   2. systemd quant-ops-watch.timer 周一至五 21:15 / 23:45 跑 --deadline: 交易日到点仍没有一次
      成功且数据推进到当天的日更 -> 告警 (日更根本没跑、卡死、或数据源当天没更新)。
+  3. systemd quant-tick-watch.timer 周一至五 13:05 / 17:05 跑 --tick: 040 供的上一交易日逐笔/T1A
+     面板还没到 041 -> 告警 (赶在 17:30 日更之前, 留出补救时间)。
 告警走 qmt_sync.alert_once: 企业微信给详情(长串疑似密钥一律打码), 邮件只给精简说明; 同日同类只发一次。
 """
 import argparse
@@ -102,11 +104,58 @@ def evaluate_run(rec):
         detail = "; ".join(f"{p}: {(rec['signal_errors'].get(p) or '')[:120]}" for p in bad)
         out.append(("signal", f"【数据】{day} 有 {len(bad)} 条线出信号失败: {detail}",
                     f"【数据】{md} 有 {len(bad)} 条线出信号失败 ({'、'.join(bad)}), 这些线今晚没有新计划。"))
+    # 陈旧度正常就是 1 (lag1: 重建日当天的包次日早上才到); >=2 才是 040 供数/供应商断了
     stale = (rec["stages"].get("build_tick1") or {}).get("stale_days") or 0
-    if stale >= 1:
-        out.append(("tick_stale", f"【数据】{day} 逐笔面板陈旧 {stale} 个交易日 (040 供数/供应商断供?), 3 天内自动兜底, 超过 3 天当晚无信号。",
-                    f"【数据】{md} 逐笔数据已断供 {stale} 个交易日, 超过 3 天当晚将没有信号。"))
+    if stale >= 2:
+        out.append(("tick_stale", f"【数据】{day} 逐笔面板陈旧 {stale} 个交易日(正常是 1), 已断供 {stale - 1} 天; "
+                                  "3 天内用前值兜底, 陈旧超过 3 天当晚无信号。查 040 ~/logs/tickfeat_*.log 与供应商 123 云盘。",
+                    f"【数据】{md} 040 逐笔数据已断供 {stale - 1} 个交易日, 陈旧超过 3 天当晚将没有信号。"))
     return out
+
+
+# ── 040 逐笔供数到货检查 ──────────────────────────────────────────
+# 040 cron 7:40 / 12:40 / 16:40 跑 tick_daily_extract: 拉供应商 123 云盘 D-1 的包 -> 抽取
+# tick_micro 与 t1a_daily -> rsync 到 041。正常 8:05 前就到; 13:05 没到 = 早班失败(还有 16:40 一班),
+# 17:05 没到 = 今晚 17:30 日更只能用前值兜底。在 041 上看「到没到」, 不依赖能不能登 040。
+PANELS = (("tick_micro", "逐笔(tk_*)"), ("t1a_daily", "订单结构(T1A)"))
+
+
+def _prev_trading_day(day, days):
+    prior = [d for d in (days or []) if d < day]
+    return max(prior) if prior else None
+
+
+def tick_arrival_check(now=None, proc_dir=None, live_dir=LIVE, days=None, send=None):
+    """交易日应已到达上一交易日的逐笔/T1A 面板; 缺就告警。返回缺失的面板名列表。"""
+    now = now or datetime.now()
+    today = now.date()
+    proc_dir = Path(proc_dir) if proc_dir else ROOT / "data" / "processed"
+    if days is None:
+        import trading_calendar
+        days, _ = trading_calendar.load()
+    if not days or today not in set(days):
+        return []
+    prev = _prev_trading_day(today, days)
+    if prev is None:
+        return []
+    stamp = prev.strftime("%Y%m%d")
+    missing = [cn for d, cn in PANELS if not (proc_dir / d / f"{stamp}.parquet").exists()]
+    if not missing:
+        return []
+    # 连续缺了几天: 从上一交易日往回数, 到最近一个两个面板都在的交易日为止
+    gap, d = 0, prev
+    while d is not None and gap < 10 and any(not (proc_dir / p / f"{d:%Y%m%d}.parquet").exists() for p, _ in PANELS):
+        gap += 1
+        d = _prev_trading_day(d, days)
+    final = now.strftime("%H:%M") >= "17:00"
+    tail = ("今晚 17:30 日更会用前值兜底; 陈旧超过 3 天当晚将没有信号。" if final else "16:40 还有一班会重试。")
+    what = "/".join(missing)
+    day = today.isoformat()
+    _alert(live_dir, f"{day}:ops:{'tick_missing_final' if final else 'tick_missing'}",
+           f"【数据】{day} {now:%H:%M} 040 的{what}面板还没到 041 ({stamp} 的包, 已连续缺 {gap} 个交易日)。{tail}"
+           f"查 040 ~/logs/tickfeat_{now:%Y%m}.log、~/logs/sync123_{now:%Y%m}.log 与供应商 123 云盘。",
+           f"【数据】{day[5:]} {now:%H:%M} 040 逐笔数据还没到 ({prev:%m-%d} 的包, 已连续缺 {gap} 个交易日)。{tail}", send)
+    return missing
 
 
 def _alert(live_dir, key, text, email_text, send=None):
@@ -197,9 +246,12 @@ def service_check(now=None, live_dir=LIVE, active_of=None, send=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--deadline", action="store_true", help="交易日截止检查 (systemd 21:15 / 23:45)")
+    ap.add_argument("--tick", action="store_true", help="040 逐笔供数到货检查 (systemd 13:05 / 17:05)")
     args = ap.parse_args(argv)
     if args.deadline:
         print(f"[{datetime.now():%F %T}] deadline: {deadline_check()} services_down: {service_check()}")
+    if args.tick:
+        print(f"[{datetime.now():%F %T}] tick panels missing: {tick_arrival_check()}")
     return 0
 
 
