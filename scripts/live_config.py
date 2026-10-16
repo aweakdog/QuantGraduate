@@ -575,6 +575,7 @@ DEFAULT_PROFILE = "steady5w"
 # 且只作废被改的那个口令, 不影响其他人的登录状态。
 ACCESS_CODES = {
     "213213": {"role": "ro"},
+    "wzx": {"role": "ro"},  # 10-16 用户指定: 只读账户 (全部线可见, 不能做任何修改)
     "611611": {"role": "admin"},
     "px":  {"role": "acct", "pids": ("steady5w", "aggr2w_px2")},  # Px 本尊 + PX2
     # 10-08: llx 改用华泰 QMT 专用线 qmt10w(排第一 = 默认线); 旧线 aggr5w 暂停使用但保留可见

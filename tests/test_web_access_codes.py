@@ -41,6 +41,7 @@ def test_user_specified_codes_present():
     """2026-08-18 用户指定的口令一个都不能少/映射不能错"""
     from live_config import ACCESS_CODES
     assert ACCESS_CODES["213213"]["role"] == "ro"
+    assert ACCESS_CODES["wzx"] == {"role": "ro"}                    # 10-16: 只读账户
     assert ACCESS_CODES["611611"]["role"] == "admin"
     assert set(ACCESS_CODES["px"]["pids"]) == {"steady5w", "aggr2w_px2"}
     assert ACCESS_CODES["llx"]["pids"] == ("qmt10w", "aggr5w")   # 10-08: 改用 QMT 专用线, 旧线保留
@@ -56,7 +57,27 @@ def test_token_roundtrip_roles():
     assert ws._view_role(_Req({ws.VIEW_COOKIE: _token(ws, "611611")})) \
         == "admin"
     assert ws._view_role(_Req({ws.VIEW_COOKIE: _token(ws, "213213")})) == "ro"
+    assert ws._view_role(_Req({ws.VIEW_COOKIE: _token(ws, "wzx")})) == "ro"
+    assert ws._view_scope(_Req({ws.VIEW_COOKIE: _token(ws, "wzx")})) is None    # 全部线可见
     assert ws._view_role(_Req()) is None
+
+
+def test_wzx_readonly_end_to_end():
+    """wzx: 能登录、能看任何线; 任何修改(确认成交/改开关/改名/重置)一律 403, 也导不出别人的 Excel"""
+    import web_server as ws
+    from fastapi.testclient import TestClient
+    c = TestClient(ws.app)
+    r = c.post("/api/view/login", json={"password": "wzx"})
+    assert r.status_code == 200
+    assert c.get("/api/today?profile=qmt10w").status_code == 200
+    assert c.get("/api/today?profile=steady5w").status_code == 200
+    for path, body in (("/api/profile/confirm", {"profile": "qmt10w", "fills": []}),
+                       ("/api/profile/qmt_switch", {"enabled": True}),
+                       ("/api/profile/rename", {"profile": "steady5w", "name": "x"}),
+                       ("/api/profile/reset", {"profile": "steady5w"})):
+        r = c.post(path, json=body)
+        assert r.status_code == 403 and r.json().get("readonly") is True, path
+    assert c.get("/api/ledger/xlsx?profile=qmt10w").status_code == 403
 
 
 def test_scope_resolution():
