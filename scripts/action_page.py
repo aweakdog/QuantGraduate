@@ -1066,7 +1066,8 @@ let PROFS = [];
 // 切到看全部只多了"看": 改账按钮对非名下的线隐掉, 后端也会拒。
 let SCOPE = null;
 let SHOWALL = localStorage.getItem('showall') === '1';
-const canEdit = pid => !SCOPE || SCOPE.includes(pid);
+let RO = false;          // 只读口令(213213 / wzx): 一切改账按钮都不给, 后端中间件同样会拦
+const canEdit = pid => !RO && (!SCOPE || SCOPE.includes(pid));
 
 function toggleAll(){
   SHOWALL = !SHOWALL;
@@ -1538,6 +1539,10 @@ function renderActs(){
   if (!p.id){ $('#acts').innerHTML = ''; return; }
   // 看全部模式下停在别人的线上: 只能看, 改账按钮全部不给
   // (后端 _write_deny 同样会拒, 这里只是别让人白点)。
+  if (RO){
+    $('#acts').innerHTML = `<div class="lockbox">只读账户 · 可以看全部线, 不能做任何修改。</div>`;
+    return;
+  }
   if (!canEdit(p.id)){
     $('#acts').innerHTML = `
       <div class="lockbox">这是别人的线 · 只能看。确认成交、改账都要到
@@ -1964,7 +1969,7 @@ async function loadRec(){
   catch(e){ $('#app').innerHTML = '<div class="warn">无法连接服务器</div>'; return; }
 
   PID = d.profile; PROFS = d.profiles || PROFS;
-  SCOPE = d.viewer_scope || null; renderProfs(PID);
+  SCOPE = d.viewer_scope || null; RO = !!d.viewer_ro; renderProfs(PID);
   LASTD = d;                     // recRow 要用 exec_day_text 拼"X日买"标签
   $('#sigdate').textContent = d.signal_date ? ('信号日 ' + d.signal_date) : '';
   $('#gen').textContent = '';
@@ -1994,7 +1999,7 @@ async function loadAct(){
   catch(e){ $('#app').innerHTML = '<div class="warn">无法连接服务器</div>'; return; }
 
   PID = d.profile; PROFS = d.profiles || PROFS;
-  SCOPE = d.viewer_scope || null; renderProfs(PID);
+  SCOPE = d.viewer_scope || null; RO = !!d.viewer_ro; renderProfs(PID);
   LASTD = d;                     // 资金链重算要用到当前计划与账户
   DAY = d.signal_date || 'na';
   $('#sigdate').textContent = d.signal_date ? ('信号日 ' + d.signal_date) : '';
@@ -2219,7 +2224,7 @@ async function loadQmt(){
     h += `<div class="tipbox" style="margin:10px 0 0">最近一次执行 ${esc(ex.today)} · ${mode} · ${(ex.orders || []).length} 笔委托${
       extra.length ? ' · ' + esc(extra.join('；')) : ''}</div>`;
   }
-  if (SCOPE == null || SCOPE.includes('qmt10w')){
+  if (canEdit('qmt10w')){
     h += `<div class="acts" style="margin:12px 0 0"><div class="btn ${on ? '' : 'btn-pri'}" onclick="setQmtSwitch(${!on})">${
       on ? '关闭自动下单' : '开启自动下单（网页钥匙）'}</div></div>`;
   }
@@ -2349,7 +2354,7 @@ async function loadHist(){
 
   if (d.profile) PID = d.profile;
   PROFS = d.profiles || PROFS;
-  SCOPE = d.viewer_scope || null; renderProfs(PID);
+  SCOPE = d.viewer_scope || null; RO = !!d.viewer_ro; renderProfs(PID);
   LASTD = null;
   $('#sigdate').textContent = '';
   $('#gen').textContent = '';

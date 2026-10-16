@@ -69,7 +69,11 @@ def test_wzx_readonly_end_to_end():
     c = TestClient(ws.app)
     r = c.post("/api/view/login", json={"password": "wzx"})
     assert r.status_code == 200
-    assert c.get("/api/today?profile=qmt10w").status_code == 200
+    d = c.get("/api/today?profile=qmt10w")
+    assert d.status_code == 200 and d.json()["viewer_ro"] is True and d.json()["viewer_scope"] is None   # 前端据此隐掉改账按钮
+    admin = TestClient(ws.app)
+    admin.post("/api/view/login", json={"password": "611611"})
+    assert admin.get("/api/today?profile=qmt10w").json()["viewer_ro"] is False
     assert c.get("/api/today?profile=steady5w").status_code == 200
     for path, body in (("/api/profile/confirm", {"profile": "qmt10w", "fills": []}),
                        ("/api/profile/qmt_switch", {"enabled": True}),

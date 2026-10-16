@@ -1679,9 +1679,11 @@ async def api_fix_lot(req: Request):
 
 def _with_viewer(req: Request, d: dict) -> dict:
     """在载荷里附上本会话的名下线, 前端据此:
-    1) 渲染「看全部/只看自己」切换  2) 对非名下的线隐掉改账按钮"""
+    1) 渲染「看全部/只看自己」切换  2) 对非名下的线隐掉改账按钮
+    3) viewer_ro: 只读口令(213213 / wzx)隐掉一切改账按钮 —— 后端中间件本来就拦, 这里只是别让人白点"""
     scope = _view_scope(req)
     d["viewer_scope"] = list(scope) if scope is not None else None
+    d["viewer_ro"] = _view_role(req) == "ro"
     return d
 
 
