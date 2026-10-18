@@ -4,9 +4,26 @@ pytest 共享 fixtures
 用法:
   pytest tests/ -v
 """
+import sys
+
 import pytest
 from pathlib import Path
 from pipeline.config import settings
+
+
+@pytest.fixture(autouse=True)
+def _isolate_access_log(tmp_path, monkeypatch):
+    """测试里的 TestClient 请求会经过网页中间件记访问日志; 不隔离就会写进生产的
+    data/live/access_log.jsonl (10-18 在 041 上发现一批 ip=testclient 的记录)。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    try:
+        import access_log
+    except ImportError:
+        return
+    monkeypatch.setattr(access_log, "LOG_PATH", tmp_path / "access_log.jsonl")
+    monkeypatch.setattr(access_log, "STATS_PATH", tmp_path / "access_stats.json")
+    if hasattr(access_log, "_stats_cache"):
+        monkeypatch.setattr(access_log, "_stats_cache", None)
 
 
 @pytest.fixture(scope="session")
