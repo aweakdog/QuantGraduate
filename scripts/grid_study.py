@@ -158,9 +158,10 @@ def g3(etf_codes):
     for code in etf_codes:
         df = load_etf(code)
         p = params_for(code)
-        g_out, _ = run_grid(df, p, capital=1.0, active=in_cash.reindex(df.index).fillna(False),
-                            start=str(idx[0].date()), end=str(idx[-1].date()))
-        always, _ = run_grid(df, p, capital=1.0, start=str(idx[0].date()), end=str(idx[-1].date()))
+        # 资金按 qmt10w 的 10 万算: 最低佣金 5 元是绝对金额, 拿 1 元本金跑会让网格一笔都买不起 (10-22 首跑踩过)
+        act = in_cash.reindex(df.index, fill_value=False).astype(bool)
+        g_out, _ = run_grid(df, p, capital=100000.0, active=act, start=str(idx[0].date()), end=str(idx[-1].date()))
+        always, _ = run_grid(df, p, capital=100000.0, start=str(idx[0].date()), end=str(idx[-1].date()))
         sleeves[code] = {"overlay": g_out["equity"].pct_change().fillna(0.0).reindex(idx).fillna(0.0),
                          "always": always["equity"].pct_change().fillna(0.0).reindex(idx).fillna(0.0)}
     on_sleeve = in_cash | in_cash.shift(1, fill_value=False)       # 离场那天的持有收益也算
@@ -197,14 +198,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True)
     ap.add_argument("--procs", type=int, default=8)
+    ap.add_argument("--only-g3", action="store_true", help="G1/G2 沿用已有结果, 只重跑 G3")
     a = ap.parse_args()
     ROOT = Path(a.root)
-    res = {"primary": PRIMARY.__dict__, "etfs": ETFS}
-    with ProcessPoolExecutor(a.procs, initializer=_init, initargs=(str(ROOT),)) as ex:
-        res["g1"] = list(ex.map(_g1_job, g1_jobs(), chunksize=4))
-        res["g2"] = list(ex.map(_g2_job, g2_jobs(), chunksize=2))
-    res["g3"] = g3(list(ETFS))
     out = ROOT / "summary_grid.json"
+    res = json.loads(out.read_text()) if a.only_g3 and out.exists() else {"primary": PRIMARY.__dict__, "etfs": ETFS}
+    if not a.only_g3:
+        with ProcessPoolExecutor(a.procs, initializer=_init, initargs=(str(ROOT),)) as ex:
+            res["g1"] = list(ex.map(_g1_job, g1_jobs(), chunksize=4))
+            res["g2"] = list(ex.map(_g2_job, g2_jobs(), chunksize=2))
+    res["g3"] = g3(list(ETFS))
     out.write_text(json.dumps(res, ensure_ascii=False, indent=1, default=str))
     print(f"写出 {out}: G1 {len(res['g1'])} 次, G2 {len(res['g2'])} 次, G3 {res['g3'].get('n_seeds')} 种子")
 
