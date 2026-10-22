@@ -183,8 +183,19 @@ def final_snapshot_for(live_dir, date):
 
 
 # ── 对账 ──────────────────────────────────────────────────────────
+# 现金类品种 (10-22 起): 货币 ETF 与国债逆回购只是「停放现金」, 不是策略持仓 ——
+# 不参与持仓对账、不进成交回报, 市值并入账户现金一起报告线外现金。
+CASH_EQUIV = {"511880", "511990", "511660", "511690", "511850", "159001", "159003", "159005"}
+REPO_PREFIXES = ("204", "1318")          # 上交所 GC 系列 204xxx / 深交所 R 系列 1318xx
+
+
 def code6(c):
     return str(c)[:6]
+
+
+def is_cash_equiv(code):
+    c = code6(code)
+    return c in CASH_EQUIV or c.startswith(REPO_PREFIXES)
 
 
 def line_positions(state):
@@ -195,27 +206,35 @@ def line_positions(state):
 
 
 def qmt_positions(snap):
+    """策略口径的券商持仓 (排除现金类品种)。"""
     out = {}
     for p in (snap or {}).get("positions") or []:
         v = int(p.get("volume") or 0)
-        if v > 0:
+        if v > 0 and not is_cash_equiv(p["stock_code"]):
             out[code6(p["stock_code"])] = out.get(code6(p["stock_code"]), 0) + v
     return out
 
 
+def cash_equiv_value(snap):
+    return round(sum(float(p.get("market_value") or 0) for p in (snap or {}).get("positions") or []
+                     if int(p.get("volume") or 0) > 0 and is_cash_equiv(p["stock_code"])), 2)
+
+
 def reconcile(snap, state):
-    """快照 vs 线账本: 持仓逐只比, 现金只报差额(线外现金)。"""
+    """快照 vs 线账本: 持仓逐只比(不含现金类), 现金只报差额(线外现金 = 账户现金 + 现金类市值 - 线现金)。"""
     q, ln = qmt_positions(snap), line_positions(state)
     diffs = [{"code": c, "qmt": q.get(c, 0), "line": ln.get(c, 0)}
              for c in sorted(set(q) | set(ln)) if q.get(c, 0) != ln.get(c, 0)]
     acct_cash = ((snap or {}).get("asset") or {}).get("cash")
     line_cash = (state or {}).get("cash")
+    ceq = cash_equiv_value(snap)
     return {"probe_at": (snap or {}).get("probe_at"), "kind": (snap or {}).get("kind"),
             "account_online": bool((snap or {}).get("account_online")),
             "positions_match": not diffs, "diffs": diffs,
-            "account_cash": acct_cash, "line_cash": None if line_cash is None else round(float(line_cash), 2),
+            "account_cash": acct_cash, "cash_equiv_value": ceq,
+            "line_cash": None if line_cash is None else round(float(line_cash), 2),
             "outside_cash": (None if acct_cash is None or line_cash is None
-                             else round(float(acct_cash) - float(line_cash), 2))}
+                             else round(float(acct_cash) + ceq - float(line_cash), 2))}
 
 
 # ── 人工确认闸门 ──────────────────────────────────────────────────
@@ -346,6 +365,8 @@ def aggregate_trades(trades, on_date=None):
     """同代码同方向的多笔成交合并成一笔(股数相加, 价格取成交额加权)。返回 (fills, problems)。"""
     agg, probs = {}, []
     for t in trades or []:
+        if is_cash_equiv(t.get("stock_code")):
+            continue                      # 货币 ETF / 逆回购是现金管理, 不是策略成交
         side = {STOCK_BUY: "buy", STOCK_SELL: "sell"}.get(t.get("order_type"))
         if side is None:
             probs.append(f"未知成交类型 order_type={t.get('order_type')} ({t.get('stock_code')})")

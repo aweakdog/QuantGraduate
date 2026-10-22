@@ -9,6 +9,18 @@
 import math
 
 MAIN_BOARD_PREFIXES = ("600", "601", "603", "605", "000", "001", "002", "003")
+# 现金类品种 (10-22): 货币 ETF + 国债逆回购, 只用于停放空仓期现金; 与 041 qmt_sync.CASH_EQUIV 保持一致
+CASH_EQUIV = {"511880", "511990", "511660", "511690", "511850", "159001", "159003", "159005"}
+REPO_PREFIXES = ("204", "1318")
+
+
+def is_cash_equiv(stock_code):
+    c = str(stock_code)
+    return c[:6] in CASH_EQUIV or c.startswith(REPO_PREFIXES)
+
+
+def is_repo(stock_code):
+    return str(stock_code).startswith(REPO_PREFIXES)
 _ALLOWED = frozenset({"start", "connect", "stop", "subscribe", "unsubscribe", "register_callback",
                       "order_stock", "cancel_order_stock"})
 FIX_PRICE = 11          # xtconstant.FIX_PRICE (限价)
@@ -55,12 +67,18 @@ def round_tick(price, tick=0.01, up=False):
 
 def check_order(stock_code, side, volume, price, up_stop, down_stop, max_value):
     """委托前硬检查; 不通过抛 OrderRejectedError (不做任何自动修正)。"""
-    if not is_main_board(stock_code):
-        raise OrderRejectedError(f"{stock_code} 不是主板股票")
+    if not (is_main_board(stock_code) or is_cash_equiv(stock_code)):
+        raise OrderRejectedError(f"{stock_code} 不是主板股票也不是现金类品种")
     if side not in (STOCK_BUY, STOCK_SELL):
         raise OrderRejectedError(f"未知买卖方向 {side}")
     if not isinstance(volume, int) or volume <= 0:
         raise OrderRejectedError(f"{stock_code} 股数必须是正整数")
+    if is_repo(stock_code):
+        if side != STOCK_SELL or volume % 10:
+            raise OrderRejectedError(f"{stock_code} 逆回购只能「卖出」且按 10 张(1000 元)整数倍")
+        if volume * 100 > max_value + 1e-6:
+            raise OrderRejectedError(f"{stock_code} 逆回购 {volume * 100:,} 元超过上限 {max_value:,.0f}")
+        return
     if side == STOCK_BUY and volume % 100:
         raise OrderRejectedError(f"{stock_code} 买入必须整百股 (收到 {volume})")
     if not (up_stop and down_stop and down_stop < up_stop):

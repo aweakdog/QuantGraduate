@@ -262,6 +262,21 @@ def test_alert_main_gets_details_email_gets_summary_each_recorded(tmp_path, monk
     assert alert_once(tmp_path, "2026-10-14:morning:offline", "离线") is False    # 同 key 不重发
 
 
+def test_cash_equivalents_are_cash_not_strategy_positions():
+    from qmt_sync import aggregate_trades, build_autoconfirm, is_cash_equiv, reconcile
+    assert is_cash_equiv("511880.SH") and is_cash_equiv("204001.SH") and is_cash_equiv("131810.SZ")
+    assert not is_cash_equiv("600000.SH") and not is_cash_equiv("510300.SH")
+    s = snap(positions=[("511880.SH", 100)], cash=93000.0,
+             trades=[("511880.SH", 23, 100, 100.903), ("511880.SH", 24, 100, 100.902), ("204001.SH", 24, 10, 1.09)])
+    s["positions"][0]["market_value"] = 10090.3
+    r = reconcile(s, state())
+    assert r["positions_match"] is True and r["cash_equiv_value"] == 10090.3
+    assert r["outside_cash"] == round(93000.0 + 10090.3 - 100000.0, 2)
+    assert aggregate_trades(s["trades"]) == ([], [])
+    fills, probs, notes = build_autoconfirm(s, state(), {"buy": []}, D)
+    assert (fills, probs) == ([], [])                      # 当晚自动确认不会因现金管理被拦
+
+
 def test_sign_is_stable_across_processes():
     # Windows 侧用同一算法: HMAC-SHA256(key, ts + "\n" + body)
     import hashlib

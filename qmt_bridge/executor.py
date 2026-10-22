@@ -32,6 +32,7 @@ from .trading import (
     TERMINAL,
     OrderRejectedError,
     TradingTrader,
+    is_cash_equiv,
     place_limit,
     round_tick,
     to_xt_code,
@@ -102,8 +103,11 @@ def plan_buys(ticket, quotes, cash):
 
 
 def positions_of(raw_positions):
+    """策略口径持仓: 排除货币 ETF / 逆回购 (现金类, 与 041 对账口径一致)。"""
     out = {}
     for p in raw_positions or []:
+        if is_cash_equiv(getattr(p, "stock_code", "")):
+            continue
         c = str(getattr(p, "stock_code", ""))[:6]
         v, cu = int(getattr(p, "volume", 0) or 0), int(getattr(p, "can_use_volume", 0) or 0)
         if v > 0:

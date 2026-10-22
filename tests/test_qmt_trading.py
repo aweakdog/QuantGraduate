@@ -51,6 +51,31 @@ def test_check_order_rejects_everything_suspicious():
     check_order(**{**ok, "side": STOCK_SELL, "volume": 150})          # 卖出零股允许(部分成交剩余)
 
 
+def test_cash_equivalents_allowed_with_their_own_rules():
+    # 货币 ETF: 按普通 ETF 规则 (买入整百)
+    check_order("511880.SH", STOCK_BUY, 100, 100.903, 110.982, 90.804, 11000)
+    with pytest.raises(OrderRejectedError):
+        check_order("511880.SH", STOCK_BUY, 100, 100.903, 110.982, 90.804, 5000)      # 超单笔上限
+    # 逆回购: 只能卖出, 10 张(1000 元)整数倍, 金额按面值算上限; 价格是年化利率
+    check_order("204001.SH", STOCK_SELL, 10, 1.09, 100000.0, 0.0, 1000)
+    for bad in (dict(side=STOCK_BUY), dict(volume=15), dict(max_value=500)):
+        kw = dict(stock_code="204001.SH", side=STOCK_SELL, volume=10, price=1.09, up_stop=100000.0, down_stop=0.0, max_value=1000)
+        with pytest.raises(OrderRejectedError):
+            check_order(**{**kw, **bad})
+    with pytest.raises(OrderRejectedError):
+        check_order("510300.SH", STOCK_BUY, 100, 4.0, 4.4, 3.6, 5000)                 # 普通 ETF 仍不在白名单
+
+
+def test_executor_positions_ignore_cash_equivalents():
+    from types import SimpleNamespace
+
+    from qmt_bridge.executor import positions_of
+    raw = [SimpleNamespace(stock_code="511880.SH", volume=100, can_use_volume=100),
+           SimpleNamespace(stock_code="204001.SH", volume=10, can_use_volume=0),
+           SimpleNamespace(stock_code="600000.SH", volume=300, can_use_volume=300)]
+    assert positions_of(raw) == {"600000": {"volume": 300, "can_use": 300}}
+
+
 def test_place_limit_requires_trading_wrapper_and_checks_first():
     raw = Fake()
     with pytest.raises(PermissionError):
