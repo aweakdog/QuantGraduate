@@ -19,7 +19,15 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from .readonly_probe import DEFAULT_USERDATA, ReadOnlyTrader, collect, connect_with_timeout, mask
+from .readonly_probe import (
+    ACCOUNT_STATUS_NAME,
+    DEFAULT_USERDATA,
+    ReadOnlyTrader,
+    account_status,
+    collect,
+    connect_with_timeout,
+    mask,
+)
 
 DEFAULT_URL = "http://eez041.ece.ust.hk:8737/api/qmt/snapshot"
 DEFAULT_KEY = r"D:\qmtcode\bridge.key"
@@ -52,9 +60,15 @@ def take_snapshot(kind, userdata=DEFAULT_USERDATA, timeout=20.0):
         return {**base, "probe_at": datetime.now().isoformat(timespec="seconds"), "account_online": False,
                 "error": "已连上 miniQMT 但资金账号未挂上 (需在柜台开放后重新登录)"}, trader
     account = StockAccount(str(stock[0].account_id), "STOCK")
+    status = account_status(trader, stock[0].account_id)
     snap = collect(trader, account, masked=True)
-    return {**base, "probe_at": datetime.now().isoformat(timespec="seconds"), "account_online": True,
-            "account": mask(stock[0].account_id), **snap}, trader
+    out = {**base, "probe_at": datetime.now().isoformat(timespec="seconds"), "account_online": status == 0,
+           "account_status": status, "account": mask(stock[0].account_id), **snap}
+    if status != 0:
+        # 能查到的只是缓存, 成交/持仓可能是旧的, 也下不了单 -> 按离线处理(触发告警, 自动确认不拿它当收盘快照)
+        out["error"] = (f"交易账户状态 {status}({ACCOUNT_STATUS_NAME.get(status, '未知')}): 只能查到缓存, 下不了单; "
+                        "请在 QMT 里重新登录交易账户")
+    return out, trader
 
 
 def push(snap, url, key, timeout=20.0, opener=urllib.request.urlopen):

@@ -123,6 +123,28 @@ def test_unfilled_sell_is_cancelled_and_moved_to_auction():
     assert rep["status"] == "done"
 
 
+def test_account_not_ready_blocks_live_and_timeout_halts_rest():
+    raw = FakeRaw(positions=[("000001.SZ", 300)])
+    t = ticket(sell=[("000001", 300)], buy=[("600000", 100)], lots=[("000001", 300)])
+    rep = run(t, True, TradingTrader(raw), "acc", lambda c: Q, FakeClock(), "q10w-1009", account_state=1)
+    assert rep["status"] == "aborted" and "等待登录" in rep["errors"][0] and raw.calls == []
+    # 第一笔委托无回执 -> 之后一笔都不再下
+    import qmt_bridge.executor as ex
+    from qmt_bridge.trading import OrderTimeoutError
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(a[2])
+        raise OrderTimeoutError("000001.SZ 下单请求 10 秒无回执")
+    orig = ex.place_limit
+    ex.place_limit = boom
+    try:
+        rep = run(t, True, TradingTrader(FakeRaw(positions=[("000001.SZ", 300)])), "acc", lambda c: Q, FakeClock(), "q10w-1009")
+    finally:
+        ex.place_limit = orig
+    assert calls == ["000001.SZ"] and any("无回执" in e for e in rep["errors"]) and any("已停止后续下单" in e for e in rep["errors"])
+
+
 def test_guards_mismatch_duplicate_late():
     t = ticket(buy=[("600000", 100)], lots=[("000001", 300)])
     rep = run(t, True, TradingTrader(FakeRaw(positions=[])), "acc", lambda c: Q, FakeClock(), "q10w-1009")

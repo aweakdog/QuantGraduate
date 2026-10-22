@@ -89,12 +89,27 @@ def check_order(stock_code, side, volume, price, up_stop, down_stop, max_value):
         raise OrderRejectedError(f"{stock_code} 买入金额 {volume * price:,.2f} 超过单笔上限 {max_value:,.2f}")
 
 
-def place_limit(trader, account, stock_code, side, volume, price, up_stop, down_stop, max_value, remark):
-    """检查通过后下一笔限价单, 返回 order_id (>0)。trader 必须是 TradingTrader。"""
+class OrderTimeoutError(RuntimeError):
+    """下单请求在限时内没有回执。委托可能仍在 QMT 队列里, 调用方必须停止后续下单并人工核对。"""
+
+
+def place_limit(trader, account, stock_code, side, volume, price, up_stop, down_stop, max_value, remark,
+                timeout=10.0):
+    """检查通过后下一笔限价单, 返回 order_id (>0)。trader 必须是 TradingTrader。
+
+    order_stock 是同步调用, 交易账户「等待登录」时会永久阻塞 (10-22 实测), 所以放进线程限时等待。"""
+    import threading
     if not isinstance(trader, TradingTrader):
         raise PermissionError("下单必须经过 TradingTrader")
     check_order(stock_code, side, volume, price, up_stop, down_stop, max_value)
-    oid = trader.order_stock(account, stock_code, side, volume, FIX_PRICE, float(price), "qmt10w", remark)
+    box = {}
+    worker = threading.Thread(daemon=True, target=lambda: box.setdefault(
+        "oid", trader.order_stock(account, stock_code, side, volume, FIX_PRICE, float(price), "qmt10w", remark)))
+    worker.start()
+    worker.join(timeout)
+    if "oid" not in box:
+        raise OrderTimeoutError(f"{stock_code} 下单请求 {timeout:g} 秒无回执 (交易账户未就绪?), 委托状态未知")
+    oid = box["oid"]
     if not oid or oid < 0:
         raise OrderRejectedError(f"{stock_code} 委托失败 (返回 {oid})")
     return oid

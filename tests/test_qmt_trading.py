@@ -76,6 +76,23 @@ def test_executor_positions_ignore_cash_equivalents():
     assert positions_of(raw) == {"600000": {"volume": 300, "can_use": 300}}
 
 
+def test_place_limit_times_out_instead_of_hanging():
+    import time
+
+    from qmt_bridge.trading import OrderTimeoutError
+
+    class Hang(Fake):
+        def __getattr__(self, name):
+            if name == "order_stock":
+                return lambda *a, **k: time.sleep(5)
+            return super().__getattr__(name)
+
+    t0 = time.time()
+    with pytest.raises(OrderTimeoutError):
+        place_limit(TradingTrader(Hang()), "acc", "600000.SH", STOCK_BUY, 100, 10.0, 11.0, 9.0, 5000, "r", timeout=0.3)
+    assert time.time() - t0 < 2
+
+
 def test_place_limit_requires_trading_wrapper_and_checks_first():
     raw = Fake()
     with pytest.raises(PermissionError):

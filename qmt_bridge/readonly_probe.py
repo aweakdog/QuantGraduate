@@ -73,6 +73,21 @@ def pick_stock_account(infos, wanted=None, security_type=2):
     return stock[0]
 
 
+ACCOUNT_STATUS_NAME = {0: "正常", 1: "等待登录", 2: "登录中", 3: "失败", 4: "初始化中", 5: "数据刷新校正中",
+                       6: "收盘后", 7: "穿透副链接断开", 8: "系统停用", 9: "用户停用", -1: "无效"}
+
+
+def account_status(trader, account_id):
+    """交易账户状态 (xtconstant.ACCOUNT_STATUS_*), 0 = 正常。拿不到返回 None。
+
+    10-22 实测: 状态 1「等待登录」时 query_* 照样返回缓存的现金/持仓, 但 order_stock 发出去收不到回执、
+    永久阻塞 —— 只看「账户列表里有它」不够, 下单前和开盘检查都必须看这个状态。"""
+    for s in trader.query_account_status() or []:
+        if str(getattr(s, "account_id", "")) == str(account_id) and getattr(s, "account_type", None) == 2:
+            return getattr(s, "status", None)
+    return None
+
+
 def connect_with_timeout(trader, seconds):
     """connect() 在 QMT 不是极简模式时会无限阻塞(10-06 实测); 超时返回 None。"""
     import threading

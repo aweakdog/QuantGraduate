@@ -12,7 +12,7 @@ import sys
 import time
 from datetime import datetime
 
-from .readonly_probe import DEFAULT_USERDATA, connect_with_timeout, mask
+from .readonly_probe import ACCOUNT_STATUS_NAME, DEFAULT_USERDATA, account_status, connect_with_timeout, mask
 from .trading import STATUS_NAME, STOCK_BUY, STOCK_SELL, TERMINAL, TradingTrader, is_cash_equiv, place_limit
 
 ETF, REPO = "511880.SH", "204001.SH"
@@ -46,6 +46,9 @@ def main(argv=None):
         raise SystemExit("资金账号不在线")
     acc = StockAccount(str(infos[0].account_id), "STOCK")
     t.subscribe(acc)
+    state = account_status(t, infos[0].account_id)
+    if state != 0:
+        raise SystemExit(f"交易账户状态 {state}({ACCOUNT_STATUS_NAME.get(state, '未知')}), 下不了单; 先在 QMT 里重新登录交易账户")
     held = [p for p in (t.query_stock_positions(acc) or []) if int(getattr(p, "volume", 0) or 0) > 0
             and not is_cash_equiv(getattr(p, "stock_code", ""))]
     asset = t.query_stock_asset(acc)
@@ -108,4 +111,10 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    import faulthandler
+    faulthandler.dump_traceback_later(150, exit=True)      # 卡住就打印调用栈并强退, 不再无声挂起
+    try:
+        main()
+    except SystemExit as e:                                 # 正常 raise SystemExit 会等 xtquant 后台线程而挂住
+        print(f"[cash_test] 停止: {e}", flush=True)
+        os._exit(2)

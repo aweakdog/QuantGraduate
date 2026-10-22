@@ -10,8 +10,8 @@ from qmt_bridge import push_snapshot as ps
 
 
 class _FakeRaw:
-    def __init__(self, rc=0, accounts=()):
-        self.rc, self.accounts, self.calls = rc, list(accounts), []
+    def __init__(self, rc=0, accounts=(), status=0):
+        self.rc, self.accounts, self.calls, self.status = rc, list(accounts), [], status
 
     def __getattr__(self, name):
         def f(*a, **k):
@@ -20,6 +20,8 @@ class _FakeRaw:
                 return self.rc
             if name == "query_account_infos":
                 return self.accounts
+            if name == "query_account_status":
+                return [SimpleNamespace(account_type=2, account_id=a.account_id, status=self.status) for a in self.accounts]
             if name == "query_stock_asset":
                 return SimpleNamespace(account_type=2, account_id="1234566735", cash=100000.0,
                                        frozen_cash=0.0, market_value=0.0, total_asset=100000.0)
@@ -91,3 +93,11 @@ def test_push_signs_like_the_server():
     hdr = {k.lower(): v for k, v in req.header_items()}
     assert verify(req.data, hdr["x-qmt-ts"], hdr["x-qmt-sig"], b"k" * 32)[0]
     assert json.loads(req.data)["kind"] == "close"
+
+
+def test_account_waiting_login_counts_as_offline(fake_xt):
+    # 10-22 实测: 状态 1「等待登录」时还能查到缓存余额, 但下不了单 —— 必须按离线报, 触发告警
+    fake_xt(_FakeRaw(accounts=[SimpleNamespace(account_type=2, account_id="1234566735")], status=1))
+    snap, _ = ps.take_snapshot("morning", timeout=2)
+    assert snap["account_online"] is False and snap["account_status"] == 1 and "等待登录" in snap["error"]
+    assert snap["asset"]["cash"] == 100000.0                    # 缓存数据照样带上, 供人工参考

@@ -25,12 +25,13 @@ from datetime import date, datetime
 from pathlib import Path
 
 from .push_snapshot import DEFAULT_KEY, sign
-from .readonly_probe import DEFAULT_USERDATA, ReadOnlyTrader, connect_with_timeout
+from .readonly_probe import DEFAULT_USERDATA, ReadOnlyTrader, account_status, connect_with_timeout
 from .trading import (
     STOCK_BUY,
     STOCK_SELL,
     TERMINAL,
     OrderRejectedError,
+    OrderTimeoutError,
     TradingTrader,
     is_cash_equiv,
     place_limit,
@@ -142,13 +143,17 @@ def quotes_for(xtdata, codes):
     return out
 
 
-def run(ticket, live, trader, account, quote_fn, clock, remark_prefix):
-    """返回回报 dict。live=False 时 trader 只用于查询, 绝不委托。"""
+def run(ticket, live, trader, account, quote_fn, clock, remark_prefix, account_state=0):
+    """返回回报 dict。live=False 时 trader 只用于查询, 绝不委托。account_state: 交易账户状态, 0=正常。"""
     rep = {"today": ticket["today"], "profile": ticket["profile"], "mode": "live" if live else "shadow",
            "signal_date": ticket["signal_date"], "started_at": clock.now().isoformat(timespec="seconds"),
            "orders": [], "skips": [], "errors": [], "status": "aborted"}
     if clock.now().strftime("%H:%M:%S") > T_BUY_LATEST:
         rep["errors"].append(f"启动太晚 ({clock.now():%H:%M:%S}), 今天不下单")
+        return rep
+    if account_state != 0:
+        rep["errors"].append(f"交易账户状态 {account_state} 不是「正常」(1=等待登录): 查询只是缓存、下单收不到回执, 今天不下单;"
+                             " 请在 QMT 里重新登录交易账户")
         return rep
     pos = positions_of(trader.query_stock_positions(account))
     want = {lot["code"]: int(lot["shares"]) for lot in ticket.get("lots") or []}
@@ -164,15 +169,24 @@ def run(ticket, live, trader, account, quote_fn, clock, remark_prefix):
     asset = trader.query_stock_asset(account)
     acct_cash = float(getattr(asset, "cash", 0) or 0)
 
+    halted = {"v": False}
+
     def submit(o):
         if not live:
             o["order_id"] = None
             rep["orders"].append(o)
             return
+        if halted["v"]:
+            rep["errors"].append(f"{o['code']} 未下单: 前面有委托请求无回执, 已停止后续下单")
+            return
         try:
             o["order_id"] = place_limit(trader, account, to_xt_code(o["code"]),
                                         STOCK_SELL if o["side"] == "sell" else STOCK_BUY, o["volume"], o["price"],
                                         o["up"], o["down"], o.get("max_value", 1e12), f"{remark_prefix}-{o['phase'][0].upper()}")
+        except OrderTimeoutError as e:
+            halted["v"] = True
+            rep["errors"].append(f"⚠ {e} —— 请立即在 QMT 里核对委托, 之后不再下单")
+            return
         except (OrderRejectedError, PermissionError) as e:
             rep["errors"].append(f"{o['code']} 委托被拦: {e}")
             return
@@ -291,8 +305,12 @@ def main(argv=None):
         finish({"today": today, "mode": "skipped", "status": "no_account", "problems": ["资金账号不在线"]})
     acc = StockAccount(str(infos[0].account_id), "STOCK")
     trader.subscribe(acc)
+    state = account_status(trader, infos[0].account_id)
     rep = run(ticket, bool(live), trader, acc, lambda codes: quotes_for(xtdata, codes), Clock(),
-              f"q10w-{today[5:7]}{today[8:10]}")
+              f"q10w-{today[5:7]}{today[8:10]}", account_state=state if live else 0)
+    rep["account_state"] = state
+    if not live and state != 0:
+        rep["errors"].append(f"(影子) 交易账户状态 {state} 不是「正常」: 若是实盘, 今天会下不了单")
     rep["keys"] = {"web": bool(ticket.get("trading_enabled")), "local": LOCAL_SWITCH.exists(), "auto": args.auto}
     finish(rep)
 
