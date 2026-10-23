@@ -61,7 +61,8 @@ def healthy(p):
 
 
 def kill_qmt():
-    for name in ("XtMiniQmt.exe", "XtItClient.exe"):
+    # miniquote.exe 也要停: 10-23 升级时它没退出, 锁住 DLL 导致装成半新半旧
+    for name in ("XtMiniQmt.exe", "XtItClient.exe", "miniquote.exe", "XtUpdate.exe"):
         subprocess.run(["taskkill", "/F", "/IM", name], capture_output=True)
 
 

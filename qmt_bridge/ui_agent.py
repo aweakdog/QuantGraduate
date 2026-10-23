@@ -49,7 +49,7 @@ def png_size(png):
     return int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
 
 
-def build_request(png, prompt, model=MODEL, detail="high", max_tokens=1500):
+def build_request(png, prompt, model=MODEL, detail="high", max_tokens=4000):
     return {"model": model, "temperature": 0, "max_tokens": max_tokens, "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"},
             "messages": [{"role": "user", "content": [
@@ -65,14 +65,23 @@ def parse_reply(resp):
     return data
 
 
-def ask(png, prompt, key=None, timeout=60, opener=urllib.request.urlopen):
-    body = json.dumps(build_request(png, prompt)).encode("utf-8")
-    req = urllib.request.Request(API_URL, data=body, headers={"Authorization": "Bearer " + (key or load_key()),
-                                                              "Content-Type": "application/json"})
+def ask(png, prompt, key=None, timeout=60, opener=urllib.request.urlopen, retries=1):
+    """一次视觉问答。回复不是合法 JSON (多半是输出被截断) 时提醒精简后重试一次。"""
+    key = key or load_key()
     t0 = time.time()
-    with opener(req, timeout=timeout) as r:
-        resp = json.load(r)
-    return parse_reply(resp), {"latency_s": round(time.time() - t0, 2), "usage": resp.get("usage", {})}
+    for attempt in range(retries + 1):
+        p = prompt if attempt == 0 else prompt + "\n上次回复不是合法 JSON。请精简内容, 只返回一个完整、合法的 JSON 对象。"
+        body = json.dumps(build_request(png, p)).encode("utf-8")
+        req = urllib.request.Request(API_URL, data=body, headers={"Authorization": "Bearer " + key,
+                                                                  "Content-Type": "application/json"})
+        with opener(req, timeout=timeout) as r:
+            resp = json.load(r)
+        try:
+            return parse_reply(resp), {"latency_s": round(time.time() - t0, 2), "usage": resp.get("usage", {}),
+                                       "attempts": attempt + 1}
+        except json.JSONDecodeError:
+            if attempt == retries:
+                raise
 
 
 def describe(png, **kw):
@@ -207,6 +216,135 @@ def dismiss_dialog(title, button, log=print):
     return not still
 
 
+# ── 普通方式登录 (取消「独立交易」) ──────────────────────────────
+# 登录窗口出现约 5 秒后自动登录, 比一次视觉调用 (3~5 秒) 还快, 所以第一下用相对窗口的固定偏移
+# 先取消「自动登录」让倒计时停下; 之后的勾选状态核对和点击都走 DeepSeek 定位+复核。
+# 偏移量 10-23 从 2.1.31.3 的 624x443 登录窗量出: 记住密码 (198,315) 自动登录 (278,315) 独立交易 (367,315) 登录 (240,346)
+LOGIN_OFFSETS = {"auto_login": (278, 315), "independent": (367, 315)}
+LOGIN_STATE_PROMPT = (
+    "这是 Windows 屏幕截图, 上面应有一个「迅投极速交易终端」登录窗口。只返回 JSON: "
+    "{{login_window (bool), tabs_selected (顶部 行情+交易/交易/行情 哪个页签是选中状态), "
+    "remember_password (bool, 「记住密码」是否勾选), auto_login (bool, 「自动登录」是否勾选), "
+    "independent_trading (bool, 「独立交易」是否勾选), other_dialogs (其他弹窗的标题和文字列表)}}")
+
+
+def find_window(title_part, timeout=15.0, size=None):
+    """按标题找可见窗口, 返回 (hwnd, (left, top, w, h)); size=(w,h) 时要求尺寸大致吻合 (±40px)。"""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.SetProcessDPIAware()
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        found = []
+
+        def cb(h, _, found=found):
+            if u.IsWindowVisible(h):
+                buf = ctypes.create_unicode_buffer(256)
+                u.GetWindowTextW(h, buf, 256)
+                if title_part in buf.value:
+                    r = wintypes.RECT()
+                    u.GetWindowRect(h, ctypes.byref(r))
+                    rect = (r.left, r.top, r.right - r.left, r.bottom - r.top)
+                    if size is None or (abs(rect[2] - size[0]) < 40 and abs(rect[3] - size[1]) < 40):
+                        found.append((h, rect))
+            return True
+        u.EnumWindows(enum_proc(cb), 0)
+        if found:
+            return found[0]
+        time.sleep(0.2)
+    return None, None
+
+
+def checkbox_state(x, y):
+    """勾选框状态: 取中心 12x12 像素平均色。蓝底=checked, 近白=unchecked, 其他 (灰/黑, 窗口还没画完)=unknown。"""
+    from PIL import ImageGrab
+    im = ImageGrab.grab(bbox=(x - 6, y - 6, x + 6, y + 6), all_screens=True).convert("RGB")
+    px = [im.getpixel((i, j)) for i in range(im.width) for j in range(im.height)]
+    r, g, b = (sum(p[i] for p in px) / len(px) for i in range(3))
+    rgb = (round(r), round(g), round(b))
+    if b > 170 and r < 120:
+        return "checked", rgb
+    if min(rgb) > 200:
+        return "unchecked", rgb
+    return "unknown", rgb
+
+
+def toggle_off(hwnd, x, y, log, tries=4, render_wait=4.0):
+    import ctypes
+    u = ctypes.windll.user32
+    t0, clicks = time.time(), 0
+    while True:
+        st, rgb = checkbox_state(x, y)
+        if st == "unchecked":
+            log(f"  checkbox ({x},{y}): unchecked rgb={rgb} after {clicks} click(s)")
+            return True
+        if st == "unknown":
+            if time.time() - t0 > render_wait:
+                log(f"  checkbox ({x},{y}): still not rendered rgb={rgb}")
+                return False
+            time.sleep(0.15)
+            continue
+        if clicks >= tries:
+            log(f"  checkbox ({x},{y}): still checked after {clicks} clicks rgb={rgb}")
+            return False
+        u.ShowWindow(hwnd, 5)
+        u.SetForegroundWindow(hwnd)
+        time.sleep(0.1)
+        click_windows(x, y)
+        clicks += 1
+        time.sleep(0.15)
+        u.SetCursorPos(x - 150, y - 120)          # 移开鼠标再读颜色, 避免悬停高亮干扰
+        time.sleep(0.2)
+
+
+def login_state(log=print):
+    state, meta = ask(screenshot_windows(), LOGIN_STATE_PROMPT)
+    log(f"login state ({meta['latency_s']}s): {state}")
+    return state
+
+
+def login_normal_mode(log=print):
+    """重启 QMT, 在自动登录倒计时期间取消「自动登录」「独立交易」, 再用普通模式点「登录」。不涉及任何交易。"""
+    from .ensure_qmt import kill_qmt, launch_qmt
+    kill_qmt()
+    time.sleep(3)
+    t0 = time.time()
+    launch_qmt()
+    hwnd, rect = find_window("QMT实盘", timeout=20, size=(624, 443))
+    if not hwnd:
+        log("登录窗口 20 秒内没出现")
+        return False
+    # 10-23 连拍: 窗口出现后约 2.4 秒才载入保存的勾选并开始倒计时 (登录(5)...(1)), 约 9 秒后自动登录。
+    # 倒计时开始前点的勾选会被载入的设置覆盖, 所以等倒计时开始后再取消「自动登录」「独立交易」。
+    ax, ay = rect[0] + LOGIN_OFFSETS["auto_login"][0], rect[1] + LOGIN_OFFSETS["auto_login"][1]
+    ix, iy = rect[0] + LOGIN_OFFSETS["independent"][0], rect[1] + LOGIN_OFFSETS["independent"][1]
+    shown = time.time()
+    while time.time() - shown < 6 and checkbox_state(ax, ay)[0] != "checked":
+        time.sleep(0.1)
+    time.sleep(max(0.0, 3.2 - (time.time() - shown)))
+    log(f"登录窗口 {rect} 出现于 {shown - t0:.1f}s; {time.time() - shown:.1f}s 后开始取消勾选")
+    off_auto = toggle_off(hwnd, ax, ay, log)
+    off_ind = toggle_off(hwnd, ix, iy, log)
+    log(f"自动登录已取消={off_auto} 独立交易已取消={off_ind} (窗口出现后 {time.time() - shown:.1f}s)")
+    time.sleep(2.5)
+    st = login_state(log)
+    if not st.get("login_window") or st.get("auto_login") or st.get("independent_trading"):
+        log("勾选状态不对或窗口已不在, 停止")
+        return False
+    loc, ok, trail = locate_verified(screenshot_windows(), "登录窗口里蓝色的「登录」按钮 (不是「脱机」)", "登录")
+    log(f"locate 登录: ok={ok} trail={trail}")
+    if not ok:
+        return False
+    click_windows(loc["x"], loc["y"])
+    log("已点「登录」(普通模式), 等待 30 秒")
+    time.sleep(30)
+    after, meta = describe(screenshot_windows())
+    log(f"登录后屏幕 ({meta['latency_s']}s): {[(w.get('title'), w.get('kind'), str(w.get('text'))[:80]) for w in after.get('windows', [])]}")
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -219,7 +357,11 @@ def main(argv=None):
     di.add_argument("--preset", choices=sorted(PRESETS))
     di.add_argument("--title")
     di.add_argument("--button")
+    sub.add_parser("login-normal", help="重启 QMT 并用普通方式登录 (取消自动登录/独立交易)")
     a = ap.parse_args(argv)
+    if a.cmd == "login-normal":
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] login-normal", flush=True)
+        return 0 if login_normal_mode(log=lambda m: print(m, flush=True)) else 1
     if a.cmd == "dismiss-dialog":
         title, button = PRESETS[a.preset] if a.preset else (a.title, a.button)
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] dismiss-dialog {title}/{button}", flush=True)
