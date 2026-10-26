@@ -159,21 +159,29 @@ def build_snapshot(kind, funds, positions, trades, orders, account_last4, proble
 
 
 def take(kind, log=print):
-    from .ui_agent import login_normal_mode
+    from .ui_agent import ensure_qmt_foreground, login_normal_mode
     from .ui_channel import click_xy_checked, click_xy_verified, read, snap
 
+    # 先恢复/最大化/切前台; 只有确实没有主窗口时才重启登录 (10-26: 最小化被误判为未登录, 白白重启了一次)
+    win_probs = ensure_qmt_foreground(log)
+    if any("找不到 QMT 主窗口" in x for x in win_probs):
+        log("没有 QMT 主窗口, 自动普通方式登录")
+        if not login_normal_mode(log=log):
+            return build_snapshot(kind, {}, [], [], [], None, ["QMT 普通方式登录失败"], {})
+        time.sleep(5)
+        win_probs = ensure_qmt_foreground(log)
+    if win_probs:
+        return build_snapshot(kind, {}, [], [], [], None, win_probs, {})
     st, _ = read("state", "snap_state")
     if not (st.get("logged_in") and st.get("trade_online")):
-        log(f"未登录或交易不在线 ({st}), 自动普通方式登录")
-        if not login_normal_mode(log=log):
-            return build_snapshot(kind, {}, [], [], [], None, ["QMT 普通方式登录失败"], {"state": st})
-        time.sleep(5)
-        st, _ = read("state", "snap_state2")
+        return build_snapshot(kind, {}, [], [], [], None, [f"QMT 未登录或交易不在线: {st}"], {"state": st})
     if st.get("popups"):
         click_xy_checked(1310, 255, "snap_close_notice")       # 华泰信息通知 (只有它会常驻)
-    if "交易" not in str(st.get("page")):
-        click_xy_verified(22, 203, "最左侧竖排导航栏的「交易」", "交易", "snap_nav_trade")
-        time.sleep(1.5)
+    # 每次都点左侧「交易」(幂等), 不信模型报的页面名 (10-26: 「模型交易」含「交易」二字, 误以为已在交易页)
+    nav = click_xy_verified(22, 203, "最左侧竖排导航栏的「交易」", "交易", "snap_nav_trade")
+    if not nav["ok"]:
+        return build_snapshot(kind, {}, [], [], [], None, [f"切到交易页失败 (复核: {nav.get('verify')})"], {"state": st})
+    time.sleep(2.0)
     meta, problems, tables = {"tabs": {}}, [], {}
     for kind_t in ("positions", "trades", "orders"):
         x, y, label = TABS[kind_t]

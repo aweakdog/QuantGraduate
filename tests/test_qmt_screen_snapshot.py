@@ -59,3 +59,41 @@ def test_codes_and_sides():
     assert ss.xt_code("600000") == "600000.SH" and ss.xt_code("000001") == "000001.SZ"
     assert ss.xt_code("300750") == "300750.SZ" and ss.xt_code("511880") == "511880.SH"
     assert ss.side_type("证券买入") == 23 and ss.side_type("卖出") == 24 and ss.side_type("撤单") is None
+
+
+def _patch_ui(monkeypatch, fg_results, login_ok=True):
+    import qmt_bridge.ui_agent as ua
+    import qmt_bridge.ui_channel as uc
+    calls = {"login": 0, "fg": 0}
+    seq = iter(fg_results)
+
+    def fg(log=print):
+        calls["fg"] += 1
+        return next(seq)
+
+    def login(log=print):
+        calls["login"] += 1
+        return login_ok
+    monkeypatch.setattr(ua, "ensure_qmt_foreground", fg)
+    monkeypatch.setattr(ua, "login_normal_mode", login)
+    monkeypatch.setattr(uc, "read", lambda kind, step=None: ({"logged_in": False, "trade_online": False}, {}))
+    monkeypatch.setattr(ss.time, "sleep", lambda s: None)
+    return calls
+
+
+def test_minimized_window_is_restored_not_relogged(monkeypatch):
+    calls = _patch_ui(monkeypatch, [[]])                     # 主窗口在 (哪怕刚被最小化, 恢复后没问题)
+    snap = ss.take("close", log=lambda m: None)
+    assert calls["login"] == 0 and snap["account_online"] is False   # 后面 read 说未登录 -> 离线, 但不重启登录
+
+
+def test_missing_window_triggers_login_once(monkeypatch):
+    calls = _patch_ui(monkeypatch, [["找不到 QMT 主窗口 (未登录或已退出)"], ["QMT 主窗口没能切到最前"]])
+    snap = ss.take("close", log=lambda m: None)
+    assert calls["login"] == 1 and snap["account_online"] is False and "切到最前" in snap["error"]
+
+
+def test_wrong_resolution_goes_offline_without_clicking(monkeypatch):
+    calls = _patch_ui(monkeypatch, [["屏幕分辨率是 1280x720, 读屏坐标按 1920x1080 量的"]])
+    snap = ss.take("close", log=lambda m: None)
+    assert calls["login"] == 0 and snap["account_online"] is False and "分辨率" in snap["error"]

@@ -299,6 +299,59 @@ def toggle_off(hwnd, x, y, log, tries=4, render_wait=4.0):
         time.sleep(0.2)
 
 
+EXPECTED_SCREEN = (1920, 1080)        # 读屏坐标都是按这个分辨率量的
+
+
+def ensure_qmt_foreground(log=print):
+    """找 QMT 主窗口 (不是 624x443 的登录框): 最小化就恢复, 没最大化就最大化, 切到最前,
+    再核对它铺满屏幕、分辨率仍是 1920x1080。返回问题列表 (空 = 可以读屏/点击)。"""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.SetProcessDPIAware()
+    screen = (u.GetSystemMetrics(0), u.GetSystemMetrics(1))
+    if screen != EXPECTED_SCREEN:
+        return [f"屏幕分辨率是 {screen[0]}x{screen[1]}, 读屏坐标按 {EXPECTED_SCREEN[0]}x{EXPECTED_SCREEN[1]} 量的"]
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    found = []
+
+    def cb(h, _):
+        buf = ctypes.create_unicode_buffer(256)
+        u.GetWindowTextW(h, buf, 256)
+        if "QMT实盘" in buf.value and u.IsWindowVisible(h):
+            r = wintypes.RECT()
+            u.GetWindowRect(h, ctypes.byref(r))
+            if u.IsIconic(h) or (r.right - r.left) > 900:           # 主窗口 (登录框只有 624 宽)
+                found.append(h)
+        return True
+    u.EnumWindows(enum_proc(cb), 0)
+    if not found:
+        return ["找不到 QMT 主窗口 (未登录或已退出)"]
+    h = found[0]
+    if u.IsIconic(h):
+        u.ShowWindow(h, 9)                                       # SW_RESTORE
+        time.sleep(0.5)
+    if not u.IsZoomed(h):
+        u.ShowWindow(h, 3)                                       # SW_MAXIMIZE
+        time.sleep(0.8)
+    u.keybd_event(0x12, 0, 0, 0)                                 # 按一下 Alt, 解除前台锁再切前台
+    u.keybd_event(0x12, 0, 2, 0)
+    u.SetForegroundWindow(h)
+    time.sleep(0.6)
+    r = wintypes.RECT()
+    u.GetWindowRect(h, ctypes.byref(r))
+    probs = []
+    if not u.IsZoomed(h):
+        probs.append("QMT 主窗口最大化失败")
+    if r.left > 0 or r.top > 0 or r.right < screen[0] or r.bottom < screen[1] - 80:   # 任务栏约占 40~60px
+        probs.append(f"QMT 主窗口没铺满屏幕: {(r.left, r.top, r.right, r.bottom)}")
+    if u.GetForegroundWindow() != h:
+        probs.append("QMT 主窗口没能切到最前 (可能被别的窗口挡住)")
+    log(f"QMT 主窗口: rect={(r.left, r.top, r.right, r.bottom)} maximized={bool(u.IsZoomed(h))} "
+        f"foreground={u.GetForegroundWindow() == h} problems={probs}")
+    return probs
+
+
 def login_state(log=print):
     state, meta = ask(screenshot_windows(), LOGIN_STATE_PROMPT)
     log(f"login state ({meta['latency_s']}s): {state}")
