@@ -158,6 +158,33 @@ def tick_arrival_check(now=None, proc_dir=None, live_dir=LIVE, days=None, send=N
     return missing
 
 
+def qmt_snapshot_check(now=None, live_dir=LIVE, days=None, send=None):
+    """Windows 读屏快照到货检查 (随 13:05 / 17:05 的 --tick 一起跑): 13:05 应有今天的开盘快照,
+    17:05 应有收盘快照。读屏程序崩溃/电脑关机/断网/计划任务没跑时, Windows 什么都推不过来, 只能在这边发现。
+    只看「有没有收到」; 收到但离线的, 快照接口当场就按原因报过警了。返回缺的类别列表。"""
+    now = now or datetime.now()
+    today = now.date()
+    if days is None:
+        import trading_calendar
+        days, _ = trading_calendar.load()
+    if not days or today not in set(days):
+        return []
+    from qmt_sync import QMT_LINES
+    if not QMT_LINES:
+        return []
+    want = ["morning"] + (["close"] if now.strftime("%H:%M") >= "16:00" else [])
+    qdir = Path(live_dir) / "qmt"
+    missing = [k for k in want if not list(qdir.glob(f"snap_{today:%Y%m%d}_*_{k}.json"))]
+    cn = {"morning": "开盘(9:36)", "close": "收盘(15:12/15:42)"}
+    for k in missing:
+        _alert(live_dir, f"{today}:ops:qmt_snap_missing_{k}",
+               f"【QMT】{today} {now:%H:%M} 没收到 Windows 的{cn[k]}读屏快照。可能是那台电脑关机/断网、"
+               "计划任务 QuantQMT\\ScreenSnap* 没跑、或读屏程序在推送前崩溃。查 D:\\qmtcode\\logs\\screen_snapshot.log。",
+               f"【QMT】{today:%m-%d} 没收到 Windows 的{cn[k]}读屏快照, 当天对账/自动确认可能停下, 请检查那台电脑。",
+               send)
+    return missing
+
+
 def _alert(live_dir, key, text, email_text, send=None):
     from qmt_sync import alert_once
     return alert_once(live_dir, key, text, send=send, email_text=email_text)
@@ -251,7 +278,8 @@ def main(argv=None):
     if args.deadline:
         print(f"[{datetime.now():%F %T}] deadline: {deadline_check()} services_down: {service_check()}")
     if args.tick:
-        print(f"[{datetime.now():%F %T}] tick panels missing: {tick_arrival_check()}")
+        print(f"[{datetime.now():%F %T}] tick panels missing: {tick_arrival_check()} "
+              f"qmt snapshots missing: {qmt_snapshot_check()}")
     return 0
 
 

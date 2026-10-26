@@ -1765,10 +1765,14 @@ async def api_qmt_snapshot(req: Request):
     path = qmt_sync.store_snapshot(snap, LIVE_DIR)
     day = str(snap["probe_at"])[:10]
     rec = {pid: qmt_sync.reconcile(snap, st) for pid in qmt_sync.QMT_LINES if (st := _state_of(pid)) is not None}
+    for note in snap.get("notes") or []:            # 例: QMT 客户端自动升级 —— 界面可能变, 提醒一次
+        qmt_sync.alert_once(LIVE_DIR, f"{day}:qmt_note:{note}", f"【QMT】{day} {note}。读屏如因此出错会另行告警。",
+                            email_text=f"【QMT】{day[5:]} {note}, 读屏如因此出错会另行告警。")
     if not snap.get("account_online"):
-        _qmt_alert(f"{day}:{snap['kind']}:offline",
-                   f"【QMT】{day} {snap['kind']} 检查: 资金账号未在线 ({snap.get('error') or '无账户'})。"
-                   "请在柜台开放后重新登录 QMT 再切极简模式, 否则当天读不到成交、无法自动对账。")
+        ek = snap.get("error_kind")
+        _qmt_alert(f"{day}:{snap['kind']}:offline" + (f":{ek}" if ek else ""),
+                   f"【QMT】{day} {snap['kind']} 检查未通过 ({snap.get('error') or '无账户'})。"
+                   "当天读不到可信的成交, 自动确认会停下等人工。")
     elif snap["kind"] == "close":
         for pid, r in rec.items():
             if not r["positions_match"]:

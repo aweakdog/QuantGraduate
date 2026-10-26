@@ -131,6 +131,41 @@ def checks(funds, positions, trades, orders):
     return probs
 
 
+ERROR_KINDS = (  # (类别, 判断关键词) —— 按顺序匹配, 给 041 的邮件挑一句人话
+    ("exception", ("读屏程序异常",)),
+    ("login", ("登录失败", "未登录", "交易不在线")),
+    ("window", ("分辨率", "主窗口")),
+    ("layout", ("页签失败", "交易页失败")),
+    ("read", ("不一致", "≠", "读数不全", "异常:", "大于委托量")),
+)
+
+
+def classify(problems):
+    text = " ".join(problems or [])
+    return next((k for k, words in ERROR_KINDS if any(w in text for w in words)), "other") if problems else None
+
+
+def qmt_version(root=None):
+    """QMT 客户端版本 (resource/version 第一行); 读不到返回 None。"""
+    try:
+        root = root or next(p for p in Path("D:/").iterdir() if (p / "bin.x64" / "XtItClient.exe").exists())
+        line = (Path(root) / "resource" / "version").read_text(encoding="utf-8", errors="ignore").splitlines()[0]
+        return line.split(":", 1)[1].strip()
+    except (StopIteration, OSError, IndexError):
+        return None
+
+
+def version_note(current, seen_file=Path(r"D:\qmtcode\qmt_version_seen.txt")):
+    """QMT 自动升级后提醒一次 (界面可能变)。返回提示文字或 None, 并记下新版本。"""
+    if not current:
+        return None
+    old = seen_file.read_text(encoding="utf-8").strip() if seen_file.exists() else None
+    if old == current:
+        return None
+    seen_file.write_text(current, encoding="utf-8")
+    return None if old is None else f"QMT 客户端版本 {old} -> {current}"
+
+
 def build_snapshot(kind, funds, positions, trades, orders, account_last4, problems, meta):
     masked = "********" + str(account_last4 or "????")[-4:]
     snap = {"kind": kind, "host": os.environ.get("COMPUTERNAME", ""), "probe_at": datetime.now().isoformat(timespec="seconds"),
@@ -155,6 +190,7 @@ def build_snapshot(kind, funds, positions, trades, orders, account_last4, proble
                         "strategy_name": "", "order_remark": ""} for t in trades]}
     if problems:
         snap["error"] = "读屏核对不一致, 按离线处理: " + "; ".join(problems)[:600]
+        snap["error_kind"] = classify(problems)
     return snap
 
 
@@ -216,9 +252,16 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     t0 = time.time()
-    snap_ = take(a.kind, log=lambda m: print(m, flush=True))
+    try:
+        snap_ = take(a.kind, log=lambda m: print(m, flush=True))
+    except Exception as e:  # noqa: BLE001 —— 程序崩了也要推一份离线快照, 让 041 带着原因报警
+        snap_ = build_snapshot(a.kind, {}, [], [], [], None, [f"读屏程序异常: {type(e).__name__}: {str(e)[:200]}"], {})
+    snap_["qmt_version"] = qmt_version()
+    note = version_note(snap_["qmt_version"])
+    if note:
+        snap_["notes"] = [note]
     out_dir = Path(__file__).resolve().parents[1] / "snapshots"
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"snap_{snap_['probe_at'].replace(':', '').replace('-', '')}_{a.kind}_screen.json").write_text(
         json.dumps(snap_, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     line = (f"[{datetime.now():%Y-%m-%d %H:%M:%S}] screen kind={a.kind} online={snap_['account_online']} "

@@ -283,3 +283,12 @@ def test_sign_is_stable_across_processes():
     import hmac
     ts = str(int(time.time()))
     assert sign(b"x", ts, KEY) == hmac.new(KEY, ts.encode() + b"\nx", hashlib.sha256).hexdigest()
+
+
+def test_email_summary_explains_screen_failures_without_trade_details():
+    from qmt_sync import email_summary
+    s = email_summary("2026-10-26:close:offline:layout")
+    assert "收盘检查" in s and "界面可能变了" in s and "极简模式" not in s
+    assert "DeepSeek" in email_summary("2026-10-26:morning:offline:exception")
+    assert "人工登录" in email_summary("2026-10-26:morning:offline:login")
+    assert "资金账号离线" in email_summary("2026-10-26:morning:offline")          # 旧格式 (无类别) 仍可用

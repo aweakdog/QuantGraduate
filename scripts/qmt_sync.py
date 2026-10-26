@@ -60,6 +60,15 @@ def load_key(path=None):
 
 SITE_URL = "http://eez041.ece.ust.hk:8737"
 _KIND_TEXT = {"morning": "开盘检查", "close": "收盘检查", "manual": "手动检查"}
+# 读屏快照 (10-26 起) 离线时带 error_kind, 邮件按类别说人话 (不含任何交易细节)
+OFFLINE_REASON = {
+    "layout": "读屏失败, QMT 界面可能变了 (客户端升级或新弹窗)。今天的对账和自动确认暂停, 需要人工看一下。",
+    "read": "读屏结果前后不一致或数字对不上, 已按离线处理, 今天不会用它自动记账。",
+    "window": "QMT 窗口状态不对 (分辨率变了/被挡住/没能最大化), 读屏暂停。",
+    "login": "QMT 未登录或交易不在线, 自动登录也没成功, 需要人工登录。",
+    "exception": "读屏程序出错 (可能是 DeepSeek 接口或网络问题), 今天的对账暂停。",
+    "other": "读屏没通过检查, 已按离线处理。",
+}
 
 
 def email_summary(key, text=""):
@@ -70,7 +79,8 @@ def email_summary(key, text=""):
     day, kind = (parts + ["", ""])[:2]
     md = day[5:] if len(day) >= 10 else day
     if kind in _KIND_TEXT and parts[2:3] == ["offline"]:
-        line = f"【QMT】{md} {_KIND_TEXT[kind]}: 资金账号离线, 请检查 QMT 是否已登录(极简模式)。"
+        why = OFFLINE_REASON.get(parts[3] if len(parts) > 3 else "", "资金账号离线, 请检查 QMT 是否已登录。")
+        line = f"【QMT】{md} {_KIND_TEXT[kind]}: {why}"
     elif kind == "close" and parts[2:3] == ["mismatch"]:
         line = f"【QMT】{md} 收盘对账: 持仓与券商不一致, 自动确认会停下等人工核对。"
     elif kind == "autoconfirm_ok":

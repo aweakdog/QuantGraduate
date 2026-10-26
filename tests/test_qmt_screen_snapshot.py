@@ -97,3 +97,33 @@ def test_wrong_resolution_goes_offline_without_clicking(monkeypatch):
     calls = _patch_ui(monkeypatch, [["屏幕分辨率是 1280x720, 读屏坐标按 1920x1080 量的"]])
     snap = ss.take("close", log=lambda m: None)
     assert calls["login"] == 0 and snap["account_online"] is False and "分辨率" in snap["error"]
+
+
+def test_classify_picks_a_reason_for_the_email():
+    assert ss.classify([]) is None
+    assert ss.classify(["切换「持仓」页签失败 (复核: ...)"]) == "layout"
+    assert ss.classify(["「成交」表多次读数不一致"]) == "read"
+    assert ss.classify(["屏幕分辨率是 1280x720, 读屏坐标按 1920x1080 量的"]) == "window"
+    assert ss.classify(["QMT 普通方式登录失败"]) == "login"
+    assert ss.classify(["读屏程序异常: HTTPError: 401"]) == "exception"
+
+
+def test_version_note_once_per_change(tmp_path):
+    f = tmp_path / "seen.txt"
+    assert ss.version_note("2.1.31.3", f) is None                        # 第一次只记下, 不报
+    assert ss.version_note("2.1.31.3", f) is None
+    assert ss.version_note("2.1.32.0", f) == "QMT 客户端版本 2.1.31.3 -> 2.1.32.0"
+    assert ss.version_note("2.1.32.0", f) is None
+
+
+def test_crash_still_pushes_offline_snapshot(monkeypatch, tmp_path):
+    pushed = []
+    monkeypatch.setattr(ss, "take", lambda kind, log=print: (_ for _ in ()).throw(RuntimeError("DeepSeek 429")))
+    monkeypatch.setattr(ss, "push", lambda snap, url, key: pushed.append(snap) or (200, "{}"))
+    monkeypatch.setattr(ss, "qmt_version", lambda root=None: None)
+    key = tmp_path / "k"
+    key.write_text("x")
+    monkeypatch.setattr(ss.Path, "resolve", lambda self: tmp_path / "a" / "b" / "c.py")
+    assert ss.main(["--kind", "close", "--key-file", str(key)]) == 0
+    snap = pushed[0]
+    assert snap["account_online"] is False and snap["error_kind"] == "exception" and "DeepSeek 429" in snap["error"]

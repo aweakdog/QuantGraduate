@@ -138,3 +138,28 @@ def test_deadline_check(tmp_path):
     with (tmp_path / ow.RUNS).open("a") as fh:
         fh.write(json.dumps(ow.summarize_run(status())) + "\n")
     assert ow.deadline_check(late, tmp_path, is_trading=True, send=send) is None         # 有一次成功推进到当天
+
+
+def test_qmt_snapshot_check(tmp_path, monkeypatch):
+    from datetime import date
+
+    import qmt_sync
+    monkeypatch.setattr(qmt_sync, "QMT_LINES", {"qmt10w"})
+    days = [date(2026, 10, 23), date(2026, 10, 26)]
+    sent = []
+    send = lambda t: sent.append(t) or True  # noqa: E731
+    q = tmp_path / "qmt"
+    q.mkdir()
+    noon = datetime.fromisoformat("2026-10-26T13:05:00")
+    assert ow.qmt_snapshot_check(noon, tmp_path, days, send) == ["morning"] and "开盘" in sent[-1]
+    (q / "snap_20261026_093612_morning.json").write_text("{}")
+    assert ow.qmt_snapshot_check(noon, tmp_path, days, send) == []                         # 13:05 只要开盘那份
+    eve = datetime.fromisoformat("2026-10-26T17:05:00")
+    assert ow.qmt_snapshot_check(eve, tmp_path, days, send) == ["close"] and "收盘" in sent[-1]
+    (q / "snap_20261026_151231_close.json").write_text("{}")
+    assert ow.qmt_snapshot_check(eve, tmp_path, days, send) == []
+    assert ow.qmt_snapshot_check(datetime.fromisoformat("2026-10-25T17:05:00"), tmp_path, days, send) == []  # 周日
+    n = len(sent)
+    (q / "snap_20261026_151231_close.json").unlink()
+    ow.qmt_snapshot_check(eve, tmp_path, days, send)
+    assert len(sent) == n                                                                  # 同一天同一类只报一次

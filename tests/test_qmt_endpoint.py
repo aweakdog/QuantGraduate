@@ -164,3 +164,15 @@ def test_build_today_hides_manual_confirm_when_gate_closed(tmp_path, monkeypatch
 def _view_token(ws, code):
     exp = int(time.time()) + 3600
     return f"{exp}.c.{ws._code_id(code)}.{ws._view_sign_code(exp, code)}"
+
+
+def test_screen_snapshot_offline_reason_and_version_note(client, monkeypatch):
+    import web_server as ws
+    notes = []
+    monkeypatch.setattr(ws.qmt_sync, "alert_once", lambda live, key, text, **kw: notes.append((key, kw.get("email_text"))) or True)
+    snap = _snap(kind="close", probe_at="2026-10-26T15:12:31", account_online=False, source="screen",
+                 error="读屏核对不一致, 按离线处理: 切换「持仓」页签失败", error_kind="layout",
+                 notes=["QMT 客户端版本 2.1.31.3 -> 2.1.32.0"])
+    assert _post(client, snap).status_code == 200
+    assert client.alerts[-1][0] == "2026-10-26:close:offline:layout" and "页签失败" in client.alerts[-1][1]
+    assert notes and "2.1.32.0" in notes[0][0] and "2.1.32.0" in notes[0][1]
