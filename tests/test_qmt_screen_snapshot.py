@@ -58,6 +58,7 @@ def test_any_problem_means_offline_so_ledger_is_never_written_from_bad_reads():
 def test_codes_and_sides():
     assert ss.xt_code("600000") == "600000.SH" and ss.xt_code("000001") == "000001.SZ"
     assert ss.xt_code("300750") == "300750.SZ" and ss.xt_code("511880") == "511880.SH"
+    assert ss.xt_code("204001") == "204001.SH" and ss.xt_code("131810") == "131810.SZ"     # 沪/深逆回购
     assert ss.side_type("证券买入") == 23 and ss.side_type("卖出") == 24 and ss.side_type("撤单") is None
 
 
@@ -132,3 +133,20 @@ def test_crash_still_pushes_offline_snapshot(monkeypatch, tmp_path):
 def test_wrong_account_or_page_is_layout_problem():
     assert ss.classify(["资金表账号尾号 None 不是预期的 6735 (可能停在别的页签)"]) == "layout"
     assert ss.classify(["切到「股票交易」页签失败 (复核: ...)"]) == "layout"
+
+
+def test_reverse_repo_rows_pass_checks_and_are_cash_for_041():
+    funds = {"total_asset": 503121.79, "available": 502121.79, "frozen": 0.0, "market_value": 1000.0}
+    pos = [{"code": "888880", "name": "新标准券", "volume": 10, "can_use": 0, "cost": 0.0, "market_value": 1000.0}]
+    trades = [{"time": "11:08:41", "code": "204001", "side": "通用回购逆回购", "price": 1.145, "volume": 10, "amount": 1000.0,
+               "order_id": "30354"}]
+    orders = [{"time": "11:08:41", "code": "204001", "side": "通用回购逆回购", "price": 1.1, "volume": 10, "traded_volume": 10,
+               "status": "已成", "order_id": "30354"}]
+    assert ss.checks(funds, pos, trades, orders) == []                     # 10-27 实测这里报过「成交行不全」
+    assert ss.checks(funds, pos, [{**trades[0], "amount": 10000.0}], orders)   # 张数×100 对不上仍要拦
+    snap = ss.build_snapshot("close", funds, pos, trades, orders, "6735", [], {})
+    assert snap["positions"][0]["stock_code"] == "888880.SH" and snap["trades"][0]["order_type"] == 24
+    from qmt_sync import aggregate_trades, qmt_positions, reconcile
+    assert qmt_positions(snap) == {} and aggregate_trades(snap["trades"]) == ([], [])
+    r = reconcile(snap, {"cash": 100000.0, "lots": []})
+    assert r["positions_match"] is True and r["outside_cash"] == round(502121.79 + 1000.0 - 100000.0, 2)

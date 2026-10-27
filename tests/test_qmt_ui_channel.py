@@ -80,3 +80,37 @@ def test_fixed_point_click_still_needs_verification(monkeypatch):
     monkeypatch.setattr(ch, "click_windows", lambda x, y: clicked.append((x, y)))
     monkeypatch.setattr(ch, "verify_point", lambda *a, **k: (False, {"under_cross": "反选", "is_target": False}))
     assert ch.click_xy_verified(1096, 499, "选中撤单", "撤单", "t")["ok"] is False and clicked == []
+
+
+def test_repo_guard_only_gc001_10_lots_at_or_below_bid():
+    ok = ch.parse_expect("204001:SELL:1.105:10")
+    assert ch.guard_repo_order(ok, 1.105)[0]
+    assert ch.guard_repo_order(ch.parse_expect("204001:SELL:1.0:10"), 1.105)[0]          # 低于买一也能立即成交
+    assert not ch.guard_repo_order(ch.parse_expect("204001:SELL:1.11:10"), 1.105)[0]     # 高于买一: 挂着不成交
+    assert not ch.guard_repo_order(ch.parse_expect("204001:SELL:0.5:10"), 1.105)[0]      # 偏离太远: 多半填错
+    assert not ch.guard_repo_order(ch.parse_expect("204001:SELL:1.105:100"), 1.105)[0]   # 不是 10 张
+    assert not ch.guard_repo_order(ch.parse_expect("204001:BUY:1.105:10"), 1.105)[0]     # 买入 = 借钱 (正回购)
+    assert not ch.guard_repo_order(ch.parse_expect("600000:SELL:1.105:10"), 1.105)[0]
+    assert not ch.guard_repo_order(ok, None)[0]
+
+
+def test_submit_sell_repo_refuses_before_clicking(monkeypatch):
+    clicked = []
+    monkeypatch.setattr(ch, "side_by_button", lambda: ("买入", {}))
+    monkeypatch.setattr(ch, "in_session", lambda now=None: True)
+    assert ch.submit_sell_repo(ch.parse_expect("204001:SELL:1.105:10"), 1.105)["ok"] is False   # 按钮是橙色 (买入)
+    monkeypatch.setattr(ch, "side_by_button", lambda: ("卖出", {}))
+    monkeypatch.setattr(ch, "click_xy_verified", lambda *a, **k: clicked.append(a) or {"ok": True})
+    exp = ch.parse_expect("204001:SELL:1.105:10")
+    monkeypatch.setattr(ch, "read_form_zoomed", lambda: ({"code": "204001", "price": 1.105, "volume": 100}, []))
+    assert ch.submit_sell_repo(exp, 1.105)["ok"] is False                                      # 表单读回 100 张
+    monkeypatch.setattr(ch, "read_form_zoomed", lambda: (None, [{"code": "60001"}, {"code": "204001"}]))
+    assert ch.submit_sell_repo(exp, 1.105)["ok"] is False                                      # 两次读数不一致
+    monkeypatch.setattr(ch, "read_form_zoomed", lambda: ({"code": "204001", "price": 1.105, "volume": 10,
+                                                          "est_amount": 10000.0}, []))
+    assert ch.submit_sell_repo(exp, 1.105)["ok"] is False                                      # 预估金额不对
+    assert clicked == []
+    monkeypatch.setattr(ch, "read_form_zoomed", lambda: ({"code": "204001", "price": 1.105, "volume": 10,
+                                                          "est_amount": 1000.0}, []))
+    monkeypatch.setattr(ch, "read", lambda kind, step=None: ({"dialogs": []}, {}))
+    assert ch.submit_sell_repo(exp, 1.105)["ok"] is True and len(clicked) == 1

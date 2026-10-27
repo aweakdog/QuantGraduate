@@ -47,13 +47,23 @@ TABLE_PROMPTS = {
 
 
 def xt_code(code6):
+    """补交易所后缀。上交所: 5/6/9 开头、204 逆回购、11 可转债、01/02 国债; 北交所: 4/8 开头; 其余深交所。"""
     c = str(code6)[:6]
-    return c + (".SH" if c[0] in "569" else ".BJ" if c[0] in "48" else ".SZ")
+    sh = c[:1] in ("5", "6", "9") or c.startswith(("204", "11", "01", "02", "888"))     # 888880 = 沪市新标准券
+    return c + (".SH" if sh else ".BJ" if c[:1] in ("4", "8") else ".SZ")
 
 
 def side_type(side):
     s = str(side or "")
+    if "逆回购" in s:
+        return 24          # 逆回购 = 卖出 (借出资金); 成交表里写的是「通用回购逆回购」
     return 23 if "买" in s else 24 if "卖" in s else None
+
+
+def is_repo_row(row):
+    """逆回购相关的行: 204xxx/1318xx, 标准券 888880/131990, 或方向写着「回购」。价格是年化利率, 金额 = 张数 x 100。"""
+    c = str(row.get("code") or "")[:6]
+    return c.startswith(("204", "1318")) or c in ("888880", "131990") or "回购" in str(row.get("side") or "")
 
 
 def _num(v):
@@ -123,7 +133,10 @@ def checks(funds, positions, trades, orders):
         if not p.get("volume") or p.get("volume") % 1 or (p.get("can_use") or 0) > p["volume"]:
             probs.append(f"持仓行异常: {p}")
     for tr in trades:
-        if None in (tr.get("price"), tr.get("volume"), tr.get("amount")) or side_type(tr.get("side")) is None:
+        if is_repo_row(tr):                 # 逆回购: 金额 = 张数 x 100 (价格是利率, 不能乘)
+            if tr.get("volume") is None or tr.get("amount") is None or abs(tr["volume"] * 100 - tr["amount"]) > 0.05:
+                probs.append(f"逆回购成交 张数×100 ≠ 金额: {tr}")
+        elif None in (tr.get("price"), tr.get("volume"), tr.get("amount")) or side_type(tr.get("side")) is None:
             probs.append(f"成交行不全: {tr}")
         elif abs(tr["price"] * tr["volume"] - tr["amount"]) > max(0.05, 0.002 * tr["amount"]):
             probs.append(f"成交 价×量 {tr['price']}×{tr['volume']} ≠ 金额 {tr['amount']}")

@@ -17,7 +17,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .ui_agent import ask, click_windows, locate_verified, png_size, screenshot_windows, verify_point
+from .ui_agent import ask, click_windows, crop, locate_verified, png_size, screenshot_windows, verify_point
 
 LOG_DIR = Path(r"D:\qmtcode\logs\ui_steps")
 SESSIONS = (("09:30:10", "11:28:00"), ("13:00:10", "14:50:00"))
@@ -67,6 +67,20 @@ def guard_channel_order(exp, limit_down):
         return False, "通道测试只允许 100 股"
     if limit_down is None or abs(exp["price"] - float(limit_down)) > 1e-6:
         return False, f"价格 {exp['price']} 不等于跌停价 {limit_down}"
+    return True, "ok"
+
+
+def guard_repo_order(exp, bid_rate):
+    """逆回购测试单: 只允许卖出 (借出) 上交所 GC001 (204001) 10 张 = 1000 元, 利率不高于买一 (才能立即成交),
+    也不低于买一 0.2 个百分点以上 (防止填错)。返回 (允许, 原因)。"""
+    if exp["code"] != "204001":
+        return False, "逆回购测试只允许 204001 (GC001)"
+    if exp["side"] != "卖出":
+        return False, "逆回购只能「卖出」(借出资金)"
+    if exp["volume"] != 10:
+        return False, "逆回购测试只允许 10 张 (1000 元)"
+    if bid_rate is None or not (bid_rate - 0.2 <= exp["price"] <= bid_rate + 1e-9):
+        return False, f"利率 {exp['price']} 不在 [买一-0.2, 买一] = [{None if bid_rate is None else bid_rate - 0.2}, {bid_rate}]"
     return True, "ok"
 
 
@@ -131,6 +145,152 @@ def submit_buy(exp, limit_down):
     res = click("左下角下单面板最底部橙色的「买入」提交按钮 (不是左侧竖排的「买入」页签, 也不是左侧菜单)", "买入", "submit_buy")
     if res["ok"]:
         res["dialogs"] = read("dialog", "after_submit")[0]
+    return res
+
+
+SELL_TAB = (262, 587)     # 10-27 量出: 下单面板左侧竖排「卖出」页签 (竖排字, 放大后常只读出「卖」)
+CODE_BOX = (545, 505)     # 下单面板右上「证券名称/代码」区, 点它可输入代码
+
+
+def tab_sell():
+    return click_xy_verified(*SELL_TAB, "下单面板左侧竖排的「卖出」页签", "", "tab_sell")   # 竖排字只读得出一个字; 纯导航
+
+
+def type_code(code):
+    """点证券代码区 -> 清空 -> 只敲数字。不按回车; 之后截图看是否出现下拉候选。"""
+    from .ui_order import backspace, select_all, type_digits
+    out = click_xy_checked(*CODE_BOX, "type_code")
+    time.sleep(0.5)
+    select_all()
+    backspace()
+    type_digits(code)
+    time.sleep(2.0)
+    out["after_typing"] = str(snap("type_code_typed")[1])
+    return out
+
+
+CANDIDATE_ROW = (633, 554)   # 输入代码后下拉候选的第一行 (10-27 量出)
+
+
+def pick_candidate(code):
+    """双击下拉候选第一行 (10-27: 单击不生效; 不用回车选 —— 焦点万一不在代码框, 回车可能等于提交)。之后截图核对。"""
+    png, before = snap("pick_candidate_before")
+    ok, v = verify_point(png, *CANDIDATE_ROW, f"代码下拉候选列表里「{code}」那一行", "")   # 同一行有代码和名称
+    out = {"ok": ok, "xy": CANDIDATE_ROW, "verify": v, "before": str(before)}
+    if ok:
+        click_windows(*CANDIDATE_ROW)
+        time.sleep(0.08)
+        click_windows(*CANDIDATE_ROW)
+        time.sleep(1.5)
+        out["after_pick"] = str(snap("pick_candidate_done")[1])
+    return out
+
+
+def fill_sell(code, price, volume):
+    """切到「卖出」页签 -> 输入证券代码 -> 填价格/数量 -> 读回。只填不交, 键盘只敲数字和小数点。"""
+    from .ui_order import backspace, read_form, select_all, set_field, type_digits
+    log = []
+    steps = [click("左下角下单面板左侧竖排的「卖出」页签 (不是顶部菜单, 也不是底部的卖出提交按钮)", "卖出", "fill_sell_tab")]
+    time.sleep(1.0)
+    c = click("左下角下单面板右侧显示证券名称/代码的输入框 (写着「请输入股票代码」或当前证券代码)", "", "fill_sell_code")
+    steps.append(c)
+    if not c["ok"]:
+        return {"ok": False, "why": "找不到证券代码输入框", "steps": steps}
+    time.sleep(0.3)
+    select_all()
+    backspace()
+    type_digits(code)
+    time.sleep(2.5)
+    set_field("下单面板里「委托价」或「价格」右边的数字输入框 (不是 +/- 按钮)", "", price, log.append)
+    set_field("下单面板里「总量」或「数量」右边的数字输入框 (不是 +/- 按钮)", "", str(volume), log.append)
+    time.sleep(1.0)
+    form = read_form()
+    return {"ok": True, "form": form, "steps": steps, "log": log}
+
+
+SUBMIT_BTN_BOX = (515, 805, 610, 865)   # 下单面板提交按钮所在区域 (买入橙/卖出绿; 逆回购时按钮略下移)
+
+
+def side_by_button():
+    """看提交按钮的颜色判断当前是买入还是卖出 (10-27: 模型把竖排页签读错过, 方向是逆回购最要命的字段)。"""
+    from PIL import ImageGrab
+    im = ImageGrab.grab(bbox=SUBMIT_BTN_BOX, all_screens=True).convert("RGB")
+    px = [im.getpixel((i, j)) for i in range(0, im.width, 2) for j in range(0, im.height, 2)]
+    green = sum(1 for r, g, b in px if g > 140 and r < 90 and b < 90)
+    orange = sum(1 for r, g, b in px if r > 200 and 50 < g < 150 and b < 70)
+    n = len(px)
+    side = "卖出" if green > 0.2 * n and green > 3 * orange else "买入" if orange > 0.2 * n and orange > 3 * green else None
+    return side, {"green": green, "orange": orange, "n": n}
+
+
+PRICE_BOX_REPO = (367, 752)   # 10-27 量出: 选中 GC001 后「委托价」输入框 (逆回购面板比股票面板靠上)
+
+
+def set_price(price):
+    """点量好的委托价框 (复核十字在输入框上) -> 全选 -> 退格 -> 只敲数字和小数点。不按回车。"""
+    from .ui_order import backspace, select_all, type_digits
+    out = click_xy_verified(*PRICE_BOX_REPO, "下单面板里「委托价」右边的数字输入框", "", "set_price")
+    if not out["ok"]:
+        return out
+    time.sleep(0.3)
+    select_all()
+    backspace()
+    type_digits(price)
+    time.sleep(0.8)
+    out["typed"] = str(snap("set_price_typed")[1])
+    return out
+
+
+CODE_AREA = (520, 495, 720, 535)      # 10-27 量出: 下单面板右上「名称/代码」两行 (小字, 整屏读会把 204001 读成 60001)
+QTY_AREA = (270, 735, 470, 890)       # 委托价 / 最大可卖 / 总量 / 预估金额
+SELL_BTN = (563, 843)                 # 选中 GC001 后的绿色「卖出」提交按钮
+ZOOM_PROMPT = ("这是交易软件下单面板一小块的放大图。只返回 JSON: {{code (6位证券代码, 没有填 null), name, price (委托价), "
+               "volume (总量), est_amount (预估金额)}}。图里没有的字段填 null, 数字转数值, 逐字读, 不要猜。")
+
+
+def read_form_zoomed():
+    """把代码区、价量区各自裁出放大读, 两种倍数各读一次, 两次一致才返回; 否则返回 None。"""
+    png = screenshot_windows()
+    reads = []
+    for scale in (3, 4):
+        r = {}
+        for box in (CODE_AREA, QTY_AREA):
+            x0, y0, x1, y1 = box
+            part, _ = crop(png, (x0 + x1) / 2, (y0 + y1) / 2, w=x1 - x0, h=y1 - y0, scale=scale, mark=False)
+            got, _ = ask(part, ZOOM_PROMPT)
+            r.update({k: v for k, v in got.items() if v is not None})
+        code = str(r.get("code") or "")[:6]
+        if not code and str(r.get("name") or "").strip().upper() == "GC001":
+            code = "204001"     # 上交所 1 天国债回购: 名称与代码一一对应 (10-27: 代码那行小字两次都读不出, 名称稳定)
+        reads.append({"code": code, "price": r.get("price"), "volume": r.get("volume"),
+                      "est_amount": r.get("est_amount"), "name": r.get("name")})
+    same = all(json.dumps({k: reads[0][k] for k in ("code", "price", "volume")}, sort_keys=True) ==
+               json.dumps({k: x[k] for k in ("code", "price", "volume")}, sort_keys=True) for x in reads)
+    return (reads[0] if same else None), reads
+
+
+def submit_sell_repo(exp, bid_rate):
+    if not in_session():
+        return {"ok": False, "why": "不在连续竞价时段"}
+    allowed, why = guard_repo_order(exp, bid_rate)
+    if not allowed:
+        return {"ok": False, "why": why}
+    side, px = side_by_button()
+    if side != "卖出":
+        return {"ok": False, "why": f"提交按钮颜色判断方向为 {side} (不是卖出)", "pixels": px}
+    zoomed, reads = read_form_zoomed()
+    if zoomed is None:
+        return {"ok": False, "why": "放大读回两次不一致", "reads": reads}
+    form = {**zoomed, "side": side}                            # 方向用按钮颜色, 不用模型读的页签
+    same, bad = matches(form, exp)
+    if not same:
+        return {"ok": False, "why": "表单读回不一致", "bad": bad, "reads": reads}
+    if zoomed.get("est_amount") is not None and abs(float(zoomed["est_amount"]) - exp["volume"] * 100) > 0.01:
+        return {"ok": False, "why": f"预估金额 {zoomed['est_amount']} ≠ {exp['volume']} 张 × 100", "reads": reads}
+    res = click_xy_verified(*SELL_BTN, "下单面板的绿色「卖出」提交按钮", "卖", "submit_sell")   # 「卖 出」中间有空格
+    res["reads"] = reads
+    if res["ok"]:
+        res["dialogs"] = read("dialog", "after_submit_sell")[0]
     return res
 
 
@@ -209,7 +369,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("step", choices=["read", "nav", "submit-buy", "confirm", "cancel-select", "cancel-submit",
                                      "cancel-confirm", "dismiss", "close-notice", "tick-row", "cancel-selected",
-                                     "cancel-prompt-ok"])
+                                     "cancel-prompt-ok", "fill-sell", "submit-sell-repo", "tab-sell", "type-code",
+                                     "pick-candidate", "set-price", "side"])
+    ap.add_argument("--code")
+    ap.add_argument("--price")
+    ap.add_argument("--volume", type=int)
+    ap.add_argument("--bid", type=float)
     ap.add_argument("arg", nargs="?")
     ap.add_argument("--expect")
     ap.add_argument("--limit-down", type=float)
@@ -242,6 +407,21 @@ def main(argv=None):
         out = click_xy_verified(x, y, "委托表格上方工具栏的「选中撤单」按钮", "撤单", "cancel_selected")  # 放大后常只读出「撤单」
         if out["ok"]:
             out["dialogs"] = read("dialog", "after_cancel_selected")[0]
+    elif a.step == "tab-sell":
+        out = tab_sell()
+    elif a.step == "type-code":
+        out = type_code(a.code)
+    elif a.step == "set-price":
+        out = set_price(a.price)
+    elif a.step == "side":
+        sd, pxs = side_by_button()
+        out = {"ok": sd is not None, "side": sd, "pixels": pxs}
+    elif a.step == "pick-candidate":
+        out = pick_candidate(a.code)
+    elif a.step == "fill-sell":
+        out = fill_sell(a.code, a.price, a.volume)
+    elif a.step == "submit-sell-repo":
+        out = submit_sell_repo(exp, a.bid)
     elif a.step == "cancel-prompt-ok":
         # 「选中撤单」后的通用确认框 (标题「提示」, 正文「是否撤单」, 不含委托内容): 只在正文含「撤单」时点「确定」。
         # 参数只用 ASCII (中文经批处理传参会被 GBK 读坏, 10-26 踩过)。
