@@ -465,9 +465,10 @@ def build_autoconfirm(snap, state, plan, exec_date):
         probs.append("快照里资金账号不在线")
     fills, p = aggregate_trades(snap.get("trades"), exec_date)
     probs += p
-    p2, n2 = sanity_checks(snap, fills, exec_date)
-    probs += p2
-    notes += n2
+    if snap.get("source") == "screen":          # 只对读屏快照做 (防读错); 接口快照的数是券商系统直接给的
+        p2, n2 = sanity_checks(snap, fills, exec_date)
+        probs += p2
+        notes += n2
     held = line_positions(state)
     plan_buys = {code6(b["code"]) for b in (plan or {}).get("buy") or []}
     alts = {code6(a["code"]) for a in (plan or {}).get("alternates") or []}
