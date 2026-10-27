@@ -249,10 +249,11 @@ ZOOM_PROMPT = ("这是交易软件下单面板一小块的放大图。只返回 
 
 
 def read_form_zoomed():
-    """把代码区、价量区各自裁出放大读, 两种倍数各读一次, 两次一致才返回; 否则返回 None。"""
+    """代码区、价量区各自裁剪放大读; 3/4 倍各读一次, (代码, 价, 量, 预估金额) 一致才返回, 否则 5 倍再读取多数。
+    10-27: 同一张图 3 倍读出预估金额 1000、4 倍读出 501000, 所以预估金额也要参与比对。"""
     png = screenshot_windows()
-    reads = []
-    for scale in (3, 4):
+
+    def one(scale):
         r = {}
         for box in (CODE_AREA, QTY_AREA):
             x0, y0, x1, y1 = box
@@ -261,12 +262,18 @@ def read_form_zoomed():
             r.update({k: v for k, v in got.items() if v is not None})
         code = str(r.get("code") or "")[:6]
         if not code and str(r.get("name") or "").strip().upper() == "GC001":
-            code = "204001"     # 上交所 1 天国债回购: 名称与代码一一对应 (10-27: 代码那行小字两次都读不出, 名称稳定)
-        reads.append({"code": code, "price": r.get("price"), "volume": r.get("volume"),
-                      "est_amount": r.get("est_amount"), "name": r.get("name")})
-    same = all(json.dumps({k: reads[0][k] for k in ("code", "price", "volume")}, sort_keys=True) ==
-               json.dumps({k: x[k] for k in ("code", "price", "volume")}, sort_keys=True) for x in reads)
-    return (reads[0] if same else None), reads
+            code = "204001"     # 上交所 1 天国债回购: 名称与代码一一对应 (代码那行小字常读不出, 名称稳定)
+        return {"code": code, "price": r.get("price"), "volume": r.get("volume"), "est_amount": r.get("est_amount"),
+                "name": r.get("name")}
+
+    def key(x):
+        return json.dumps({k: x[k] for k in ("code", "price", "volume", "est_amount")}, sort_keys=True, default=str)
+    reads = [one(3), one(4)]
+    if key(reads[0]) != key(reads[1]):
+        reads.append(one(5))
+    from collections import Counter
+    top, n = Counter(key(x) for x in reads).most_common(1)[0]
+    return (next(x for x in reads if key(x) == top) if n >= 2 else None), reads
 
 
 def submit_sell_repo(exp, bid_rate):

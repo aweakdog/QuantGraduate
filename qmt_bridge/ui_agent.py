@@ -19,9 +19,33 @@ import time
 import urllib.request
 from pathlib import Path
 
-API_URL = "https://api.deepseek.com/chat/completions"
-MODEL = "deepseek-flash"
+# 视觉模型可切换 (10-27 用户要求试 MiniMax): 环境变量 VISION_PROVIDER 或 D:\qmtcode\vision_provider.txt, 默认 deepseek
+PROVIDERS = {
+    "deepseek": {"url": "https://api.deepseek.com/chat/completions", "model": "deepseek-flash", "key": "deepseek.key",
+                 "extra": {"thinking": {"type": "disabled"}, "response_format": {"type": "json_object"}}, "image": {}},
+    "minimax": {"url": "https://api.minimaxi.com/v1/chat/completions", "model": "MiniMax-M3.1-Flash", "key": "minimax.key",
+                "extra": {"reasoning_effort": "low"}, "image": {"max_long_side_pixel": 3840}},   # 原图不缩小, 小字才读得清
+}
+API_URL = PROVIDERS["deepseek"]["url"]
+MODEL = PROVIDERS["deepseek"]["model"]
 KEY_FILES = (r"D:\qmtcode\deepseek.key", str(Path.home() / ".quant" / "deepseek.key"))
+
+
+def provider_name():
+    if os.environ.get("VISION_PROVIDER"):
+        return os.environ["VISION_PROVIDER"].strip()
+    f = Path(r"D:\qmtcode\vision_provider.txt")
+    return f.read_text(encoding="utf-8").strip() if f.exists() else "deepseek"
+
+
+def provider_key(name):
+    env = os.environ.get(f"{name.upper()}_API_KEY")
+    if env:
+        return env.strip()
+    for f in (Path(r"D:\qmtcode") / PROVIDERS[name]["key"], Path.home() / ".quant" / PROVIDERS[name]["key"]):
+        if f.exists():
+            return f.read_text(encoding="utf-8").strip()
+    raise SystemExit(f"找不到 {name} 的 API 密钥")
 
 DESCRIBE_PROMPT = (
     "这是一张 {w}x{h} 的 Windows 屏幕截图。只返回 JSON, 键为: "
@@ -49,30 +73,37 @@ def png_size(png):
     return int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
 
 
-def build_request(png, prompt, model=MODEL, detail="high", max_tokens=4000):
-    return {"model": model, "temperature": 0, "max_tokens": max_tokens, "thinking": {"type": "disabled"},
-            "response_format": {"type": "json_object"},
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode(),
-                                                    "detail": detail}}]}]}
+def build_request(png, prompt, model=None, detail="high", max_tokens=4000, provider=None):
+    pv = PROVIDERS[provider or "deepseek"]
+    image = {"url": "data:image/png;base64," + base64.b64encode(png).decode(), "detail": detail, **pv["image"]}
+    return {"model": model or pv["model"], "temperature": 0, "max_tokens": max_tokens, **pv["extra"],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt},
+                                                      {"type": "image_url", "image_url": image}]}]}
 
 
 def parse_reply(resp):
-    content = resp["choices"][0]["message"]["content"]
-    data = json.loads(content)
+    """取回复里的 JSON。不支持 json 模式的模型可能包代码块或前后带字, 取第一个 { 到最后一个 }。"""
+    content = resp["choices"][0]["message"]["content"] or ""
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        i, j = content.find("{"), content.rfind("}")
+        if i < 0 or j <= i:
+            raise
+        data = json.loads(content[i:j + 1])
     data.pop("type", None)                      # 模型偶尔把 response_format 的 type 也写进来
     return data
 
 
-def ask(png, prompt, key=None, timeout=60, opener=urllib.request.urlopen, retries=1):
+def ask(png, prompt, key=None, timeout=90, opener=urllib.request.urlopen, retries=1, provider=None):
     """一次视觉问答。回复不是合法 JSON (多半是输出被截断) 时提醒精简后重试一次。"""
-    key = key or load_key()
+    name = provider or provider_name()
+    key = key or (load_key() if name == "deepseek" else provider_key(name))
     t0 = time.time()
     for attempt in range(retries + 1):
         p = prompt if attempt == 0 else prompt + "\n上次回复不是合法 JSON。请精简内容, 只返回一个完整、合法的 JSON 对象。"
-        body = json.dumps(build_request(png, p)).encode("utf-8")
-        req = urllib.request.Request(API_URL, data=body, headers={"Authorization": "Bearer " + key,
+        body = json.dumps(build_request(png, p, provider=name)).encode("utf-8")
+        req = urllib.request.Request(PROVIDERS[name]["url"], data=body, headers={"Authorization": "Bearer " + key,
                                                                   "Content-Type": "application/json"})
         with opener(req, timeout=timeout) as r:
             resp = json.load(r)
@@ -90,8 +121,19 @@ def describe(png, **kw):
 
 
 def locate(png, target, **kw):
+    """定位交给 MiniMax (10-27 评测: 密集按钮偏 10px, DeepSeek 偏 500px); 没有 MiniMax 密钥时退回默认。"""
     w, h = png_size(png)
+    if "provider" not in kw and _has_key("minimax"):
+        kw["provider"] = "minimax"
     return ask(png, LOCATE_PROMPT.format(w=w, h=h, target=target), **kw)
+
+
+def _has_key(name):
+    try:
+        provider_key(name)
+        return True
+    except SystemExit:
+        return False
 
 
 VERIFY_PROMPT = (

@@ -68,7 +68,7 @@ def is_repo_row(row):
 
 def _num(v):
     try:
-        return round(float(str(v).replace(",", "").replace("股", "").strip()), 2)
+        return round(float(str(v).replace(",", "").replace(" ", "").rstrip("股张元").strip()), 3)
     except (TypeError, ValueError):
         return None
 
@@ -76,16 +76,22 @@ def _num(v):
 def canon_rows(kind, rows):
     """规范化后用于比对: 数字统一两位小数、代码 6 位、按 (代码, 时间, 价, 量) 排序。"""
     keys = {"positions": ("code", "volume", "can_use", "cost", "market_value"),
-            "trades": ("time", "code", "side", "price", "volume", "amount", "order_id"),
-            "orders": ("time", "code", "side", "price", "volume", "traded_volume", "status", "order_id")}[kind]
+            "trades": ("time", "code", "side", "price", "volume", "amount"),
+            "orders": ("time", "code", "side", "price", "volume", "traded_volume", "status")}[kind]
+    # 方向按买/卖代码比 (「卖出」与「通用回购逆回购」是同一方向, 两家模型写法不同); 合同号不比 (对账不用, 且常被读成资金账号)
     out = []
     for r in rows or []:
         c = {}
         for k in keys:
             v = r.get(k)
-            c[k] = str(v)[:6] if k == "code" else (_num(v) if k in ("volume", "can_use", "cost", "market_value", "price",
-                                                                    "amount", "traded_volume") else
-                                                   (str(v).strip() if v is not None else None))
+            if k == "code":
+                c[k] = str(v)[:6]
+            elif k == "side":
+                c[k] = side_type(v)
+            elif k in ("volume", "can_use", "cost", "market_value", "price", "amount", "traded_volume"):
+                c[k] = _num(v)
+            else:
+                c[k] = str(v).strip() if v is not None else None
         out.append(c)
     return sorted(out, key=lambda c: json.dumps(c, ensure_ascii=False, sort_keys=True))
 
@@ -101,20 +107,24 @@ def agree(reads, canon):
     return (json.loads(top) if n >= 2 else None), cs
 
 
-def read_box(png, box, prompt, scale):
+def read_box(png, box, prompt, scale, provider=None):
     x0, y0, x1, y1 = box
     part, _ = crop(png, (x0 + x1) / 2, (y0 + y1) / 2, w=x1 - x0, h=y1 - y0, scale=scale, mark=False)
-    res, _ = ask(part, prompt)
+    res, _ = ask(part, prompt, provider=provider)
     return res
 
 
 def read_agreed(png, box, prompt, canon, scales=(2, 3, 2.5)):
-    reads = [read_box(png, box, prompt, s) for s in scales[:2]]
+    """两家模型各读一次 (失误方式不同: 10-27 MiniMax 把「50 3121.80」读成 50312.8, DeepSeek 把资金账号当合同号),
+    一致才采用; 不一致再用 DeepSeek 换倍数读一次取多数。没有 MiniMax 密钥时退回同一家两种倍数。"""
+    from .ui_agent import _has_key
+    second = "minimax" if _has_key("minimax") else None
+    reads = [read_box(png, box, prompt, scales[0], "deepseek"), read_box(png, box, prompt, scales[1], second)]
     val, cs = agree(reads, canon)
     if val is None:
-        reads.append(read_box(png, box, prompt, scales[2]))
+        reads.append(read_box(png, box, prompt, scales[2], "deepseek"))
         val, cs = agree(reads, canon)
-    return val, {"reads": len(reads), "agreed": val is not None}, reads
+    return val, {"reads": len(reads), "agreed": val is not None, "second": second or "deepseek"}, reads
 
 
 def checks(funds, positions, trades, orders):

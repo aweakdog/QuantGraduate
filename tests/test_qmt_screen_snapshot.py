@@ -150,3 +150,12 @@ def test_reverse_repo_rows_pass_checks_and_are_cash_for_041():
     assert qmt_positions(snap) == {} and aggregate_trades(snap["trades"]) == ([], [])
     r = reconcile(snap, {"cash": 100000.0, "lots": []})
     assert r["positions_match"] is True and r["outside_cash"] == round(502121.79 + 1000.0 - 100000.0, 2)
+
+
+def test_cross_model_wording_differences_still_agree():
+    a = [{"time": "11:08:41", "code": "204001", "side": "卖出", "price": 1.145, "volume": "10张", "amount": "1,000.00",
+          "order_id": "30354"}]
+    b = [{"time": "11:08:41", "code": "204001", "side": "通用回购逆回购", "price": "1.145", "volume": 10, "amount": 1000,
+          "order_id": "666656116735"}]
+    assert ss.canon_rows("trades", a) == ss.canon_rows("trades", b)
+    assert ss.canon_rows("trades", a) != ss.canon_rows("trades", [{**b[0], "price": 1.15}])   # 真读错的价格仍算不一致
