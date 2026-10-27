@@ -127,3 +127,8 @@ def test_crash_still_pushes_offline_snapshot(monkeypatch, tmp_path):
     assert ss.main(["--kind", "close", "--key-file", str(key)]) == 0
     snap = pushed[0]
     assert snap["account_online"] is False and snap["error_kind"] == "exception" and "DeepSeek 429" in snap["error"]
+
+
+def test_wrong_account_or_page_is_layout_problem():
+    assert ss.classify(["资金表账号尾号 None 不是预期的 6735 (可能停在别的页签)"]) == "layout"
+    assert ss.classify(["切到「股票交易」页签失败 (复核: ...)"]) == "layout"

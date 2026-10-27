@@ -26,6 +26,8 @@ STATUS_CODE = {"未报": 48, "待报": 49, "已报": 50, "已报待撤": 51, "�
 # 10-26 截图量出 (QMT 最大化 1920x1080, 交易页): 底部页签与表格区域。点击前仍做独立复核。
 TABS = {"positions": (840, 474, "持仓"), "trades": (905, 474, "成交"), "orders": (1000, 474, "委托")}
 TABLE_BOX = (780, 482, 1920, 738)
+TOP_TAB_STOCK = (110, 51, "股票交易")      # 10-27 量出: 顶部页签栏最左边; 那天早上停在「沪港通」, 三张表和资金表全空
+EXPECTED_ACCOUNT_LAST4 = os.environ.get("QMT_ACCOUNT_LAST4", "6735")
 FUNDS_BOX = (780, 742, 1920, 830)
 
 FUNDS_PROMPT = ("这是 QMT「账号资金」表格的放大截图。只返回 JSON: {account_last4 (资金账号后4位), total_asset (总资产), "
@@ -135,7 +137,7 @@ ERROR_KINDS = (  # (类别, 判断关键词) —— 按顺序匹配, 给 041 的
     ("exception", ("读屏程序异常",)),
     ("login", ("登录失败", "未登录", "交易不在线")),
     ("window", ("分辨率", "主窗口")),
-    ("layout", ("页签失败", "交易页失败")),
+    ("layout", ("页签失败", "交易页失败", "不是预期的")),
     ("read", ("不一致", "≠", "读数不全", "异常:", "大于委托量")),
 )
 
@@ -218,6 +220,11 @@ def take(kind, log=print):
     if not nav["ok"]:
         return build_snapshot(kind, {}, [], [], [], None, [f"切到交易页失败 (复核: {nav.get('verify')})"], {"state": st})
     time.sleep(2.0)
+    x, y, label = TOP_TAB_STOCK
+    top = click_xy_verified(x, y, f"顶部页签栏最左边的「{label}」页签", label, "snap_tab_stock")
+    if not top["ok"]:
+        return build_snapshot(kind, {}, [], [], [], None, [f"切到「{label}」页签失败 (复核: {top.get('verify')})"], {})
+    time.sleep(1.5)
     meta, problems, tables = {"tabs": {}}, [], {}
     for kind_t in ("positions", "trades", "orders"):
         x, y, label = TABS[kind_t]
@@ -239,7 +246,9 @@ def take(kind, log=print):
     if funds is None:
         problems.append("资金表多次读数不一致")
         funds = {}
-    last4 = next((r.get("account_last4") for r in reads if r.get("account_last4")), None)
+    last4 = next((str(r.get("account_last4")) for r in reads if r.get("account_last4")), None)
+    if last4 != EXPECTED_ACCOUNT_LAST4:     # 停在沪港通/融资融券等别的页签时资金表是空的或是别的账号
+        problems.append(f"资金表账号尾号 {last4} 不是预期的 {EXPECTED_ACCOUNT_LAST4} (可能停在别的页签)")
     problems += checks(funds, tables["positions"], tables["trades"], tables["orders"])
     return build_snapshot(kind, funds, tables["positions"], tables["trades"], tables["orders"], last4, problems, meta)
 
