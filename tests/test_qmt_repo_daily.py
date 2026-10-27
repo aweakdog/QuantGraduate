@@ -24,3 +24,10 @@ def test_guard():
     assert not rd.guard_repo_daily({**ok, "code": "600000"}, 1.145, 502121.79)[0]
     assert not rd.guard_repo_daily({**ok, "price": 1.2}, 1.145, 502121.79)[0]             # 高于买一, 不会成交
     assert not rd.guard_repo_daily(ok, None, 502121.79)[0]
+
+
+def test_morning_only_on_confirmed_cash_days():
+    assert rd.morning_ok({"buy": [], "sell": [], "in_cash": True})
+    assert not rd.morning_ok({"buy": [{"code": "600000"}], "sell": []})
+    assert not rd.morning_ok({"buy": [], "sell": [{"code": "600000"}]})
+    assert not rd.morning_ok(None)                              # 取不到计划: 留给下午

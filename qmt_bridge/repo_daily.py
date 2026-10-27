@@ -19,7 +19,7 @@ from pathlib import Path
 
 ENABLED = Path(r"D:\qmtcode\REPO_ENABLED")
 DONE_DIR = Path(r"D:\qmtcode\repo_done")
-WINDOW = ("14:30:00", "14:50:00")
+WINDOWS = (("10:00:00", "11:20:00"), ("14:30:00", "14:50:00"))   # 上午只在确认空仓日借 (利率通常更高); 下午兜底
 RESERVE = 1000.0
 MAX_AMOUNT = 2_000_000.0
 QTY_BOX_REPO = (367, 848)          # 10-27 量出: 选中 GC001 后「总量」输入框
@@ -37,6 +37,11 @@ def plan_amount(cash, ticket):
         why += f" + 今天策略有买入, 留出线内现金 {float(ticket.get('line_cash') or 0):,.0f}"
     amount = min(MAX_AMOUNT, math.floor(max(0.0, float(cash or 0) - reserve) / 1000) * 1000)
     return float(amount), reserve, why
+
+
+def morning_ok(ticket):
+    """上午只在确认空仓日借: 能取到当天计划, 且计划不买也不卖。"""
+    return ticket is not None and not ticket.get("buy") and not ticket.get("sell")
 
 
 def repo_rate(bid):
@@ -96,8 +101,9 @@ def run(dry_run, log=print):
     if marker.exists():
         return {"ok": True, "status": "already_done"}
     now = datetime.now().strftime("%H:%M:%S")
-    if not dry_run and not (WINDOW[0] <= now <= WINDOW[1]):
+    if not dry_run and not any(a <= now <= b for a, b in WINDOWS):
         return {"ok": False, "status": "outside_window", "now": now}
+    morning = now < "12:00:00"
     key = Path(DEFAULT_KEY).read_text(encoding="utf-8").strip().encode()
     snap0 = take("manual", log=log)
     if not snap0.get("account_online"):
@@ -105,6 +111,8 @@ def run(dry_run, log=print):
     cash = snap0["asset"]["cash"]
     st, resp = signed_post(f"{BASE_URL}/api/qmt/ticket", {"profile": "qmt10w", "today": today}, key)
     ticket = resp.get("ticket") if st == 200 else None
+    if morning and not morning_ok(ticket):
+        return {"ok": True, "status": "defer_to_afternoon", "why": "今天不是确认空仓日 (或取不到计划), 留到 14:40 再判断"}
     amount, reserve, why = plan_amount(cash, ticket)
     log(f"可用 {cash:,.2f}; {why}; 借出 {amount:,.0f}")
     if amount < 1000:
