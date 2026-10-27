@@ -317,3 +317,16 @@ def test_sanity_checks_fill_price_and_total_asset(tmp_path):
     assert sanity_checks(snap, [], "2026-10-27", kd, ld)[0] == []
     p, _ = sanity_checks({"asset": {"total_asset": 50312.18}}, [], "2026-10-27", kd, ld)   # 少读一位
     assert p and "超出合理范围" in p[0]
+
+
+def test_sanity_total_falls_back_when_morning_snapshot_offline(tmp_path):
+    import json as _j
+
+    from qmt_sync import sanity_checks
+    q = tmp_path / "live" / "qmt"
+    q.mkdir(parents=True)
+    (q / "snap_20261026_151231_close.json").write_text(_j.dumps({"account_online": True,
+                                                                 "asset": {"total_asset": 503121.80, "market_value": 0}}))
+    (q / "snap_20261027_093637_morning.json").write_text(_j.dumps({"account_online": False, "asset": {"total_asset": None}}))
+    p, _ = sanity_checks({"asset": {"total_asset": 50312.18}}, [], "2026-10-27", tmp_path / "k", tmp_path / "live")
+    assert p and "超出合理范围" in p[0]

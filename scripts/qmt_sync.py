@@ -428,8 +428,8 @@ def sanity_checks(snap, fills, exec_date, kline_dir=None, live_dir=None):
     prev = None
     qdir = live_dir / "qmt"
     day = str(exec_date).replace("-", "")
-    cands = sorted(qdir.glob(f"snap_{day}_*_morning.json")) or [
-        x for x in sorted(qdir.glob("snap_*.json")) if x.name[5:13] < day]
+    # 先找当天开盘快照, 它离线 (或没有) 就退到之前最近的在线快照 (10-27 当天开盘读屏就离线过)
+    cands = [x for x in sorted(qdir.glob("snap_*.json")) if x.name[5:13] < day] + sorted(qdir.glob(f"snap_{day}_*_morning.json"))
     for path in reversed(cands):
         try:
             s = json.loads(path.read_text(encoding="utf-8"))
