@@ -109,7 +109,7 @@ def crop(png, cx, cy, w=360, h=220, scale=2, mark=True):
     im = Image.open(io.BytesIO(png)).convert("RGB")
     x0, y0 = max(0, int(cx - w / 2)), max(0, int(cy - h / 2))
     x1, y1 = min(im.width, x0 + w), min(im.height, y0 + h)
-    part = im.crop((x0, y0, x1, y1)).resize(((x1 - x0) * scale, (y1 - y0) * scale))
+    part = im.crop((x0, y0, x1, y1)).resize((round((x1 - x0) * scale), round((y1 - y0) * scale)))   # scale 可为小数 (10-27: 2.5 倍时崩过)
     if mark:
         d = ImageDraw.Draw(part)
         px, py = (cx - x0) * scale, (cy - y0) * scale

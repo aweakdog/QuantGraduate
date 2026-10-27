@@ -55,3 +55,15 @@ def test_safe_target_refuses_anything_doubtful(loc, ok):
 def test_dismiss_only_whitelisted_dialogs():
     with pytest.raises(SystemExit):
         dismiss_dialog("下单确认", "确定")                    # 交易相关的弹窗一律不点
+
+
+def test_crop_accepts_fractional_scale():
+    import io
+
+    from PIL import Image
+
+    from qmt_bridge.ui_agent import crop
+    buf = io.BytesIO()
+    Image.new("RGB", (1920, 1080), "white").save(buf, format="PNG")
+    part, (x0, y0, s) = crop(buf.getvalue(), 1350, 610, w=1140, h=256, scale=2.5, mark=False)
+    assert png_size(part) == (2850, 640) and (x0, y0, s) == (780, 482, 2.5)
