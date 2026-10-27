@@ -292,3 +292,28 @@ def test_email_summary_explains_screen_failures_without_trade_details():
     assert "DeepSeek" in email_summary("2026-10-26:morning:offline:exception")
     assert "人工登录" in email_summary("2026-10-26:morning:offline:login")
     assert "资金账号离线" in email_summary("2026-10-26:morning:offline")          # 旧格式 (无类别) 仍可用
+
+
+def test_sanity_checks_fill_price_and_total_asset(tmp_path):
+    import json as _j
+
+    import pandas as pd
+    from qmt_sync import sanity_checks
+    kd, ld = tmp_path / "kline", tmp_path / "live"
+    kd.mkdir()
+    (ld / "qmt").mkdir(parents=True)
+    pd.DataFrame({"date": pd.to_datetime(["2026-10-27"]), "low": [9.45], "high": [9.68]}).to_parquet(kd / "600000.parquet")
+    snap = {"asset": {"total_asset": 503121.79}}
+    ok = [{"code": "600000", "action": "buy", "shares": 1000, "price": 9.62}]
+    assert sanity_checks(snap, ok, "2026-10-27", kd, ld) == ([], [])
+    p, _ = sanity_checks(snap, [{**ok[0], "price": 6.92}], "2026-10-27", kd, ld)           # 读错的价格
+    assert p and "不在当天行情" in p[0]
+    p, _ = sanity_checks(snap, [{**ok[0], "shares": 1050}], "2026-10-27", kd, ld)
+    assert p and "整百" in p[0]
+    _, n = sanity_checks(snap, [{**ok[0], "code": "000001"}], "2026-10-27", kd, ld)
+    assert n and "未核对" in n[0]
+    (ld / "qmt" / "snap_20261027_093637_morning.json").write_text(_j.dumps(
+        {"account_online": True, "asset": {"total_asset": 503121.80, "market_value": 0}}))
+    assert sanity_checks(snap, [], "2026-10-27", kd, ld)[0] == []
+    p, _ = sanity_checks({"asset": {"total_asset": 50312.18}}, [], "2026-10-27", kd, ld)   # 少读一位
+    assert p and "超出合理范围" in p[0]

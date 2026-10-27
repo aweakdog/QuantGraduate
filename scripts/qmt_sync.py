@@ -401,6 +401,51 @@ def aggregate_trades(trades, on_date=None):
     return fills, probs
 
 
+def sanity_checks(snap, fills, exec_date, kline_dir=None, live_dir=None):
+    """与读屏无关的两道检查 (10-27 加, 防两家模型同时读错同一个数):
+      1. 每笔成交价必须落在当天 K 线 [最低, 最高] 内 (留 0.2% 余量); 买入股数必须整百。缺 K 线只记备注。
+      2. 总资产相对当天开盘快照 (没有就用之前最近一份在线快照) 的变化不得超过 12%×持仓市值 + 0.3%×总资产 + 200 元
+         —— 「少读一位」会让总资产凭空少九成; 当天有银证转账也会触发, 人工确认即可。返回 (problems, notes)。"""
+    root = Path(__file__).resolve().parents[1]
+    kline_dir = Path(kline_dir) if kline_dir else root / "data" / "raw" / "kline"
+    live_dir = Path(live_dir) if live_dir else root / "data" / "live"
+    probs, notes = [], []
+    for f in fills:
+        if f["action"] == "buy" and f["shares"] % 100:
+            probs.append(f"买入 {f['code']} {f['shares']} 股不是整百 (多半读错)")
+        kp = kline_dir / f"{f['code']}.parquet"
+        bar = None
+        if kp.exists():
+            import pandas as pd
+            k = pd.read_parquet(kp, columns=["date", "low", "high"])
+            hit = k[pd.to_datetime(k["date"]).dt.date.astype(str) == str(exec_date)]
+            bar = None if hit.empty else hit.iloc[-1]
+        if bar is None:
+            notes.append(f"缺 {f['code']} {exec_date} 的 K 线, 成交价未核对")
+        elif not (float(bar["low"]) * 0.998 <= f["price"] <= float(bar["high"]) * 1.002):
+            probs.append(f"{f['code']} 成交价 {f['price']} 不在当天行情 [{bar['low']}, {bar['high']}] 内 (多半读错)")
+    total = ((snap or {}).get("asset") or {}).get("total_asset")
+    prev = None
+    qdir = live_dir / "qmt"
+    day = str(exec_date).replace("-", "")
+    cands = sorted(qdir.glob(f"snap_{day}_*_morning.json")) or [
+        x for x in sorted(qdir.glob("snap_*.json")) if x.name[5:13] < day]
+    for path in reversed(cands):
+        try:
+            s = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if s.get("account_online") and (s.get("asset") or {}).get("total_asset"):
+            prev = s
+            break
+    if total is not None and prev is not None:
+        pt, pm = float(prev["asset"]["total_asset"]), float(prev["asset"].get("market_value") or 0)
+        bound = 0.12 * pm + 0.003 * pt + 200
+        if abs(float(total) - pt) > bound:
+            probs.append(f"总资产 {pt:,.2f} → {float(total):,.2f} 变化超出合理范围 ±{bound:,.0f} (可能读错位数, 或当天有银证转账)")
+    return probs, notes
+
+
 def build_autoconfirm(snap, state, plan, exec_date):
     """把执行日收盘后的 QMT 快照转成确认回报。返回 (fills, problems, notes)。
 
@@ -420,6 +465,9 @@ def build_autoconfirm(snap, state, plan, exec_date):
         probs.append("快照里资金账号不在线")
     fills, p = aggregate_trades(snap.get("trades"), exec_date)
     probs += p
+    p2, n2 = sanity_checks(snap, fills, exec_date)
+    probs += p2
+    notes += n2
     held = line_positions(state)
     plan_buys = {code6(b["code"]) for b in (plan or {}).get("buy") or []}
     alts = {code6(a["code"]) for a in (plan or {}).get("alternates") or []}
