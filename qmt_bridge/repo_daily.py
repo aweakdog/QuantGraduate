@@ -80,7 +80,7 @@ def set_volume(lots):
     return out
 
 
-def run(dry_run, log=print):
+def run(dry_run, log=print, test_amount=None):
     from .executor import BASE_URL, signed_post
     from .push_snapshot import DEFAULT_KEY, DEFAULT_URL, push
     from .screen_snapshot import take
@@ -114,6 +114,8 @@ def run(dry_run, log=print):
     if morning and not morning_ok(ticket):
         return {"ok": True, "status": "defer_to_afternoon", "why": "今天不是确认空仓日 (或取不到计划), 留到 14:40 再判断"}
     amount, reserve, why = plan_amount(cash, ticket)
+    if dry_run and test_amount:                     # 只用于演练: 钱已借出时也能把填单流程走一遍
+        amount, reserve, why, cash = float(test_amount), 0.0, f"演练金额 {test_amount}", max(cash, float(test_amount))
     log(f"可用 {cash:,.2f}; {why}; 借出 {amount:,.0f}")
     if amount < 1000:
         return {"ok": True, "status": "nothing_to_lend", "cash": cash, "why": why}
@@ -201,9 +203,10 @@ def report_failure(out):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--test-amount", type=int, help="只配合 --dry-run: 用这个金额演练填单")
     a = ap.parse_args(argv)
     try:
-        out = run(a.dry_run, log=lambda m: print(m, flush=True))
+        out = run(a.dry_run, log=lambda m: print(m, flush=True), test_amount=a.test_amount if a.dry_run else None)
     except Exception as e:  # noqa: BLE001
         out = {"ok": False, "status": "exception", "error": f"{type(e).__name__}: {str(e)[:300]}"}
     if not a.dry_run and out.get("status") not in QUIET:

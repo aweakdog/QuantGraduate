@@ -175,7 +175,12 @@ CANDIDATE_ROW = (633, 554)   # 输入代码后下拉候选的第一行 (10-27 �
 def pick_candidate(code):
     """双击下拉候选第一行 (10-27: 单击不生效; 不用回车选 —— 焦点万一不在代码框, 回车可能等于提交)。之后截图核对。"""
     png, before = snap("pick_candidate_before")
-    ok, v = verify_point(png, *CANDIDATE_ROW, f"代码下拉候选列表里「{code}」那一行", "")   # 同一行有代码和名称
+    a_ok, a_why = ocr_anchor(png, 555, CANDIDATE_ROW[1], code, rx=110)     # 候选行左边是代码 (10-28 量出 x≈555)
+    if a_ok:
+        ok, v = True, {"by": "ocr", "why": a_why}
+    else:
+        ok, v = verify_point(png, *CANDIDATE_ROW, f"代码下拉候选列表里「{code}」那一行", "")   # 同一行有代码和名称
+        v = {**v, "by": "model", "ocr": a_why}
     out = {"ok": ok, "xy": CANDIDATE_ROW, "verify": v, "before": str(before)}
     if ok:
         click_windows(*CANDIDATE_ROW)
