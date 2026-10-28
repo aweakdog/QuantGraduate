@@ -162,6 +162,17 @@ def read_table(png, box, kind, scale=2):
     return parse_table(ocr_boxes_w(png, box, scale), kind)
 
 
+def parse_panel(code_text, form_text):
+    """下单面板 OCR 文字 -> {code, price, volume, est_amount}。代码取右上角第一个 6 位数 (GC001 只有 3 位数字, 不会误认)。"""
+    import re
+    code = next(iter(re.findall(r"\d{6}", code_text)), None)
+    pm = re.search(r"委托价\s*(\d+\.\d+)", form_text)
+    vm = re.search(r"总[量里]\s*(\d+)", form_text)
+    em = re.search(r"预估金额\S*?\s*([\d ,]+\.\d+)\s*元", form_text)
+    return {"code": code, "price": float(pm.group(1)) if pm else None, "volume": int(vm.group(1)) if vm else None,
+            "est_amount": float(em.group(1).replace(" ", "").replace(",", "")) if em else None}
+
+
 def available():
     """这台机器能不能用 OCR (Windows 上装了 rapidocr; Mac 上一般没装)。"""
     try:

@@ -294,6 +294,54 @@ def read_form_zoomed(qty_area=None):
     return (next(x for x in reads if key(x) == top) if n >= 2 else None), reads
 
 
+def _form_by_model(png, provider, scale, qty_area):
+    r = {}
+    for box in (CODE_AREA, qty_area or QTY_AREA):
+        x0, y0, x1, y1 = box
+        part, _ = crop(png, (x0 + x1) / 2, (y0 + y1) / 2, w=x1 - x0, h=y1 - y0, scale=scale, mark=False)
+        got, _ = ask(part, ZOOM_PROMPT, provider=provider, fallbacks=())
+        r.update({k: v for k, v in got.items() if v is not None})
+    code = str(r.get("code") or "")[:6]
+    if not code and str(r.get("name") or "").strip().upper() == "GC001":
+        code = "204001"
+    return {"code": code or None, "price": r.get("price"), "volume": r.get("volume"), "est_amount": r.get("est_amount"),
+            "name": r.get("name")}
+
+
+def same_form(a, b):
+    """代码、价格、数量一致 (预估金额常刷新慢, 不比)。"""
+    try:
+        return (a.get("code") == b.get("code") and a.get("code") is not None
+                and abs(float(a["price"]) - float(b["price"])) < 1e-6 and int(float(a["volume"])) == int(float(b["volume"])))
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
+def read_form_checked(qty_area=None):
+    """下单面板读回 (10-28 起): 本地 OCR 读一遍, 再依次请 MiniMax→千问→DeepSeek 各读一遍, 有一家与 OCR 一致就采用
+    OCR 的读数; 都不一致返回 None。比原来两家模型各读两遍快, 且两家模型同时读错也推翻不了 OCR。
+    返回 (读数或 None, [OCR 读数, 各家模型读数...])。没装 OCR 时退回 read_form_zoomed。"""
+    from . import ocr_read
+    from .ui_agent import _has_key
+    if not ocr_read.available():
+        return read_form_zoomed(qty_area)
+    png = screenshot_windows()
+    ocr = ocr_read.parse_panel(ocr_read.text_of(ocr_read.ocr_boxes(png, CODE_AREA, 3)),
+                               ocr_read.text_of(ocr_read.ocr_boxes(png, qty_area or QTY_AREA, 3)))
+    reads = [ocr]
+    for prov, sc in (("minimax", 3), ("qwen", 3), ("deepseek", 3)):
+        if not _has_key(prov):
+            continue
+        try:
+            m = _form_by_model(png, prov, sc, qty_area)
+        except Exception:  # noqa: BLE001 —— 这一家挂了就问下一家
+            continue
+        reads.append(m)
+        if same_form(ocr, m):
+            return ocr, reads
+    return None, reads
+
+
 def submit_sell_repo(exp, bid_rate):
     if not in_session():
         return {"ok": False, "why": "不在连续竞价时段"}
@@ -303,9 +351,9 @@ def submit_sell_repo(exp, bid_rate):
     side, px = side_by_button()
     if side != "卖出":
         return {"ok": False, "why": f"提交按钮颜色判断方向为 {side} (不是卖出)", "pixels": px}
-    zoomed, reads = read_form_zoomed()
+    zoomed, reads = read_form_checked()
     if zoomed is None:
-        return {"ok": False, "why": "放大读回两次不一致", "reads": reads}
+        return {"ok": False, "why": "OCR 与模型读回对不上", "reads": reads}
     form = {**zoomed, "side": side}                            # 方向用按钮颜色, 不用模型读的页签
     same, bad = matches(form, exp)
     if not same:

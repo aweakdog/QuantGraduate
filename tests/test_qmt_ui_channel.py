@@ -102,15 +102,15 @@ def test_submit_sell_repo_refuses_before_clicking(monkeypatch):
     monkeypatch.setattr(ch, "side_by_button", lambda: ("卖出", {}))
     monkeypatch.setattr(ch, "click_xy_verified", lambda *a, **k: clicked.append(a) or {"ok": True})
     exp = ch.parse_expect("204001:SELL:1.105:10")
-    monkeypatch.setattr(ch, "read_form_zoomed", lambda: ({"code": "204001", "price": 1.105, "volume": 100}, []))
+    monkeypatch.setattr(ch, "read_form_checked", lambda qty_area=None: ({"code": "204001", "price": 1.105, "volume": 100}, []))
     assert ch.submit_sell_repo(exp, 1.105)["ok"] is False                                      # 表单读回 100 张
-    monkeypatch.setattr(ch, "read_form_zoomed", lambda: (None, [{"code": "60001"}, {"code": "204001"}]))
+    monkeypatch.setattr(ch, "read_form_checked", lambda qty_area=None: (None, [{"code": "60001"}, {"code": "204001"}]))
     assert ch.submit_sell_repo(exp, 1.105)["ok"] is False                                      # 两次读数不一致
-    monkeypatch.setattr(ch, "read_form_zoomed", lambda: ({"code": "204001", "price": 1.105, "volume": 10,
+    monkeypatch.setattr(ch, "read_form_checked", lambda qty_area=None: ({"code": "204001", "price": 1.105, "volume": 10,
                                                           "est_amount": 10000.0}, []))
     assert ch.submit_sell_repo(exp, 1.105)["ok"] is False                                      # 预估金额不对
     assert clicked == []
-    monkeypatch.setattr(ch, "read_form_zoomed", lambda: ({"code": "204001", "price": 1.105, "volume": 10,
+    monkeypatch.setattr(ch, "read_form_checked", lambda qty_area=None: ({"code": "204001", "price": 1.105, "volume": 10,
                                                           "est_amount": 1000.0}, []))
     monkeypatch.setattr(ch, "read", lambda kind, step=None: ({"dialogs": []}, {}))
     assert ch.submit_sell_repo(exp, 1.105)["ok"] is True and len(clicked) == 1
@@ -146,3 +146,24 @@ def test_tab_side_checks_button_color(monkeypatch):
     monkeypatch.setattr(ch, "side_by_button", lambda: ("买入", {}))
     assert ch.tab_side("买入")["ok"] and clicks[-1] == ch.BUY_TAB
     assert ch.tab_side("卖出")["ok"] is False and clicks[-1] == ch.SELL_TAB      # 点了但按钮还是橙色: 不算
+
+
+def test_read_form_checked_ocr_backed_by_one_model(monkeypatch):
+    import qmt_bridge.ocr_read as ocr
+    import qmt_bridge.ui_agent as ua
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ua, "_has_key", lambda name: True)
+    monkeypatch.setattr(ch, "screenshot_windows", lambda: b"png")
+    monkeypatch.setattr(ocr, "ocr_boxes", lambda png, box, scale: [])
+    monkeypatch.setattr(ocr, "text_of", lambda boxes: "")
+    good = {"code": "600703", "price": 9.48, "volume": 2100, "est_amount": None}
+    monkeypatch.setattr(ocr, "parse_panel", lambda a, b: dict(good))
+    asked = []
+    seq = {"minimax": {**good, "volume": 210}, "qwen": dict(good), "deepseek": dict(good)}
+    monkeypatch.setattr(ch, "_form_by_model", lambda png, prov, sc, area: asked.append(prov) or seq[prov])
+    form, reads = ch.read_form_checked()
+    assert form == good and asked == ["minimax", "qwen"] and len(reads) == 3       # MiniMax 读错, 千问附和 OCR
+    seq.update(qwen={**good, "price": 9.84}, deepseek={**good, "code": "600000"})
+    asked.clear()
+    form, reads = ch.read_form_checked()
+    assert form is None and asked == ["minimax", "qwen", "deepseek"]               # 没有一家附和: 不采用

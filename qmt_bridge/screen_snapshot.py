@@ -336,8 +336,12 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     t0 = time.time()
+    from .ui_lock import ui_lock
     try:
-        snap_ = take(a.kind, log=lambda m: print(m, flush=True))
+        with ui_lock(f"screen_snapshot:{a.kind}", wait_s=240):
+            snap_ = take(a.kind, log=lambda m: print(m, flush=True))
+    except TimeoutError as e:
+        snap_ = build_snapshot(a.kind, {}, [], [], [], None, [f"读屏程序异常: 界面被别的程序占用超过 4 分钟 ({e})"], {})
     except Exception as e:  # noqa: BLE001 —— 程序崩了也要推一份离线快照, 让 041 带着原因报警
         snap_ = build_snapshot(a.kind, {}, [], [], [], None, [f"读屏程序异常: {type(e).__name__}: {str(e)[:200]}"], {})
     snap_["qmt_version"] = qmt_version()

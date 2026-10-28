@@ -89,7 +89,7 @@ def run(dry_run, log=print, test_amount=None):
         click_xy_verified,
         confirm,
         pick_candidate,
-        read_form_zoomed,
+        read_form_checked,
         set_price,
         side_by_button,
         tab_sell,
@@ -133,11 +133,11 @@ def run(dry_run, log=print, test_amount=None):
     time.sleep(1.0)
     if not all(s.get("ok") for s in steps.values()):
         return {"ok": False, "status": "fill_failed", "steps": {k: v.get("ok") for k, v in steps.items()}}
-    form, reads = read_form_zoomed()
+    form, reads = read_form_checked()
     side, _ = side_by_button()
     bad = []
     if form is None:
-        bad.append("放大读回两次不一致")
+        bad.append("OCR 与模型读回对不上")
     else:
         if form.get("code") != "204001":
             bad.append(f"代码 {form.get('code')}")
@@ -205,8 +205,12 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--test-amount", type=int, help="只配合 --dry-run: 用这个金额演练填单")
     a = ap.parse_args(argv)
+    from .ui_lock import ui_lock
     try:
-        out = run(a.dry_run, log=lambda m: print(m, flush=True), test_amount=a.test_amount if a.dry_run else None)
+        with ui_lock("repo_daily", wait_s=300):
+            out = run(a.dry_run, log=lambda m: print(m, flush=True), test_amount=a.test_amount if a.dry_run else None)
+    except TimeoutError as e:
+        out = {"ok": False, "status": "ui_busy", "error": str(e)}
     except Exception as e:  # noqa: BLE001
         out = {"ok": False, "status": "exception", "error": f"{type(e).__name__}: {str(e)[:300]}"}
     if not a.dry_run and out.get("status") not in QUIET:

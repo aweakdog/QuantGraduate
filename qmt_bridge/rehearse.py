@@ -15,6 +15,8 @@ import time
 import urllib.request
 from datetime import date, datetime
 
+from .ocr_read import parse_panel  # noqa: F401 —— 读回解析在 ocr_read 里, 这里保留同名供测试和调用
+
 PANEL_LABELS = (250, 690, 560, 900)  # 委托价/总量/预估金额 这几个标签所在区域
 CODE_AREA = (520, 495, 720, 535)
 FORM_AREA = (250, 700, 520, 900)
@@ -51,16 +53,6 @@ def plan_orders(ticket, quotes, n=5):
     return out
 
 
-def parse_panel(code_text, form_text):
-    """OCR 读回的下单面板文字 -> {code, price, volume, est_amount}。"""
-    code = next(iter(re.findall(r"\d{6}", code_text)), None)
-    pm = re.search(r"委托价\s*(\d+\.\d+)", form_text)
-    vm = re.search(r"总[量里]\s*(\d+)", form_text)
-    em = re.search(r"预估金额\S*?\s*([\d ,]+\.\d+)\s*元", form_text)
-    return {"code": code, "price": float(pm.group(1)) if pm else None, "volume": int(vm.group(1)) if vm else None,
-            "est_amount": float(em.group(1).replace(" ", "").replace(",", "")) if em else None}
-
-
 def same(read, o):
     return (read.get("code") == o["code"] and read.get("price") is not None and abs(float(read["price"]) - o["price"]) < 1e-6
             and read.get("volume") is not None and int(float(read["volume"])) == o["shares"])
@@ -87,14 +79,9 @@ def ensure_code(o, tries=2):
 
 def fill_one(o, log=print):
     """填一笔并读回; 不提交。返回记录。"""
-    from .ocr_read import locate_text, ocr_boxes, text_of
+    from .ocr_read import locate_text
     from .ui_agent import screenshot_windows
-    from .ui_channel import (
-        click_xy_verified,
-        read_form_zoomed,
-        side_by_button,
-        tab_side,
-    )
+    from .ui_channel import click_xy_verified, read_form_checked, side_by_button, tab_side
     from .ui_order import backspace, select_all, type_digits
     t0, rec = time.time(), {**o, "problems": []}
     # 先切方向再输代码, 输完用 OCR 确认面板上确实是这只: 切页签时 QMT 会换回该页上次用的股票 (10-28 第一笔变成 600000);
@@ -132,16 +119,13 @@ def fill_one(o, log=print):
         from .ui_agent import click_windows
         click_windows(*est)
         time.sleep(1.0)
-    png = screenshot_windows()
-    rec["ocr"] = parse_panel(text_of(ocr_boxes(png, CODE_AREA, 3)), text_of(ocr_boxes(png, FORM_AREA, 3)))
-    model, _ = read_form_zoomed(qty_area=FORM_AREA)
-    rec["model"] = model
+    form, reads = read_form_checked(qty_area=FORM_AREA)
+    rec["ocr"], rec["model"] = reads[0], (reads[1] if len(reads) > 1 else None)
     rec["side_ok"] = side_by_button()[0] == o["side"]
-    rec["ocr_ok"], rec["model_ok"] = same(rec["ocr"], o), bool(model) and same(model, o)
-    if not rec["ocr_ok"]:
-        rec["problems"].append(f"OCR 读回不一致 {rec['ocr']}")
-    if not rec["model_ok"]:
-        rec["problems"].append(f"模型读回不一致 {model}")
+    rec["ocr_ok"], rec["model_ok"] = same(rec["ocr"], o), bool(rec["model"]) and same(rec["model"], o)
+    rec["backers"] = len(reads) - 1
+    if not (form and same(form, o)):
+        rec["problems"].append(f"读回不一致 OCR={rec['ocr']} 模型={reads[1:]}")
     r = click_xy_verified(lab_q[0] + QTY_DX, lab_q[1], "下单面板里「总量」右边的数字输入框", "", f"rh_clear_{o['code']}",
                           anchor=(lab_q[0], lab_q[1], "总"))
     if r["ok"]:                                               # 清空数量, 面板上不留填好的单
@@ -181,8 +165,14 @@ def main(argv=None):
     orders = plan_orders(ticket, quotes, a.max)
     print(f"[{datetime.now():%H:%M:%S}] 演练 {len(orders)} 笔 (空仓日用排名前 {a.max}): "
           + ", ".join(f"{o['side']}{o['code']}" for o in orders), flush=True)
-    probs = ensure_qmt_foreground(print)
-    results = [] if probs else [fill_one(o) for o in orders]
+    from .ui_lock import ui_lock
+    try:
+        with ui_lock("rehearse", wait_s=60):
+            probs = ensure_qmt_foreground(print)
+            results = [] if probs else [fill_one(o) for o in orders]
+    except TimeoutError as e:
+        print(f"界面被占用, 今天的演练跳过: {e}", flush=True)
+        return 0
     bad = probs + [f"{r['side']} {r['code']}: {'; '.join(r['problems'])}" for r in results if r["problems"]]
     rep = {"today": today, "mode": "rehearsal", "results": results, **({"problems": bad} if bad else {})}
     signed_post(f"{BASE_URL}/api/qmt/exec_report", rep, key)
