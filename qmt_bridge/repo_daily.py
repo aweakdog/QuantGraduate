@@ -174,7 +174,8 @@ def run(dry_run, log=print):
             "note": note, "push": status}
 
 
-QUIET = {"lent", "already_done", "nothing_to_lend", "defer_to_afternoon", "dry_run", "outside_window"}
+# check_failed = 已提交但事后核对没通过: run() 已把具体情况写进快照 notes 推送, 不再另发「没做成」(10-28 那条说法不对)
+QUIET = {"lent", "already_done", "nothing_to_lend", "defer_to_afternoon", "dry_run", "outside_window", "check_failed"}
 
 
 def failure_text(out, now=None):
