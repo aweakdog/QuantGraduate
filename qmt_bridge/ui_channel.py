@@ -166,15 +166,19 @@ def tab_sell():
     return tab_side("卖出")
 
 
+# 点击后等界面刷新的时间 (10-28 收盘后由 1.5 秒缩短; 每步之后都有核对, 等得不够会被发现而不是出错)
+CLICK_SETTLE = 0.6
+
+
 def type_code(code):
     """点证券代码区 -> 清空 -> 只敲数字。不按回车; 之后截图看是否出现下拉候选。"""
     from .ui_order import backspace, select_all, type_digits
     out = click_xy_checked(*CODE_BOX, "type_code")
-    time.sleep(0.5)
+    time.sleep(0.3)
     select_all()
     backspace()
     type_digits(code)
-    time.sleep(2.0)
+    time.sleep(1.2)
     out["after_typing"] = str(snap("type_code_typed")[1])
     return out
 
@@ -198,7 +202,7 @@ def pick_candidate(code, name=None):
         click_windows(*CANDIDATE_ROW)
         time.sleep(0.08)
         click_windows(*CANDIDATE_ROW)
-        time.sleep(1.5)
+        time.sleep(0.8)
         out["after_pick"] = str(snap("pick_candidate_done")[1])
     return out
 
@@ -407,7 +411,7 @@ def click_xy_checked(x, y, step):
     """固定坐标点击 (只用于关闭已知的信息类通知), 前后截图供人工核对。"""
     before = snap(step + "_before")[1]
     click_windows(x, y)
-    time.sleep(1.5)
+    time.sleep(CLICK_SETTLE)
     return {"ok": True, "xy": (x, y), "before": str(before), "after": str(snap(step + "_after")[1])}
 
 
@@ -441,7 +445,7 @@ def click_xy_verified(x, y, target, expect, step, anchor=None):
     out = {"ok": ok, "xy": (x, y), "verify": v, "before": str(before)}
     if ok:
         click_windows(x, y)
-        time.sleep(1.5)
+        time.sleep(CLICK_SETTLE)
         out["after"] = str(snap(step + "_after")[1])
     return out
 

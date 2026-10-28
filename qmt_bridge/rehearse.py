@@ -73,7 +73,7 @@ def ensure_code(o, tries=2):
             return True
         type_code(o["code"])
         if pick_candidate(o["code"], o.get("name"))["ok"]:
-            time.sleep(1.5)
+            time.sleep(0.6)
     return panel_code() == o["code"]
 
 
