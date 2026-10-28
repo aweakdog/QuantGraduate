@@ -202,6 +202,10 @@ def test_read_agreed_ocr_plus_one_model(monkeypatch):
     monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None: calls.append(provider) or seq.pop(0))
     val, meta, _ = ss.read_agreed(b"", ss.FUNDS_BOX, "", ss.canon_funds, ocr_kind="funds")
     assert val["available"] == 503121.8 and meta["sources"] == ["ocr", "minimax", "deepseek"]   # 第三家与 OCR 一致
+    seq = [bad, dict(bad)]                                                                  # 两家模型犯同样的错
+    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None: seq.pop(0))
+    val, meta, _ = ss.read_agreed(b"", ss.FUNDS_BOX, "", ss.canon_funds, ocr_kind="funds")
+    assert val is None and meta["agreed"] is False                                          # 不能推翻 OCR
     monkeypatch.setattr(ocr, "read_table", lambda png, box, kind: None)                     # OCR 认不出表头
     calls.clear()
     monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None: calls.append(provider) or dict(good))

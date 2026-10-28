@@ -229,7 +229,8 @@ PRICE_BOX_REPO = (367, 752)   # 10-27 量出: 选中 GC001 后「委托价」输
 def set_price(price):
     """点量好的委托价框 (复核十字在输入框上) -> 全选 -> 退格 -> 只敲数字和小数点。不按回车。"""
     from .ui_order import backspace, select_all, type_digits
-    out = click_xy_verified(*PRICE_BOX_REPO, "下单面板里「委托价」右边的数字输入框", "", "set_price")
+    out = click_xy_verified(*PRICE_BOX_REPO, "下单面板里「委托价」右边的数字输入框", "", "set_price",
+                            anchor=(298, 752, "委托价"))
     if not out["ok"]:
         return out
     time.sleep(0.3)
@@ -344,10 +345,33 @@ def click_xy_checked(x, y, step):
     return {"ok": True, "xy": (x, y), "before": str(before), "after": str(snap(step + "_after")[1])}
 
 
-def click_xy_verified(x, y, target, expect, step):
-    """量好的坐标 + 独立复核: 放大该点, 十字下必须正是预期按钮才点 (密集工具栏里模型定位会偏一格)。"""
+def ocr_anchor(png, x, y, text, rx=80, ry=20, tol=25):
+    """本地 OCR 核对固定位置的文字 (不联网、结果确定): (x,y) 附近要正好有一处包含 text 的文字, 且其中心离 (x,y)
+    不超过 tol 像素。返回 (True/False/None, 说明); None = 这里用不了 OCR (没装, 或没有可核对的文字)。"""
+    from . import ocr_read
+    if not text or not ocr_read.available():
+        return None, "不用 OCR"
+    try:
+        c = ocr_read.locate_text(png, text, (max(0, x - rx), max(0, y - ry), x + rx, y + ry), 3)
+    except Exception as e:  # noqa: BLE001
+        return None, f"OCR 出错 {type(e).__name__}"
+    if c is None:
+        return False, f"附近没有唯一的「{text}」"
+    d = ((c[0] - x) ** 2 + (c[1] - y) ** 2) ** 0.5
+    return d <= tol, f"OCR 看到「{text}」偏 {d:.0f}px"
+
+
+def click_xy_verified(x, y, target, expect, step, anchor=None):
+    """量好的坐标 + 核对后才点。先用本地 OCR 核对 (点击处的文字 expect, 或给定的旁边固定标签 anchor=(x, y, 文字),
+    用于输入框这类本身没有固定文字的目标); OCR 确认了就直接点, 确认不了才退回模型放大复核 (10-28 起)。"""
     png, before = snap(step + "_before")
-    ok, v = verify_point(png, x, y, target, expect)
+    ax, ay, atext = anchor or (x, y, expect)
+    a_ok, a_why = ocr_anchor(png, ax, ay, atext)
+    if a_ok:
+        ok, v = True, {"by": "ocr", "why": a_why}
+    else:
+        ok, v = verify_point(png, x, y, target, expect)
+        v = {**v, "by": "model", "ocr": a_why}
     out = {"ok": ok, "xy": (x, y), "verify": v, "before": str(before)}
     if ok:
         click_windows(x, y)

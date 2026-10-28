@@ -30,19 +30,21 @@ TOP_TAB_STOCK = (110, 51, "股票交易")      # 10-27 量出: 顶部页签栏�
 EXPECTED_ACCOUNT_LAST4 = os.environ.get("QMT_ACCOUNT_LAST4", "6735")
 FUNDS_BOX = (780, 742, 1920, 830)
 
+SPACE_HINT = ("注意: 这个软件用空格分隔千位, 例如「50 3121.80」是 503121.80、「43 4000.00」是 434000.00, "
+              "读数时把空格去掉再转数值, 不要丢位。")
 FUNDS_PROMPT = ("这是 QMT「账号资金」表格的放大截图。只返回 JSON: {account_last4 (资金账号后4位), total_asset (总资产), "
                 "available (可用金额), frozen (冻结金额), market_value (总市值), withdrawable (可取金额), "
-                "login_status (登录状态那一列的文字)}。数字转数值, 看不清填 null, 不要猜。")
+                "login_status (登录状态那一列的文字)}。数字转数值, 看不清填 null, 不要猜。" + SPACE_HINT)
 TABLE_PROMPTS = {
     "positions": ("这是 QMT「持仓」表格的放大截图。逐行读出, 只返回 JSON: {rows: [{code (6位证券代码), name, "
                   "volume (持仓数量/当前拥股), can_use (可用数量), cost (成本价), market_value (市值)}]}。"
-                  "表格为空就 rows=[]。数字转数值, 看不清填 null, 不要猜, 不要把别的列错填进来。"),
+                  "表格为空就 rows=[]。数字转数值, 看不清填 null, 不要猜, 不要把别的列错填进来。" + SPACE_HINT),
     "trades": ("这是 QMT「成交」表格的放大截图。逐行读出, 只返回 JSON: {rows: [{time (成交时间), code (6位证券代码), "
                "side (买入/卖出), price (成交价格/成交均价), volume (成交数量), amount (成交金额), order_id (合同编号), "
-               "trade_id (成交编号)}]}。表格为空就 rows=[]。数字转数值, 看不清填 null, 不要把别的列错填进来。"),
+               "trade_id (成交编号)}]}。表格为空就 rows=[]。数字转数值, 看不清填 null, 不要把别的列错填进来。" + SPACE_HINT),
     "orders": ("这是 QMT「委托」表格的放大截图。逐行读出, 只返回 JSON: {rows: [{time (委托时间), code (6位证券代码), "
                "side (买入/卖出), price (委托价格), volume (委托量), traded_volume (成交数量, 注意不是委托剩余量), "
-               "status (委托状态), order_id (合同编号, 注意不是资金账号)}]}。表格为空就 rows=[]。"),
+               "status (委托状态), order_id (合同编号, 注意不是资金账号)}]}。表格为空就 rows=[]。" + SPACE_HINT),
 }
 
 
@@ -140,12 +142,20 @@ def read_agreed(png, box, prompt, canon, scales=(2, 3, 2.5), ocr_kind=None):
     else:
         reads = [read_box(png, box, prompt, scales[0], "deepseek"), read_box(png, box, prompt, scales[1], second)]
         sources = ["deepseek", second or "deepseek"]
-    val, cs = agree(reads, canon)
+    pick = ocr_backed if sources[0] == "ocr" else agree
+    val, cs = pick(reads, canon)
     if val is None:
         reads.append(read_box(png, box, prompt, scales[2], "deepseek"))
         sources.append("deepseek")
-        val, cs = agree(reads, canon)
+        val, cs = pick(reads, canon)
     return val, {"reads": len(reads), "agreed": val is not None, "sources": sources}, reads
+
+
+def ocr_backed(reads, canon):
+    """有 OCR 读数时, 必须有一家模型与 OCR 一致才采用; 两家模型联手推翻 OCR 不算 (10-28: 「43 4000.00」两家模型
+    都读成 43400, OCR 读对 434000, 按多数会采用错的)。reads[0] 是 OCR。"""
+    cs = [json.dumps(canon(r), ensure_ascii=False, sort_keys=True) for r in reads]
+    return (json.loads(cs[0]) if cs[0] in cs[1:] else None), cs
 
 
 def checks(funds, positions, trades, orders):

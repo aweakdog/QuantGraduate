@@ -114,3 +114,27 @@ def test_submit_sell_repo_refuses_before_clicking(monkeypatch):
                                                           "est_amount": 1000.0}, []))
     monkeypatch.setattr(ch, "read", lambda kind, step=None: ({"dialogs": []}, {}))
     assert ch.submit_sell_repo(exp, 1.105)["ok"] is True and len(clicked) == 1
+
+
+def test_click_xy_verified_uses_ocr_first_then_model(monkeypatch):
+    import qmt_bridge.ocr_read as ocr
+    clicks, model = [], []
+    monkeypatch.setattr(ch, "snap", lambda step: (b"png", step))
+    monkeypatch.setattr(ch, "click_windows", lambda x, y: clicks.append((x, y)))
+    monkeypatch.setattr(ch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ch, "verify_point", lambda *a, **k: model.append(a) or (True, {"is_target": True}))
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "locate_text", lambda png, text, box, scale: (112, 52))
+    out = ch.click_xy_verified(110, 51, "股票交易页签", "股票交易", "t")
+    assert out["ok"] and out["verify"]["by"] == "ocr" and clicks == [(110, 51)] and model == []   # OCR 确认: 不调模型
+    monkeypatch.setattr(ocr, "locate_text", lambda png, text, box, scale: (180, 52))             # 偏 70px: 不算
+    out = ch.click_xy_verified(110, 51, "股票交易页签", "股票交易", "t")
+    assert out["verify"]["by"] == "model" and len(model) == 1                                     # 退回模型复核
+    monkeypatch.setattr(ch, "verify_point", lambda *a, **k: (False, {"is_target": False}))
+    monkeypatch.setattr(ocr, "locate_text", lambda png, text, box, scale: None)
+    n = len(clicks)
+    assert ch.click_xy_verified(110, 51, "股票交易页签", "股票交易", "t")["ok"] is False and len(clicks) == n   # 都不认: 不点
+    seen = []
+    monkeypatch.setattr(ocr, "locate_text", lambda png, text, box, scale: seen.append(text) or (298, 752))
+    assert ch.click_xy_verified(367, 752, "委托价输入框", "", "t", anchor=(298, 752, "委托价"))["verify"]["by"] == "ocr"
+    assert seen == ["委托价"]                                                                       # 输入框核对旁边的标签

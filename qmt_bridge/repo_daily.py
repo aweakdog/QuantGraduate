@@ -70,7 +70,7 @@ def quote_bid():
 def set_volume(lots):
     from .ui_channel import click_xy_verified
     from .ui_order import backspace, select_all, type_digits
-    out = click_xy_verified(*QTY_BOX_REPO, "下单面板里「总量」右边的数字输入框", "", "repo_qty")
+    out = click_xy_verified(*QTY_BOX_REPO, "下单面板里「总量」右边的数字输入框", "", "repo_qty", anchor=(305, 847, "总量"))
     if out["ok"]:
         time.sleep(0.3)
         select_all()
@@ -98,7 +98,7 @@ def run(dry_run, log=print):
 
     today = date.today().isoformat()
     marker = DONE_DIR / f"{today}.json"
-    if marker.exists():
+    if marker.exists() and not dry_run:            # 演练不受「今天已做过」限制, 便于收盘后测试
         return {"ok": True, "status": "already_done"}
     now = datetime.now().strftime("%H:%M:%S")
     if not dry_run and not any(a <= now <= b for a, b in WINDOWS):
@@ -152,6 +152,7 @@ def run(dry_run, log=print):
     if dry_run or not ENABLED.exists():
         set_volume(0)
         return {"ok": True, "status": "dry_run", "exp": exp, "reads": reads,
+                "verified_by": {k: (v.get("verify") or {}).get("by") for k, v in steps.items()},
                 "why": "演练 (--dry-run)" if dry_run else f"开关文件 {ENABLED} 不存在, 只演练"}
     sub = click_xy_verified(*SELL_BTN, "下单面板的绿色「卖出」提交按钮", "卖", "repo_submit")
     if not sub["ok"]:
