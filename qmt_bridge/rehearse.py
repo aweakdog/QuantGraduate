@@ -83,10 +83,17 @@ def fill_one(o, log=print):
     from .ui_agent import screenshot_windows
     from .ui_channel import click_xy_verified, read_form_checked, side_by_button, tab_side
     from .ui_order import backspace, select_all, type_digits
-    t0, rec = time.time(), {**o, "problems": []}
+    t0, rec = time.time(), {**o, "problems": [], "t": {}}
+    last = [t0]
+
+    def lap(name):                                   # 各环节耗时, 找慢在哪
+        now = time.time()
+        rec["t"][name] = round(now - last[0], 1)
+        last[0] = now
     # 先切方向再输代码, 输完用 OCR 确认面板上确实是这只: 切页签时 QMT 会换回该页上次用的股票 (10-28 第一笔变成 600000);
     # 面板还是逆回购 GC001 时点「买入」不生效 (个人不能正回购), 那就先输代码再切一次
     first = tab_side(o["side"])
+    lap("tab")
     if not ensure_code(o):
         rec["problems"].append("面板上的代码不是目标股票")
         return {**rec, "seconds": round(time.time() - t0, 1)}
@@ -95,6 +102,7 @@ def fill_one(o, log=print):
         if not c["ok"] or not ensure_code(o):
             rec["problems"].append(f"切到「{o['side']}」失败 (按钮方向 {c['verify'].get('side')})")
             return {**rec, "seconds": round(time.time() - t0, 1)}
+    lap("code")
     time.sleep(0.5)
     png = screenshot_windows()
     lab_p = locate_text(png, "委托价", PANEL_LABELS, 2)
@@ -114,12 +122,15 @@ def fill_one(o, log=print):
         backspace()
         type_digits(val)
         time.sleep(0.5)
+    lap("fill")
     est = locate_text(screenshot_windows(), "预估金额", PANEL_LABELS, 2)
     if est:                                                   # 点一下标签让输入框失焦, 预估金额才刷新
         from .ui_agent import click_windows
         click_windows(*est)
         time.sleep(1.0)
+    lap("blur")
     form, reads = read_form_checked(qty_area=FORM_AREA)
+    lap("readback")
     rec["ocr"], rec["model"] = reads[0], (reads[1] if len(reads) > 1 else None)
     rec["side_ok"] = side_by_button()[0] == o["side"]
     rec["ocr_ok"], rec["model_ok"] = same(rec["ocr"], o), bool(rec["model"]) and same(rec["model"], o)
@@ -132,9 +143,10 @@ def fill_one(o, log=print):
         select_all()
         backspace()
         type_digits("0")
+    lap("clear")
     rec["seconds"] = round(time.time() - t0, 1)
     log(f"  {o['side']} {o['code']} {o['name']} {o['price']}×{o['shares']}: OCR {'✓' if rec['ocr_ok'] else '✗'} "
-        f"模型 {'✓' if rec['model_ok'] else '✗'} 方向 {'✓' if rec['side_ok'] else '✗'} {rec['seconds']}s")
+        f"模型 {'✓' if rec['model_ok'] else '✗'} 方向 {'✓' if rec['side_ok'] else '✗'} {rec['seconds']}s {rec['t']}")
     return rec
 
 

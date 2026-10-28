@@ -159,11 +159,11 @@ def test_read_form_checked_ocr_backed_by_one_model(monkeypatch):
     good = {"code": "600703", "price": 9.48, "volume": 2100, "est_amount": None}
     monkeypatch.setattr(ocr, "parse_panel", lambda a, b: dict(good))
     asked = []
-    seq = {"minimax": {**good, "volume": 210}, "qwen": dict(good), "deepseek": dict(good)}
+    seq = {"deepseek": {**good, "volume": 210}, "minimax": dict(good), "qwen": dict(good)}
     monkeypatch.setattr(ch, "_form_by_model", lambda png, prov, sc, area: asked.append(prov) or seq[prov])
     form, reads = ch.read_form_checked()
-    assert form == good and asked == ["minimax", "qwen"] and len(reads) == 3       # MiniMax 读错, 千问附和 OCR
-    seq.update(qwen={**good, "price": 9.84}, deepseek={**good, "code": "600000"})
+    assert form == good and asked == ["deepseek", "minimax"] and len(reads) == 3   # DeepSeek 读错, MiniMax 附和 OCR
+    seq.update(minimax={**good, "price": 9.84}, qwen={**good, "code": "600000"})
     asked.clear()
     form, reads = ch.read_form_checked()
-    assert form is None and asked == ["minimax", "qwen", "deepseek"]               # 没有一家附和: 不采用
+    assert form is None and asked == ["deepseek", "minimax", "qwen"]               # 没有一家附和: 不采用

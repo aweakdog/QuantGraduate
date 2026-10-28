@@ -302,8 +302,8 @@ def _form_by_model(png, provider, scale, qty_area):
         got, _ = ask(part, ZOOM_PROMPT, provider=provider, fallbacks=())
         r.update({k: v for k, v in got.items() if v is not None})
     code = str(r.get("code") or "")[:6]
-    if not code and str(r.get("name") or "").strip().upper() == "GC001":
-        code = "204001"
+    if code.upper() == "GC001" or (not code and str(r.get("name") or "").strip().upper() == "GC001"):
+        code = "204001"         # 千问常把名称 GC001 填进代码
     return {"code": code or None, "price": r.get("price"), "volume": r.get("volume"), "est_amount": r.get("est_amount"),
             "name": r.get("name")}
 
@@ -329,7 +329,8 @@ def read_form_checked(qty_area=None):
     ocr = ocr_read.parse_panel(ocr_read.text_of(ocr_read.ocr_boxes(png, CODE_AREA, 3)),
                                ocr_read.text_of(ocr_read.ocr_boxes(png, qty_area or QTY_AREA, 3)))
     reads = [ocr]
-    for prov, sc in (("minimax", 3), ("qwen", 3), ("deepseek", 3)):
+    # 面板读回只比代码/价格/数量 (没有空格千分位的大数), DeepSeek 读得准又快 (约 2 秒), 先问它 (10-28)
+    for prov, sc in (("deepseek", 3), ("minimax", 3), ("qwen", 3)):
         if not _has_key(prov):
             continue
         try:
