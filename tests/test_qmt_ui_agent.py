@@ -133,3 +133,18 @@ def test_non_transient_error_is_not_retried(monkeypatch):
     with pytest.raises(urllib.error.HTTPError):
         ua.ask(b"\x89PNG", "q", key="k", opener=opener, provider="deepseek")
     assert len(calls) == 1
+
+
+def test_locate_never_falls_back_to_deepseek(monkeypatch):
+    import qmt_bridge.ui_agent as ua
+    monkeypatch.setattr(ua.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ua, "_has_key", lambda name: True)
+    monkeypatch.setattr(ua, "provider_key", lambda name: "k")
+    monkeypatch.setattr(ua, "png_size", lambda png: (1920, 1080))
+    opener, calls = _fake_opener([529, 529, 529, 529, 529, 529])                # MiniMax、千问都挂
+    import urllib.error
+
+    import pytest
+    with pytest.raises(urllib.error.HTTPError):
+        ua.locate(b"\x89PNG", "某按钮", opener=opener)
+    assert not any("deepseek" in c for c in calls) and any("dashscope" in c for c in calls)

@@ -121,10 +121,11 @@ def _post(req, opener, timeout):
 FALLBACK = {"minimax": ("qwen", "deepseek"), "qwen": ("deepseek",), "deepseek": ("qwen",)}
 
 
-def ask(png, prompt, key=None, timeout=90, opener=urllib.request.urlopen, retries=1, provider=None):
-    """一次视觉问答。临时错误先重试; 仍不行按 FALLBACK 换下一家顶上 (meta 里记 fallback)。"""
+def ask(png, prompt, key=None, timeout=90, opener=urllib.request.urlopen, retries=1, provider=None, fallbacks=None):
+    """一次视觉问答。临时错误先重试; 仍不行按 FALLBACK (或传入的 fallbacks) 换下一家顶上 (meta 里记 fallback)。"""
     name = provider or provider_name()
-    chain = [name] + ([] if key is not None else [p for p in FALLBACK.get(name, ()) if _has_key(p)])
+    nxt = FALLBACK.get(name, ()) if fallbacks is None else fallbacks
+    chain = [name] + ([] if key is not None else [p for p in nxt if _has_key(p)])
     for i, prov in enumerate(chain):
         try:
             data, meta = _ask_once(png, prompt, key if i == 0 else None, timeout, opener, retries, prov)
@@ -160,6 +161,10 @@ def describe(png, **kw):
     return ask(png, DESCRIBE_PROMPT.format(w=w, h=h), **kw)
 
 
+# 定位不用 DeepSeek (10-28 评测: 它的坐标时而是缩小图上的像素 (约 0.93 倍), 时而是 0-1000 相对值, 无法稳定换算)
+LOCATE_FALLBACKS = ("qwen",)
+
+
 def to_pixels(provider, x, y, w, h):
     """Qwen3-VL 的坐标是 0-1000 相对坐标 (10-28 评测发现), 换算成原图像素; 其他家原样返回。"""
     if PROVIDERS.get(provider or "", {}).get("coords") == "norm1000":
@@ -172,6 +177,7 @@ def locate(png, target, **kw):
     w, h = png_size(png)
     if "provider" not in kw and _has_key("minimax"):
         kw["provider"] = "minimax"
+        kw.setdefault("fallbacks", LOCATE_FALLBACKS)
     loc, meta = ask(png, LOCATE_PROMPT.format(w=w, h=h, target=target), **kw)
     used = meta.get("fallback") or kw.get("provider")
     if loc.get("found") and loc.get("x") is not None and loc.get("y") is not None:
