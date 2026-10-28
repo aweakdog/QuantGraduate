@@ -31,3 +31,10 @@ def test_morning_only_on_confirmed_cash_days():
     assert not rd.morning_ok({"buy": [{"code": "600000"}], "sell": []})
     assert not rd.morning_ok({"buy": [], "sell": [{"code": "600000"}]})
     assert not rd.morning_ok(None)                              # 取不到计划: 留给下午
+
+
+def test_failure_text_and_quiet_statuses():
+    t = rd.failure_text({"status": "exception", "error": "HTTPError: HTTP Error 529"}, now="10:30")
+    assert "529" in t and "14:40" in t
+    assert "不再重试" in rd.failure_text({"status": "readback_mismatch", "bad": ["代码 60001"]}, now="14:41")
+    assert {"lent", "defer_to_afternoon", "nothing_to_lend"} <= rd.QUIET and "exception" not in rd.QUIET

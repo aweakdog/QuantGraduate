@@ -67,3 +67,59 @@ def test_crop_accepts_fractional_scale():
     Image.new("RGB", (1920, 1080), "white").save(buf, format="PNG")
     part, (x0, y0, s) = crop(buf.getvalue(), 1350, 610, w=1140, h=256, scale=2.5, mark=False)
     assert png_size(part) == (2850, 640) and (x0, y0, s) == (780, 482, 2.5)
+
+
+def _fake_opener(script):
+    """script: 依次返回的结果; Exception 实例就抛出, dict 就当 JSON 回复。"""
+    import io
+    import json as _j
+    import urllib.error
+
+    calls = []
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def opener(req, timeout=None):
+        calls.append(req.full_url)
+        item = script.pop(0)
+        if isinstance(item, int):
+            raise urllib.error.HTTPError(req.full_url, item, "err", {}, None)
+        return _Resp(_j.dumps({"choices": [{"message": {"content": _j.dumps(item)}}]}).encode())
+    return opener, calls
+
+
+def test_transient_529_is_retried_then_succeeds(monkeypatch):
+    import qmt_bridge.ui_agent as ua
+    monkeypatch.setattr(ua.time, "sleep", lambda s: None)
+    opener, calls = _fake_opener([529, {"ok": 1}])
+    data, meta = ua.ask(b"\x89PNG", "q", key="k", opener=opener, provider="minimax")
+    assert data == {"ok": 1} and len(calls) == 2 and "fallback" not in meta
+
+
+def test_minimax_keeps_failing_falls_back_to_deepseek(monkeypatch):
+    import qmt_bridge.ui_agent as ua
+    monkeypatch.setattr(ua.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ua, "provider_key", lambda name: "mm")
+    monkeypatch.setattr(ua, "load_key", lambda: "ds")
+    opener, calls = _fake_opener([529, 529, 529, {"ok": 2}])
+    data, meta = ua.ask(b"\x89PNG", "q", opener=opener, provider="minimax")
+    assert data == {"ok": 2} and meta["fallback"] == "deepseek"
+    assert "minimaxi" in calls[0] and "deepseek" in calls[-1]
+
+
+def test_non_transient_error_is_not_retried(monkeypatch):
+    import urllib.error
+
+    import pytest
+
+    import qmt_bridge.ui_agent as ua
+    monkeypatch.setattr(ua.time, "sleep", lambda s: None)
+    opener, calls = _fake_opener([401])
+    with pytest.raises(urllib.error.HTTPError):
+        ua.ask(b"\x89PNG", "q", key="k", opener=opener, provider="deepseek")
+    assert len(calls) == 1

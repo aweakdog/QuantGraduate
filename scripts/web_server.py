@@ -1830,11 +1830,12 @@ async def api_qmt_exec_report(req: Request):
     rep, err = await _qmt_signed_json(req)
     if err is not None:
         return err
-    if not rep.get("today") or rep.get("mode") not in ("shadow", "live", "skipped"):
+    if not rep.get("today") or rep.get("mode") not in ("shadow", "live", "skipped", "repo"):
         return JSONResponse({"error": "回报缺 today/mode"}, status_code=400)
     path = qmt_sync.store_exec_report(LIVE_DIR, rep)
     if rep.get("orders") or rep.get("errors") or rep.get("problems"):
-        tag = {"shadow": "【QMT 影子】若开启自动下单, 今天会", "live": "【QMT】自动下单", "skipped": "【QMT】今天没有下单"}[rep["mode"]]
+        tag = {"shadow": "【QMT 影子】若开启自动下单, 今天会", "live": "【QMT】自动下单", "skipped": "【QMT】今天没有下单",
+               "repo": "【QMT】逆回购没做成"}[rep["mode"]]
         lines = [f"{tag}:"]
         for o in rep.get("orders") or []:
             act = "卖" if o.get("side") == "sell" else "买"

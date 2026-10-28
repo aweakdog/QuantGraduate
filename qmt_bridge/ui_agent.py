@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -95,9 +96,39 @@ def parse_reply(resp):
     return data
 
 
+TRANSIENT = {429, 500, 502, 503, 504, 529}
+
+
+def _post(req, opener, timeout):
+    """发请求; 限流/过载/超时这类临时错误等 2 秒、5 秒各重试一次 (10-28: MiniMax 返回 529 过载, 上午逆回购因此中断)。"""
+    for wait in (2, 5, None):
+        try:
+            with opener(req, timeout=timeout) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code not in TRANSIENT or wait is None:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if wait is None:
+                raise
+        time.sleep(wait)
+
+
 def ask(png, prompt, key=None, timeout=90, opener=urllib.request.urlopen, retries=1, provider=None):
-    """一次视觉问答。回复不是合法 JSON (多半是输出被截断) 时提醒精简后重试一次。"""
+    """一次视觉问答。临时错误先重试; MiniMax 重试后仍不行就换 DeepSeek 顶上 (meta 里记 fallback)。"""
     name = provider or provider_name()
+    try:
+        return _ask_once(png, prompt, key, timeout, opener, retries, name)
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        if name == "deepseek" or key is not None:
+            raise
+        data, meta = _ask_once(png, prompt, None, timeout, opener, retries, "deepseek")
+        meta["fallback"] = "deepseek"
+        return data, meta
+
+
+def _ask_once(png, prompt, key, timeout, opener, retries, name):
+    """回复不是合法 JSON (多半是输出被截断) 时提醒精简后重试一次。"""
     key = key or (load_key() if name == "deepseek" else provider_key(name))
     t0 = time.time()
     for attempt in range(retries + 1):
@@ -105,8 +136,7 @@ def ask(png, prompt, key=None, timeout=90, opener=urllib.request.urlopen, retrie
         body = json.dumps(build_request(png, p, provider=name)).encode("utf-8")
         req = urllib.request.Request(PROVIDERS[name]["url"], data=body, headers={"Authorization": "Bearer " + key,
                                                                   "Content-Type": "application/json"})
-        with opener(req, timeout=timeout) as r:
-            resp = json.load(r)
+        resp = _post(req, opener, timeout)
         try:
             return parse_reply(resp), {"latency_s": round(time.time() - t0, 2), "usage": resp.get("usage", {}),
                                        "attempts": attempt + 1}

@@ -174,6 +174,28 @@ def run(dry_run, log=print):
             "note": note, "push": status}
 
 
+QUIET = {"lent", "already_done", "nothing_to_lend", "defer_to_afternoon", "dry_run", "outside_window"}
+
+
+def failure_text(out, now=None):
+    """没做成时发给 041 的一句话 (10-28: 上午因模型接口 529 中断, 之前失败只记日志不提醒)。"""
+    now = now or datetime.now().strftime("%H:%M")
+    why = out.get("why") or out.get("error") or out.get("bad") or ""
+    tail = "下午 14:40 会再试一次" if now < "12:00" else "今天不再重试, 钱留在账上"
+    return f"逆回购没做成 ({out.get('status')}): {str(why)[:200]}。{tail}"
+
+
+def report_failure(out):
+    try:
+        from .executor import BASE_URL, signed_post
+        from .push_snapshot import DEFAULT_KEY
+        key = Path(DEFAULT_KEY).read_text(encoding="utf-8").strip().encode()
+        signed_post(f"{BASE_URL}/api/qmt/exec_report",
+                    {"today": date.today().isoformat(), "mode": "repo", "problems": [failure_text(out)]}, key)
+    except Exception as e:  # noqa: BLE001
+        print(f"失败提醒也没发出去: {type(e).__name__}: {e}", flush=True)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dry-run", action="store_true")
@@ -182,6 +204,8 @@ def main(argv=None):
         out = run(a.dry_run, log=lambda m: print(m, flush=True))
     except Exception as e:  # noqa: BLE001
         out = {"ok": False, "status": "exception", "error": f"{type(e).__name__}: {str(e)[:300]}"}
+    if not a.dry_run and out.get("status") not in QUIET:
+        report_failure(out)
     print(json.dumps({"at": datetime.now().isoformat(timespec="seconds"), **out}, ensure_ascii=False, default=str)[:3000],
           flush=True)
     return 0 if out.get("ok") else 1
