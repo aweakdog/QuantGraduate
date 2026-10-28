@@ -254,14 +254,14 @@ ZOOM_PROMPT = ("这是交易软件下单面板一小块的放大图。只返回 
                "volume (总量), est_amount (预估金额)}}。图里没有的字段填 null, 数字转数值, 逐字读, 不要猜。")
 
 
-def read_form_zoomed():
+def read_form_zoomed(qty_area=None):
     """代码区、价量区各自裁剪放大读; 3/4 倍各读一次, (代码, 价, 量, 预估金额) 一致才返回, 否则 5 倍再读取多数。
     10-27: 同一张图 3 倍读出预估金额 1000、4 倍读出 501000, 所以预估金额也要参与比对。"""
     png = screenshot_windows()
 
     def one(scale):
         r = {}
-        for box in (CODE_AREA, QTY_AREA):
+        for box in (CODE_AREA, qty_area or QTY_AREA):
             x0, y0, x1, y1 = box
             part, _ = crop(png, (x0 + x1) / 2, (y0 + y1) / 2, w=x1 - x0, h=y1 - y0, scale=scale, mark=False)
             got, _ = ask(part, ZOOM_PROMPT)

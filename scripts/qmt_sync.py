@@ -349,6 +349,7 @@ def build_ticket(pid, state, plan, today, exec_date_of, switch, tranche_n):
               "slot_cap": round(equity / max(1, tranche_n) * 1.3, 2),
               "lots": [{"code": c, "shares": s} for c, s in sorted(held.items())],
               "sell": sells, "buy": buys, "in_cash": bool((plan or {}).get("in_cash")),
+              "ranked": [code6(c) for c in ((plan or {}).get("ranked") or [])[:10]],   # 空仓日填单演练用 (10-28)
               "plan_generated_at": (plan or {}).get("generated_at")}
     return ticket, probs
 
