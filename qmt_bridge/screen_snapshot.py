@@ -119,17 +119,33 @@ def read_box(png, box, prompt, scale, provider=None):
     return res
 
 
-def read_agreed(png, box, prompt, canon, scales=(2, 3, 2.5)):
-    """两家模型各读一次 (失误方式不同: 10-27 MiniMax 把「50 3121.80」读成 50312.8, DeepSeek 把资金账号当合同号),
-    一致才采用; 不一致再用 DeepSeek 换倍数读一次取多数。没有 MiniMax 密钥时退回同一家两种倍数。"""
+def read_agreed(png, box, prompt, canon, scales=(2, 3, 2.5), ocr_kind=None):
+    """本地 OCR 读一遍 + 一家模型独立读一遍, 一致才采用; 不一致再让 DeepSeek 读一次取多数 (10-28 起)。
+    OCR 不可用 (没装、认不出表头、出错) 时退回两家模型交叉核对: DeepSeek + MiniMax (10-27 MiniMax 把「50 3121.80」
+    读成 50312.8, DeepSeek 把资金账号当合同号, 所以要两家)。"""
+    from . import ocr_read
     from .ui_agent import _has_key
     second = "minimax" if _has_key("minimax") else None
-    reads = [read_box(png, box, prompt, scales[0], "deepseek"), read_box(png, box, prompt, scales[1], second)]
+    reads, sources = [], []
+    if ocr_kind and ocr_read.available():
+        try:
+            r = ocr_read.read_table(png, box, ocr_kind)
+        except Exception:  # noqa: BLE001 —— OCR 出错就当没读到, 由模型兜底
+            r = None
+        if r is not None:
+            reads, sources = [r], ["ocr"]
+    if reads:
+        reads.append(read_box(png, box, prompt, scales[1], second))
+        sources.append(second or "deepseek")
+    else:
+        reads = [read_box(png, box, prompt, scales[0], "deepseek"), read_box(png, box, prompt, scales[1], second)]
+        sources = ["deepseek", second or "deepseek"]
     val, cs = agree(reads, canon)
     if val is None:
         reads.append(read_box(png, box, prompt, scales[2], "deepseek"))
+        sources.append("deepseek")
         val, cs = agree(reads, canon)
-    return val, {"reads": len(reads), "agreed": val is not None, "second": second or "deepseek"}, reads
+    return val, {"reads": len(reads), "agreed": val is not None, "sources": sources}, reads
 
 
 def checks(funds, positions, trades, orders):
@@ -271,13 +287,14 @@ def take(kind, log=print):
             continue
         time.sleep(1.2)
         png, path = snap(f"snap_{kind_t}")
-        val, m, _ = read_agreed(png, TABLE_BOX, TABLE_PROMPTS[kind_t], lambda r, k=kind_t: canon_rows(k, r.get("rows")))
+        val, m, _ = read_agreed(png, TABLE_BOX, TABLE_PROMPTS[kind_t], lambda r, k=kind_t: canon_rows(k, r.get("rows")),
+                                ocr_kind=kind_t)
         meta["tabs"][kind_t] = {**m, "shot": str(path)}
         if val is None:
             problems.append(f"「{label}」表多次读数不一致")
         tables[kind_t] = val or []
     png, path = snap("snap_funds")
-    funds, m, reads = read_agreed(png, FUNDS_BOX, FUNDS_PROMPT, canon_funds)
+    funds, m, reads = read_agreed(png, FUNDS_BOX, FUNDS_PROMPT, canon_funds, ocr_kind="funds")
     meta["funds"] = {**m, "shot": str(path)}
     if funds is None:
         problems.append("资金表多次读数不一致")

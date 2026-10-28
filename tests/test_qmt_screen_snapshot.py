@@ -183,3 +183,27 @@ def test_repo_rows_compare_only_code_volume_amount():
     s2 = [{**s1[0], "time": "14:55:07"}]
     assert ss.canon_rows("trades", s1) == ss.canon_rows("trades", s2)                               # 秒数不同不算
     assert ss.canon_rows("trades", s1) != ss.canon_rows("trades", [{**s1[0], "price": 9.26}])      # 股票价格仍要一致
+
+
+def test_read_agreed_ocr_plus_one_model(monkeypatch):
+    import qmt_bridge.ocr_read as ocr
+    import qmt_bridge.ui_agent as ua
+    monkeypatch.setattr(ua, "_has_key", lambda name: True)
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    good = {"total_asset": 503121.8, "available": 503121.8, "frozen": 0, "market_value": 0, "account_last4": "6735"}
+    monkeypatch.setattr(ocr, "read_table", lambda png, box, kind: dict(good))
+    calls = []
+    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None: calls.append(provider) or dict(good))
+    val, meta, _ = ss.read_agreed(b"", ss.FUNDS_BOX, "", ss.canon_funds, ocr_kind="funds")
+    assert val["available"] == 503121.8 and meta["sources"] == ["ocr", "minimax"] and calls == ["minimax"]
+    bad = {**good, "total_asset": 50312.18, "available": 50312.18}                         # MiniMax 少读一位
+    seq = [bad, good]
+    calls.clear()
+    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None: calls.append(provider) or seq.pop(0))
+    val, meta, _ = ss.read_agreed(b"", ss.FUNDS_BOX, "", ss.canon_funds, ocr_kind="funds")
+    assert val["available"] == 503121.8 and meta["sources"] == ["ocr", "minimax", "deepseek"]   # 第三家与 OCR 一致
+    monkeypatch.setattr(ocr, "read_table", lambda png, box, kind: None)                     # OCR 认不出表头
+    calls.clear()
+    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None: calls.append(provider) or dict(good))
+    val, meta, _ = ss.read_agreed(b"", ss.FUNDS_BOX, "", ss.canon_funds, ocr_kind="funds")
+    assert meta["sources"] == ["deepseek", "minimax"] and val is not None                   # 退回两家模型

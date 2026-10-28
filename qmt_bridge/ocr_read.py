@@ -76,5 +76,100 @@ def locate_text(png, target, box=None, scale=2):
     return find_text([(t, s, c)], target, box_width=w)
 
 
+# 表头文字 -> 字段 (10-28 按 QMT 2.1.31.3 实际表头; 表头按「完全相等」匹配, 免得「委托量」认成「委托剩余量」)
+COLS = {
+    "positions": {"证券代码": "code", "证券名称": "name", "当前拥股": "volume", "可用数量": "can_use", "成本价": "cost",
+                  "市值": "market_value"},
+    "trades": {"成交时间": "time", "证券代码": "code", "证券名称": "name", "买卖标记": "side", "成交数量": "volume",
+               "成交价格": "price", "成交金额": "amount", "合同编号": "order_id"},
+    "orders": {"委托时间": "time", "证券代码": "code", "证券名称": "name", "买卖标记": "side", "委托量": "volume",
+               "成交数量": "traded_volume", "委托状态": "status", "委托价格": "price", "合同编号": "order_id"},
+    "funds": {"资金账号": "account", "登录状态": "login_status", "总资产": "total_asset", "总市值": "market_value",
+              "可用金额": "available", "冻结金额": "frozen", "可取金额": "withdrawable"},
+}
+NUMERIC = {"volume", "can_use", "cost", "market_value", "price", "amount", "traded_volume", "total_asset", "available",
+           "frozen", "withdrawable"}
+ROW_TOL = 7          # 同一行的文字框中心 y 相差不超过 7 像素
+
+
+def _number(text):
+    """「50 2000.00」(QMT 用空格分千位)、「5020张」「￥0」「1,234.5」都转成数; 转不了返回 None。"""
+    t = text.replace(" ", "").replace(",", "").replace("￥", "").replace("¥", "").rstrip("股张元")
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def parse_table(boxes, kind):
+    """boxes: ocr_boxes_w 的结果 [(text, score, (cx, cy), width)]。认不出表头返回 None (多半不在这一页), 否则返回
+    {"rows": [...]} (表格类) 或字段字典 (funds)。按表头横向中点划分列边界 (表头行上所有列都参与, 包括用不到的列),
+    按 y 聚成行, 跳过「合计」行。"""
+    cols = COLS[kind]
+    heads = [b for b in boxes if b[0].strip() in cols]
+    if len({b[0].strip() for b in heads}) < min(3, len(cols)):
+        return None
+    hy = sorted(b[2][1] for b in heads)[len(heads) // 2]
+    row_heads = sorted((b for b in boxes if abs(b[2][1] - hy) <= ROW_TOL), key=lambda b: b[2][0])
+    xs = [b[2][0] for b in row_heads]
+    bounds = [(-1e9 if i == 0 else (xs[i - 1] + xs[i]) / 2, 1e9 if i == len(xs) - 1 else (xs[i] + xs[i + 1]) / 2)
+              for i in range(len(xs))]
+    field_of = {i: cols.get(b[0].strip()) for i, b in enumerate(row_heads)}
+    body = sorted((b for b in boxes if b[2][1] > hy + ROW_TOL), key=lambda b: b[2][1])
+    rows, cur = [], []
+    for b in body:
+        if cur and abs(b[2][1] - cur[0][2][1]) > ROW_TOL:
+            rows.append(cur)
+            cur = []
+        cur.append(b)
+    if cur:
+        rows.append(cur)
+    out = []
+    for r in rows:
+        if any("合计" in b[0] for b in r):
+            continue
+        cells = {}
+        for b in sorted(r, key=lambda b: b[2][0]):
+            i = next((k for k, (lo, hi) in enumerate(bounds) if lo <= b[2][0] < hi), None)
+            f = field_of.get(i)
+            if f:
+                cells[f] = cells.get(f, "") + b[0].strip()
+        rec = {}
+        for f in cols.values():
+            v = cells.get(f)
+            if v is None:
+                rec[f] = None
+            elif f in NUMERIC:
+                rec[f] = _number(v)
+            elif f == "code":
+                m = next((v[i:i + 6] for i in range(len(v) - 5) if v[i:i + 6].isdigit()), None)
+                rec[f] = m
+            else:
+                rec[f] = v
+        out.append(rec)
+    if kind == "funds":
+        if not out:
+            return None
+        f = out[0]
+        acct = "".join(ch for ch in str(f.get("account") or "") if ch.isdigit())
+        return {**{k: f.get(k) for k in ("total_asset", "available", "frozen", "market_value", "withdrawable",
+                                          "login_status")}, "account_last4": acct[-4:] or None}
+    return {"rows": out}
+
+
+def read_table(png, box, kind, scale=2):
+    """在固定区域 OCR 后按表头解析; 认不出表头返回 None。"""
+    return parse_table(ocr_boxes_w(png, box, scale), kind)
+
+
+def available():
+    """这台机器能不能用 OCR (Windows 上装了 rapidocr; Mac 上一般没装)。"""
+    try:
+        import rapidocr  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def text_of(boxes):
     return " ".join(b[0] for b in sorted(boxes, key=lambda b: (b[2][1] // 8, b[2][0])))
