@@ -149,11 +149,21 @@ def submit_buy(exp, limit_down):
 
 
 SELL_TAB = (262, 587)     # 10-27 量出: 下单面板左侧竖排「卖出」页签 (竖排字, 放大后常只读出「卖」)
+BUY_TAB = (262, 523)
 CODE_BOX = (545, 505)     # 下单面板右上「证券名称/代码」区, 点它可输入代码
 
 
+def tab_side(side):
+    """切下单面板的买/卖页签: 纯界面切换 (不会产生委托), 点固定坐标, 点完看提交按钮颜色确认 (10-28: 竖排字模型
+    常把「买入」认成「卖出」而拒点, OCR 也读不了竖排)。颜色不对 ok=False。"""
+    xy = SELL_TAB if side == "卖出" else BUY_TAB
+    out = click_xy_checked(*xy, f"tab_{'sell' if side == '卖出' else 'buy'}")
+    got, px = side_by_button()
+    return {**out, "ok": got == side, "verify": {"by": "button_color", "side": got, "pixels": px}}
+
+
 def tab_sell():
-    return click_xy_verified(*SELL_TAB, "下单面板左侧竖排的「卖出」页签", "", "tab_sell")   # 竖排字只读得出一个字; 纯导航
+    return tab_side("卖出")
 
 
 def type_code(code):
@@ -172,7 +182,7 @@ def type_code(code):
 CANDIDATE_ROW = (633, 554)   # 输入代码后下拉候选的第一行 (10-27 量出)
 
 
-def pick_candidate(code):
+def pick_candidate(code, name=None):
     """双击下拉候选第一行 (10-27: 单击不生效; 不用回车选 —— 焦点万一不在代码框, 回车可能等于提交)。之后截图核对。"""
     png, before = snap("pick_candidate_before")
     a_ok, a_why = ocr_anchor(png, 555, CANDIDATE_ROW[1], code, rx=110)     # 候选行左边是代码 (10-28 量出 x≈555)
@@ -180,6 +190,8 @@ def pick_candidate(code):
         ok, v = True, {"by": "ocr", "why": a_why}
     else:
         ok, v = verify_point(png, *CANDIDATE_ROW, f"代码下拉候选列表里「{code}」那一行", "")   # 同一行有代码和名称
+        under = str(v.get("under_cross", ""))
+        ok = ok and (code in under or bool(name and name in under) or (code == "204001" and "GC001" in under))
         v = {**v, "by": "model", "ocr": a_why}
     out = {"ok": ok, "xy": CANDIDATE_ROW, "verify": v, "before": str(before)}
     if ok:

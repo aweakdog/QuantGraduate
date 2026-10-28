@@ -138,3 +138,11 @@ def test_click_xy_verified_uses_ocr_first_then_model(monkeypatch):
     monkeypatch.setattr(ocr, "locate_text", lambda png, text, box, scale: seen.append(text) or (298, 752))
     assert ch.click_xy_verified(367, 752, "委托价输入框", "", "t", anchor=(298, 752, "委托价"))["verify"]["by"] == "ocr"
     assert seen == ["委托价"]                                                                       # 输入框核对旁边的标签
+
+
+def test_tab_side_checks_button_color(monkeypatch):
+    clicks = []
+    monkeypatch.setattr(ch, "click_xy_checked", lambda x, y, step: clicks.append((x, y)) or {"ok": True})
+    monkeypatch.setattr(ch, "side_by_button", lambda: ("买入", {}))
+    assert ch.tab_side("买入")["ok"] and clicks[-1] == ch.BUY_TAB
+    assert ch.tab_side("卖出")["ok"] is False and clicks[-1] == ch.SELL_TAB      # 点了但按钮还是橙色: 不算

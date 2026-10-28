@@ -15,8 +15,6 @@ import time
 import urllib.request
 from datetime import date, datetime
 
-BUY_TAB = (262, 523)                 # 下单面板左侧竖排「买入」页签 (10-27 截图量出)
-SELL_TAB = (262, 587)
 PANEL_LABELS = (250, 690, 560, 900)  # 委托价/总量/预估金额 这几个标签所在区域
 CODE_AREA = (520, 495, 720, 535)
 FORM_AREA = (250, 700, 520, 900)
@@ -68,26 +66,49 @@ def same(read, o):
             and read.get("volume") is not None and int(float(read["volume"])) == o["shares"])
 
 
+def panel_code():
+    """OCR 读下单面板右上角的 6 位代码。"""
+    from .ocr_read import ocr_boxes, text_of
+    from .ui_agent import screenshot_windows
+    return next(iter(re.findall(r"\d{6}", text_of(ocr_boxes(screenshot_windows(), CODE_AREA, 3)))), None)
+
+
+def ensure_code(o, tries=2):
+    """输入代码、选候选, 再用 OCR 确认面板上就是这只; 不是就重来一次。"""
+    from .ui_channel import pick_candidate, type_code
+    for _ in range(tries):
+        if panel_code() == o["code"]:
+            return True
+        type_code(o["code"])
+        if pick_candidate(o["code"], o.get("name"))["ok"]:
+            time.sleep(1.5)
+    return panel_code() == o["code"]
+
+
 def fill_one(o, log=print):
     """填一笔并读回; 不提交。返回记录。"""
     from .ocr_read import locate_text, ocr_boxes, text_of
     from .ui_agent import screenshot_windows
-    from .ui_channel import click_xy_verified, pick_candidate, read_form_zoomed, side_by_button, type_code
+    from .ui_channel import (
+        click_xy_verified,
+        read_form_zoomed,
+        side_by_button,
+        tab_side,
+    )
     from .ui_order import backspace, select_all, type_digits
     t0, rec = time.time(), {**o, "problems": []}
-    tab = BUY_TAB if o["side"] == "买入" else SELL_TAB
-    c = click_xy_verified(*tab, f"下单面板左侧竖排的「{o['side']}」页签", "", f"rh_tab_{o['code']}")
-    time.sleep(1.0)
-    side, _ = side_by_button()
-    if not c["ok"] or side != o["side"]:
-        rec["problems"].append(f"切到「{o['side']}」失败 (按钮方向 {side})")
+    # 先切方向再输代码, 输完用 OCR 确认面板上确实是这只: 切页签时 QMT 会换回该页上次用的股票 (10-28 第一笔变成 600000);
+    # 面板还是逆回购 GC001 时点「买入」不生效 (个人不能正回购), 那就先输代码再切一次
+    first = tab_side(o["side"])
+    if not ensure_code(o):
+        rec["problems"].append("面板上的代码不是目标股票")
         return {**rec, "seconds": round(time.time() - t0, 1)}
-    type_code(o["code"])
-    p = pick_candidate(o["code"])
-    if not p["ok"]:
-        rec["problems"].append("没选中下拉候选")
-        return {**rec, "seconds": round(time.time() - t0, 1)}
-    time.sleep(1.5)
+    if not first["ok"]:
+        c = tab_side(o["side"])
+        if not c["ok"] or not ensure_code(o):
+            rec["problems"].append(f"切到「{o['side']}」失败 (按钮方向 {c['verify'].get('side')})")
+            return {**rec, "seconds": round(time.time() - t0, 1)}
+    time.sleep(0.5)
     png = screenshot_windows()
     lab_p = locate_text(png, "委托价", PANEL_LABELS, 2)
     lab_q = locate_text(png, "总量", PANEL_LABELS, 2) or locate_text(png, "总里", PANEL_LABELS, 2)
