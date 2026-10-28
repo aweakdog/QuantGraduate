@@ -140,6 +140,8 @@ def checks(funds, positions, trades, orders):
         if abs(s - mv) > max(1.0, 0.005 * mv):
             probs.append(f"持仓市值合计 {s:.2f} ≠ 总市值 {mv}")
     for p in positions:
+        if closed_row(p):       # 当天清仓/逆回购到期后留下的 0 股 0 市值行 (10-28 开盘: 标准券 888880 到期留了一行)
+            continue
         if not p.get("volume") or p.get("volume") % 1 or (p.get("can_use") or 0) > p["volume"]:
             probs.append(f"持仓行异常: {p}")
     for tr in trades:
@@ -191,7 +193,13 @@ def version_note(current, seen_file=Path(r"D:\qmtcode\qmt_version_seen.txt")):
     return None if old is None else f"QMT 客户端版本 {old} -> {current}"
 
 
+def closed_row(p):
+    """0 股且 0 市值的持仓行 = 已清仓/已到期, 不算持仓。股数读不出 (None) 或市值不为 0 都不算。"""
+    return p.get("volume") == 0 and not p.get("market_value")
+
+
 def build_snapshot(kind, funds, positions, trades, orders, account_last4, problems, meta):
+    positions = [p for p in positions if not closed_row(p)]
     masked = "********" + str(account_last4 or "????")[-4:]
     snap = {"kind": kind, "host": os.environ.get("COMPUTERNAME", ""), "probe_at": datetime.now().isoformat(timespec="seconds"),
             "source": "screen", "account": masked, "account_status": 0 if not problems else None,

@@ -159,3 +159,12 @@ def test_cross_model_wording_differences_still_agree():
           "order_id": "666656116735"}]
     assert ss.canon_rows("trades", a) == ss.canon_rows("trades", b)
     assert ss.canon_rows("trades", a) != ss.canon_rows("trades", [{**b[0], "price": 1.15}])   # 真读错的价格仍算不一致
+
+
+def test_matured_repo_or_sold_out_zero_rows_are_ignored():
+    funds = {"total_asset": 503135.05, "available": 503135.05, "frozen": 0.0, "market_value": 0.0}
+    zero = [{"code": "888880", "name": "新标准券", "volume": 0, "can_use": 0, "cost": 0.0, "market_value": 0.0}]
+    assert ss.checks(funds, zero, [], []) == []                                  # 10-28 开盘这里报过「持仓行异常」
+    assert ss.build_snapshot("morning", funds, zero, [], [], "6735", [], {})["positions"] == []
+    assert ss.checks(funds, [{**zero[0], "volume": None}], [], [])                # 股数读不出仍要拦
+    assert ss.checks(funds, [{**zero[0], "market_value": 1000.0}], [], [])       # 0 股却有市值仍要拦
