@@ -193,21 +193,24 @@ def test_read_agreed_ocr_plus_one_model(monkeypatch):
     good = {"total_asset": 503121.8, "available": 503121.8, "frozen": 0, "market_value": 0, "account_last4": "6735"}
     monkeypatch.setattr(ocr, "read_table", lambda png, box, kind: dict(good))
     calls = []
-    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None: calls.append(provider) or dict(good))
+    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None, fallbacks=None:
+                        calls.append(provider) or dict(good))
     val, meta, _ = ss.read_agreed(b"", ss.FUNDS_BOX, "", ss.canon_funds, ocr_kind="funds")
     assert val["available"] == 503121.8 and meta["sources"] == ["ocr", "minimax"] and calls == ["minimax"]
     bad = {**good, "total_asset": 50312.18, "available": 50312.18}                         # MiniMax 少读一位
     seq = [bad, good]
     calls.clear()
-    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None: calls.append(provider) or seq.pop(0))
+    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None, fallbacks=None:
+                        calls.append(provider) or seq.pop(0))
     val, meta, _ = ss.read_agreed(b"", ss.FUNDS_BOX, "", ss.canon_funds, ocr_kind="funds")
-    assert val["available"] == 503121.8 and meta["sources"] == ["ocr", "minimax", "deepseek"]   # 第三家与 OCR 一致
-    seq = [bad, dict(bad)]                                                                  # 两家模型犯同样的错
-    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None: seq.pop(0))
+    assert val["available"] == 503121.8 and meta["sources"] == ["ocr", "minimax", "qwen"]       # 千问与 OCR 一致
+    seq = [bad, dict(bad), dict(bad)]                                                       # 三家模型犯同样的错
+    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None, fallbacks=None: seq.pop(0))
     val, meta, _ = ss.read_agreed(b"", ss.FUNDS_BOX, "", ss.canon_funds, ocr_kind="funds")
     assert val is None and meta["agreed"] is False                                          # 不能推翻 OCR
     monkeypatch.setattr(ocr, "read_table", lambda png, box, kind: None)                     # OCR 认不出表头
     calls.clear()
-    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None: calls.append(provider) or dict(good))
+    monkeypatch.setattr(ss, "read_box", lambda png, box, prompt, scale, provider=None, fallbacks=None:
+                        calls.append(provider) or dict(good))
     val, meta, _ = ss.read_agreed(b"", ss.FUNDS_BOX, "", ss.canon_funds, ocr_kind="funds")
     assert meta["sources"] == ["deepseek", "minimax"] and val is not None                   # 退回两家模型

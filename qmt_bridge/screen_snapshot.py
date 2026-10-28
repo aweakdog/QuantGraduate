@@ -114,11 +114,16 @@ def agree(reads, canon):
     return (json.loads(top) if n >= 2 else None), cs
 
 
-def read_box(png, box, prompt, scale, provider=None):
+def read_box(png, box, prompt, scale, provider=None, fallbacks=None):
     x0, y0, x1, y1 = box
     part, _ = crop(png, (x0 + x1) / 2, (y0 + y1) / 2, w=x1 - x0, h=y1 - y0, scale=scale, mark=False)
-    res, _ = ask(part, prompt, provider=provider)
+    res, _ = ask(part, prompt, provider=provider, fallbacks=fallbacks)
     return res
+
+
+# 有 OCR 时依次请这几家附和, 有一家与 OCR 一致就停 (10-28: 同一张图上 OCR/MiniMax/千问都读对「43 4000.00」,
+# DeepSeek 每次都读成 43400, 所以它排最后)
+BACKERS = (("minimax", 3), ("qwen", 3), ("deepseek", 2))
 
 
 def read_agreed(png, box, prompt, canon, scales=(2, 3, 2.5), ocr_kind=None):
@@ -127,27 +132,34 @@ def read_agreed(png, box, prompt, canon, scales=(2, 3, 2.5), ocr_kind=None):
     读成 50312.8, DeepSeek 把资金账号当合同号, 所以要两家)。"""
     from . import ocr_read
     from .ui_agent import _has_key
-    second = "minimax" if _has_key("minimax") else None
-    reads, sources = [], []
+    ocr = None
     if ocr_kind and ocr_read.available():
         try:
-            r = ocr_read.read_table(png, box, ocr_kind)
+            ocr = ocr_read.read_table(png, box, ocr_kind)
         except Exception:  # noqa: BLE001 —— OCR 出错就当没读到, 由模型兜底
-            r = None
-        if r is not None:
-            reads, sources = [r], ["ocr"]
-    if reads:
-        reads.append(read_box(png, box, prompt, scales[1], second))
-        sources.append(second or "deepseek")
-    else:
-        reads = [read_box(png, box, prompt, scales[0], "deepseek"), read_box(png, box, prompt, scales[1], second)]
-        sources = ["deepseek", second or "deepseek"]
-    pick = ocr_backed if sources[0] == "ocr" else agree
-    val, cs = pick(reads, canon)
+            ocr = None
+    if ocr is not None:
+        reads, sources, val = [ocr], ["ocr"], None
+        for prov, sc in BACKERS:
+            if not _has_key(prov):
+                continue
+            try:
+                reads.append(read_box(png, box, prompt, sc, prov, fallbacks=()))
+            except Exception:  # noqa: BLE001 —— 这一家挂了就问下一家
+                continue
+            sources.append(prov)
+            val, _ = ocr_backed(reads, canon)
+            if val is not None:
+                break
+        return val, {"reads": len(reads), "agreed": val is not None, "sources": sources}, reads
+    second = "minimax" if _has_key("minimax") else None
+    reads = [read_box(png, box, prompt, scales[0], "deepseek"), read_box(png, box, prompt, scales[1], second)]
+    sources = ["deepseek", second or "deepseek"]
+    val, cs = agree(reads, canon)
     if val is None:
         reads.append(read_box(png, box, prompt, scales[2], "deepseek"))
         sources.append("deepseek")
-        val, cs = pick(reads, canon)
+        val, cs = agree(reads, canon)
     return val, {"reads": len(reads), "agreed": val is not None, "sources": sources}, reads
 
 
