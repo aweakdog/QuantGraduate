@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from qmt_bridge.ui_agent import ask  # noqa: E402
+from qmt_bridge.ui_agent import ask, png_size, to_pixels  # noqa: E402
 
 CASES = [
     ("下单面板读数(GC001 小字)", "20261027_103632_submit_sell_check.png",
@@ -74,6 +74,8 @@ def main(argv=None):
                 t0 = time.time()
                 try:
                     got, _ = ask(png, prompt, provider=prov)
+                    if "xy" in want and got.get("x") is not None:
+                        got["x"], got["y"] = to_pixels(prov, got["x"], got["y"], *png_size(png))
                     ok, why = score(got, want)
                 except Exception as e:  # noqa: BLE001
                     ok, why, got = False, f"异常 {type(e).__name__}: {str(e)[:80]}", {}

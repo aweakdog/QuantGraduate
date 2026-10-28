@@ -26,6 +26,9 @@ PROVIDERS = {
                  "extra": {"thinking": {"type": "disabled"}, "response_format": {"type": "json_object"}}, "image": {}},
     "minimax": {"url": "https://api.minimaxi.com/v1/chat/completions", "model": "MiniMax-M3.1-Flash", "key": "minimax.key",
                 "extra": {"reasoning_effort": "low"}, "image": {"max_long_side_pixel": 3840}},   # 原图不缩小, 小字才读得清
+    # 10-28 加: 阿里云国际站 (新加坡) 百炼; 用户密钥只认 dashscope-intl
+    "qwen": {"url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions", "model": "qwen3-vl-plus",
+             "key": "qwen.key", "extra": {"vl_high_resolution_images": True}, "image": {}, "coords": "norm1000"},
 }
 API_URL = PROVIDERS["deepseek"]["url"]
 MODEL = PROVIDERS["deepseek"]["model"]
@@ -114,16 +117,23 @@ def _post(req, opener, timeout):
         time.sleep(wait)
 
 
+# 一家重试后仍不行就按顺序换下一家 (只换有密钥的); MiniMax 挂了先换千问, 交叉核对仍是两家不同的模型 (10-28)
+FALLBACK = {"minimax": ("qwen", "deepseek"), "qwen": ("deepseek",), "deepseek": ("qwen",)}
+
+
 def ask(png, prompt, key=None, timeout=90, opener=urllib.request.urlopen, retries=1, provider=None):
-    """一次视觉问答。临时错误先重试; MiniMax 重试后仍不行就换 DeepSeek 顶上 (meta 里记 fallback)。"""
+    """一次视觉问答。临时错误先重试; 仍不行按 FALLBACK 换下一家顶上 (meta 里记 fallback)。"""
     name = provider or provider_name()
-    try:
-        return _ask_once(png, prompt, key, timeout, opener, retries, name)
-    except (urllib.error.URLError, TimeoutError, ConnectionError):
-        if name == "deepseek" or key is not None:
-            raise
-        data, meta = _ask_once(png, prompt, None, timeout, opener, retries, "deepseek")
-        meta["fallback"] = "deepseek"
+    chain = [name] + ([] if key is not None else [p for p in FALLBACK.get(name, ()) if _has_key(p)])
+    for i, prov in enumerate(chain):
+        try:
+            data, meta = _ask_once(png, prompt, key if i == 0 else None, timeout, opener, retries, prov)
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if i == len(chain) - 1:
+                raise
+            continue
+        if i:
+            meta["fallback"] = prov
         return data, meta
 
 
@@ -150,17 +160,28 @@ def describe(png, **kw):
     return ask(png, DESCRIBE_PROMPT.format(w=w, h=h), **kw)
 
 
+def to_pixels(provider, x, y, w, h):
+    """Qwen3-VL 的坐标是 0-1000 相对坐标 (10-28 评测发现), 换算成原图像素; 其他家原样返回。"""
+    if PROVIDERS.get(provider or "", {}).get("coords") == "norm1000":
+        return round(float(x) / 1000 * w), round(float(y) / 1000 * h)
+    return x, y
+
+
 def locate(png, target, **kw):
     """定位交给 MiniMax (10-27 评测: 密集按钮偏 10px, DeepSeek 偏 500px); 没有 MiniMax 密钥时退回默认。"""
     w, h = png_size(png)
     if "provider" not in kw and _has_key("minimax"):
         kw["provider"] = "minimax"
-    return ask(png, LOCATE_PROMPT.format(w=w, h=h, target=target), **kw)
+    loc, meta = ask(png, LOCATE_PROMPT.format(w=w, h=h, target=target), **kw)
+    used = meta.get("fallback") or kw.get("provider")
+    if loc.get("found") and loc.get("x") is not None and loc.get("y") is not None:
+        loc["x"], loc["y"] = to_pixels(used, loc["x"], loc["y"], w, h)
+    return loc, meta
 
 
 def _has_key(name):
     try:
-        provider_key(name)
+        load_key() if name == "deepseek" else provider_key(name)
         return True
     except SystemExit:
         return False

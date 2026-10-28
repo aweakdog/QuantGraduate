@@ -108,8 +108,18 @@ def test_minimax_keeps_failing_falls_back_to_deepseek(monkeypatch):
     monkeypatch.setattr(ua, "load_key", lambda: "ds")
     opener, calls = _fake_opener([529, 529, 529, {"ok": 2}])
     data, meta = ua.ask(b"\x89PNG", "q", opener=opener, provider="minimax")
-    assert data == {"ok": 2} and meta["fallback"] == "deepseek"
-    assert "minimaxi" in calls[0] and "deepseek" in calls[-1]
+    assert data == {"ok": 2} and meta["fallback"] == "qwen"                     # 有千问密钥: 先换千问
+    assert "minimaxi" in calls[0] and "dashscope" in calls[-1]
+    monkeypatch.setattr(ua, "_has_key", lambda name: name == "deepseek")       # 没有千问密钥: 换 DeepSeek
+    opener, calls = _fake_opener([529, 529, 529, {"ok": 3}])
+    data, meta = ua.ask(b"\x89PNG", "q", opener=opener, provider="minimax")
+    assert data == {"ok": 3} and meta["fallback"] == "deepseek" and "deepseek" in calls[-1]
+
+
+def test_qwen_norm1000_coords_converted():
+    import qmt_bridge.ui_agent as ua
+    assert ua.to_pixels("qwen", 57, 47, 1920, 1080) == (109, 51)
+    assert ua.to_pixels("minimax", 108, 51, 1920, 1080) == (108, 51)
 
 
 def test_non_transient_error_is_not_retried(monkeypatch):
