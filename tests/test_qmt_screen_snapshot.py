@@ -158,7 +158,7 @@ def test_cross_model_wording_differences_still_agree():
     b = [{"time": "11:08:41", "code": "204001", "side": "通用回购逆回购", "price": "1.145", "volume": 10, "amount": 1000,
           "order_id": "666656116735"}]
     assert ss.canon_rows("trades", a) == ss.canon_rows("trades", b)
-    assert ss.canon_rows("trades", a) != ss.canon_rows("trades", [{**b[0], "price": 1.15}])   # 真读错的价格仍算不一致
+    assert ss.canon_rows("trades", a) != ss.canon_rows("trades", [{**b[0], "volume": 100}])   # 张数读错仍算不一致 (利率不比)
 
 
 def test_matured_repo_or_sold_out_zero_rows_are_ignored():
@@ -168,3 +168,18 @@ def test_matured_repo_or_sold_out_zero_rows_are_ignored():
     assert ss.build_snapshot("morning", funds, zero, [], [], "6735", [], {})["positions"] == []
     assert ss.checks(funds, [{**zero[0], "volume": None}], [], [])                # 股数读不出仍要拦
     assert ss.checks(funds, [{**zero[0], "market_value": 1000.0}], [], [])       # 0 股却有市值仍要拦
+
+
+def test_repo_rows_compare_only_code_volume_amount():
+    a = [{"time": "10:53:41", "code": "204001", "side": "卖出", "price": 1.42, "volume": 5020, "amount": 502000}]
+    b = [{"time": "10:53:47", "code": "204001", "side": "通用回购逆回购", "price": 1.4, "volume": "5020张",
+          "amount": "502,000.00"}]
+    assert ss.canon_rows("trades", a) == ss.canon_rows("trades", b)
+    assert ss.canon_rows("trades", a) != ss.canon_rows("trades", [{**b[0], "volume": 5200}])       # 张数读错仍算不一致
+    pa = [{"code": "888880", "volume": 5020, "can_use": 0, "cost": 100.0, "market_value": 502000}]
+    pb = [{"code": "888880", "volume": 5020, "can_use": None, "cost": 0, "market_value": 502000.0}]
+    assert ss.canon_rows("positions", pa) == ss.canon_rows("positions", pb)
+    s1 = [{"time": "14:55:01", "code": "600000", "side": "买入", "price": 9.62, "volume": 1000, "amount": 9620}]
+    s2 = [{**s1[0], "time": "14:55:07"}]
+    assert ss.canon_rows("trades", s1) == ss.canon_rows("trades", s2)                               # 秒数不同不算
+    assert ss.canon_rows("trades", s1) != ss.canon_rows("trades", [{**s1[0], "price": 9.26}])      # 股票价格仍要一致

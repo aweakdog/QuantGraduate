@@ -79,10 +79,13 @@ def canon_rows(kind, rows):
             "trades": ("time", "code", "side", "price", "volume", "amount"),
             "orders": ("time", "code", "side", "price", "volume", "traded_volume", "status")}[kind]
     # 方向按买/卖代码比 (「卖出」与「通用回购逆回购」是同一方向, 两家模型写法不同); 合同号不比 (对账不用, 且常被读成资金账号)
+    # 逆回购/标准券行只比 代码、张数、金额 (利率、时间、成本两家常读得不一样, 且这些行按现金处理不进对账; 10-28 因此报过离线)
+    repo_keys = {"positions": ("code", "volume", "market_value"), "trades": ("code", "volume", "amount"),
+                 "orders": ("code", "volume", "traded_volume", "status")}[kind]
     out = []
     for r in rows or []:
         c = {}
-        for k in keys:
+        for k in (repo_keys if is_repo_row(r) else keys):
             v = r.get(k)
             if k == "code":
                 c[k] = str(v)[:6]
@@ -90,6 +93,8 @@ def canon_rows(kind, rows):
                 c[k] = side_type(v)
             elif k in ("volume", "can_use", "cost", "market_value", "price", "amount", "traded_volume"):
                 c[k] = _num(v)
+            elif k == "time":
+                c[k] = str(v).strip()[:5] if v is not None else None     # 只比到分钟, 秒数常读错且对账不用
             else:
                 c[k] = str(v).strip() if v is not None else None
         out.append(c)
