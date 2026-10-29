@@ -399,6 +399,51 @@ def toggle_off(hwnd, x, y, log, tries=4, render_wait=4.0):
 
 
 EXPECTED_SCREEN = (1920, 1080)        # 读屏坐标都是按这个分辨率量的
+# QMT 自己弹的信息类通知, 标题完全相等才自动关 (10-29 早上 QMT 重新登录后弹「系统预留信息」, 主窗口切不到最前,
+# 开盘读屏报离线)。下单确认/下达任务/交易消息/撤单这类绝不自动关。
+INFO_NOTICES = ("系统预留信息",)
+
+
+def window_title(u, h):
+    import ctypes
+    buf = ctypes.create_unicode_buffer(256)
+    u.GetWindowTextW(h, buf, 256)
+    return buf.value
+
+
+def qmt_popups(u, main):
+    """与 QMT 主窗口同一进程的其他可见顶层窗口 [(hwnd, 标题)]。"""
+    import ctypes
+    from ctypes import wintypes
+    pid = wintypes.DWORD()
+    u.GetWindowThreadProcessId(main, ctypes.byref(pid))
+    out = []
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(h, _):
+        p = wintypes.DWORD()
+        u.GetWindowThreadProcessId(h, ctypes.byref(p))
+        if h != main and p.value == pid.value and u.IsWindowVisible(h):
+            t = window_title(u, h)
+            if t:
+                out.append((h, t))
+        return True
+    u.EnumWindows(enum_proc(cb), 0)
+    return out
+
+
+def close_info_notices(u, main, log=print):
+    """关掉白名单里的 QMT 信息通知 (发 WM_CLOSE, 等于点右上角 ×); 返回 (关掉的, 没敢关的) 标题。"""
+    closed, others = [], []
+    for h, t in qmt_popups(u, main):
+        if t in INFO_NOTICES:
+            u.PostMessageW(h, 0x0010, 0, 0)
+            closed.append(t)
+        else:
+            others.append(t)
+    if closed:
+        log(f"关掉 QMT 信息通知: {closed}")
+    return closed, others
 
 
 def ensure_qmt_foreground(log=print):
@@ -433,10 +478,18 @@ def ensure_qmt_foreground(log=print):
     if not u.IsZoomed(h):
         u.ShowWindow(h, 3)                                       # SW_MAXIMIZE
         time.sleep(0.8)
-    u.keybd_event(0x12, 0, 0, 0)                                 # 按一下 Alt, 解除前台锁再切前台
-    u.keybd_event(0x12, 0, 2, 0)
-    u.SetForegroundWindow(h)
-    time.sleep(0.6)
+    def to_front():
+        u.keybd_event(0x12, 0, 0, 0)                             # 按一下 Alt, 解除前台锁再切前台
+        u.keybd_event(0x12, 0, 2, 0)
+        u.SetForegroundWindow(h)
+        time.sleep(0.6)
+    to_front()
+    others = []
+    if u.GetForegroundWindow() != h:                             # 多半是 QMT 自己弹了通知 (模态框挡着主窗口)
+        closed, others = close_info_notices(u, h, log)
+        if closed:
+            time.sleep(0.8)
+            to_front()
     r = wintypes.RECT()
     u.GetWindowRect(h, ctypes.byref(r))
     probs = []
@@ -445,7 +498,8 @@ def ensure_qmt_foreground(log=print):
     if r.left > 0 or r.top > 0 or r.right < screen[0] or r.bottom < screen[1] - 80:   # 任务栏约占 40~60px
         probs.append(f"QMT 主窗口没铺满屏幕: {(r.left, r.top, r.right, r.bottom)}")
     if u.GetForegroundWindow() != h:
-        probs.append("QMT 主窗口没能切到最前 (可能被别的窗口挡住)")
+        fg = window_title(u, u.GetForegroundWindow())
+        probs.append(f"QMT 主窗口没能切到最前 (当前最前: 「{fg}」; QMT 其他窗口: {others or '无'})")
     log(f"QMT 主窗口: rect={(r.left, r.top, r.right, r.bottom)} maximized={bool(u.IsZoomed(h))} "
         f"foreground={u.GetForegroundWindow() == h} problems={probs}")
     return probs
