@@ -55,7 +55,7 @@ def test_number_handles_qmt_formats():
 
 def test_positions_table():
     rows = parse_table(POSITIONS, "positions")["rows"]
-    assert rows == [{"code": "888880", "name": "新标准券", "volume": 5020.0, "can_use": 0.0, "cost": 0.0,
+    assert rows == [{"code": "888880", "name": "新标准券", "volume": 5020.0, "can_use": 0.0, "cost": 0.0, "last": 1.0,
                      "market_value": 502000.0}]
 
 

@@ -79,7 +79,7 @@ def locate_text(png, target, box=None, scale=2):
 # 表头文字 -> 字段 (10-28 按 QMT 2.1.31.3 实际表头; 表头按「完全相等」匹配, 免得「委托量」认成「委托剩余量」)
 COLS = {
     "positions": {"证券代码": "code", "证券名称": "name", "当前拥股": "volume", "可用数量": "can_use", "成本价": "cost",
-                  "市值": "market_value"},
+                  "最新价": "last", "市值": "market_value"},
     "trades": {"成交时间": "time", "证券代码": "code", "证券名称": "name", "买卖标记": "side", "成交数量": "volume",
                "成交价格": "price", "成交金额": "amount", "合同编号": "order_id"},
     "orders": {"委托时间": "time", "证券代码": "code", "证券名称": "name", "买卖标记": "side", "委托量": "volume",
@@ -88,7 +88,7 @@ COLS = {
               "可用金额": "available", "冻结金额": "frozen", "可取金额": "withdrawable"},
 }
 NUMERIC = {"volume", "can_use", "cost", "market_value", "price", "amount", "traded_volume", "total_asset", "available",
-           "frozen", "withdrawable"}
+           "frozen", "withdrawable", "last"}
 ROW_TOL = 7          # 同一行的文字框中心 y 相差不超过 7 像素
 
 

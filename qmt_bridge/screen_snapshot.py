@@ -37,7 +37,7 @@ FUNDS_PROMPT = ("这是 QMT「账号资金」表格的放大截图。只返回 J
                 "login_status (登录状态那一列的文字)}。数字转数值, 看不清填 null, 不要猜。" + SPACE_HINT)
 TABLE_PROMPTS = {
     "positions": ("这是 QMT「持仓」表格的放大截图。逐行读出, 只返回 JSON: {rows: [{code (6位证券代码), name, "
-                  "volume (持仓数量/当前拥股), can_use (可用数量), cost (成本价), market_value (市值)}]}。"
+                  "volume (持仓数量/当前拥股), can_use (可用数量), cost (成本价), last (最新价), market_value (市值)}]}。"
                   "表格为空就 rows=[]。数字转数值, 看不清填 null, 不要猜, 不要把别的列错填进来。" + SPACE_HINT),
     "trades": ("这是 QMT「成交」表格的放大截图。逐行读出, 只返回 JSON: {rows: [{time (成交时间), code (6位证券代码), "
                "side (买入/卖出), price (成交价格/成交均价), volume (成交数量), amount (成交金额), order_id (合同编号), "
@@ -77,12 +77,13 @@ def _num(v):
 
 def canon_rows(kind, rows):
     """规范化后用于比对: 数字统一两位小数、代码 6 位、按 (代码, 时间, 价, 量) 排序。"""
-    keys = {"positions": ("code", "volume", "can_use", "cost", "market_value"),
+    # 持仓不比「市值」列: 10-29 QMT 重启后列变窄, 「50 2000.00」只显示「50 2」; 市值改由数量算 (position_value)
+    keys = {"positions": ("code", "volume", "can_use", "cost", "last"),
             "trades": ("time", "code", "side", "price", "volume", "amount"),
             "orders": ("time", "code", "side", "price", "volume", "traded_volume", "status")}[kind]
     # 方向按买/卖代码比 (「卖出」与「通用回购逆回购」是同一方向, 两家模型写法不同); 合同号不比 (对账不用, 且常被读成资金账号)
     # 逆回购/标准券行只比 代码、张数、金额 (利率、时间、成本两家常读得不一样, 且这些行按现金处理不进对账; 10-28 因此报过离线)
-    repo_keys = {"positions": ("code", "volume", "market_value"), "trades": ("code", "volume", "amount"),
+    repo_keys = {"positions": ("code", "volume"), "trades": ("code", "volume", "amount"),
                  "orders": ("code", "volume", "traded_volume", "status")}[kind]
     out = []
     for r in rows or []:
@@ -93,7 +94,7 @@ def canon_rows(kind, rows):
                 c[k] = str(v)[:6]
             elif k == "side":
                 c[k] = side_type(v)
-            elif k in ("volume", "can_use", "cost", "market_value", "price", "amount", "traded_volume"):
+            elif k in ("volume", "can_use", "cost", "market_value", "price", "amount", "traded_volume", "last"):
                 c[k] = _num(v)
             elif k == "time":
                 c[k] = str(v).strip()[:5] if v is not None else None     # 只比到分钟, 秒数常读错且对账不用
@@ -170,6 +171,17 @@ def ocr_backed(reads, canon):
     return (json.loads(cs[0]) if cs[0] in cs[1:] else None), cs
 
 
+def position_value(p):
+    """持仓市值按数量算, 不信「市值」列 (10-29: 列变窄后「50 2000.00」只显示「50 2」, OCR 和模型都读成 502):
+    逆回购标准券 = 张数 x 100; 股票 = 股数 x 最新价; 两者都没有才用读到的市值。"""
+    vol = p.get("volume") or 0
+    if is_repo_row(p):
+        return round(vol * 100.0, 2)
+    if p.get("last") is not None:
+        return round(vol * float(p["last"]), 2)
+    return p.get("market_value") or 0
+
+
 def checks(funds, positions, trades, orders):
     """算术交叉核对, 返回问题列表 (空 = 通过)。"""
     probs = []
@@ -179,7 +191,7 @@ def checks(funds, positions, trades, orders):
     elif abs(t - (a + (fr or 0) + mv)) > max(1.0, 0.002 * t):
         probs.append(f"可用 {a} + 冻结 {fr} + 市值 {mv} ≠ 总资产 {t}")
     if positions and mv is not None:
-        s = sum(p.get("market_value") or 0 for p in positions)
+        s = sum(position_value(p) for p in positions)
         if abs(s - mv) > max(1.0, 0.005 * mv):
             probs.append(f"持仓市值合计 {s:.2f} ≠ 总市值 {mv}")
     for p in positions:
@@ -253,7 +265,7 @@ def build_snapshot(kind, funds, positions, trades, orders, account_last4, proble
             "positions": [{"account_id": masked, "stock_code": xt_code(p["code"]), "volume": int(p["volume"]),
                            "can_use_volume": int(p.get("can_use") or 0), "frozen_volume": None, "on_road_volume": None,
                            "yesterday_volume": None, "open_price": p.get("cost"), "avg_price": p.get("cost"),
-                           "market_value": p.get("market_value")} for p in positions],
+                           "market_value": position_value(p)} for p in positions],
             "orders": [{"stock_code": xt_code(o["code"]), "order_id": o.get("order_id"), "order_sysid": None,
                         "order_time": o.get("time"), "order_type": side_type(o.get("side")),
                         "order_volume": int(o.get("volume") or 0), "price_type": None, "price": o.get("price"),

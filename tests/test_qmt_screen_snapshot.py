@@ -214,3 +214,15 @@ def test_read_agreed_ocr_plus_one_model(monkeypatch):
                         calls.append(provider) or dict(good))
     val, meta, _ = ss.read_agreed(b"", ss.FUNDS_BOX, "", ss.canon_funds, ocr_kind="funds")
     assert meta["sources"] == ["deepseek", "minimax"] and val is not None                   # 退回两家模型
+
+
+def test_position_value_ignores_truncated_market_value_column():
+    funds = {"total_asset": 503154.14, "available": 1153.64, "frozen": 0.0, "market_value": 502000.0}
+    trunc = [{"code": "888880", "volume": 5020, "can_use": 0, "cost": 0.0, "market_value": 502.0}]   # 「50 2」
+    assert ss.checks(funds, trunc, [], []) == []                    # 10-29 这里报过「持仓市值合计 502 ≠ 502000」
+    snap = ss.build_snapshot("manual", funds, trunc, [], [], "6735", [], {})
+    assert snap["positions"][0]["market_value"] == 502000.0
+    stock = [{"code": "600703", "volume": 2100, "can_use": 0, "cost": 9.48, "last": 9.5, "market_value": 19.9}]
+    f2 = {"total_asset": 120000.0, "available": 100050.0, "frozen": 0.0, "market_value": 19950.0}
+    assert ss.checks(f2, stock, [], []) == [] and ss.position_value(stock[0]) == 19950.0
+    assert ss.checks(f2, [{**stock[0], "last": None}], [], [])      # 没读到最新价: 只能用 (截断的) 市值, 对不上就拦
