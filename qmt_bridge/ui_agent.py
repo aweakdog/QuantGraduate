@@ -485,11 +485,12 @@ def ensure_qmt_foreground(log=print):
         time.sleep(0.6)
     to_front()
     others = []
-    if u.GetForegroundWindow() != h:                             # 多半是 QMT 自己弹了通知 (模态框挡着主窗口)
-        closed, others = close_info_notices(u, h, log)
-        if closed:
-            time.sleep(0.8)
-            to_front()
+    for _ in range(3):                                           # 10-29 9:36 切不到最前, 9:59 一次就成; 多试几次
+        if u.GetForegroundWindow() == h:
+            break
+        closed, others = close_info_notices(u, h, log)           # 多半是 QMT 自己弹了通知 (模态框挡着主窗口)
+        time.sleep(1.0 if not closed else 0.8)
+        to_front()
     r = wintypes.RECT()
     u.GetWindowRect(h, ctypes.byref(r))
     probs = []
