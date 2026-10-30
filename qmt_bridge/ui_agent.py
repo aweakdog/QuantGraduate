@@ -462,22 +462,40 @@ def foreign_overlaps(regions, main=None):
             return True
         for x0, y0, x1, y1 in regions:
             if r.left < x1 and r.right > x0 and r.top < y1 and r.bottom > y0:
-                out.append((window_title(u, h), cls.value, (r.left, r.top, r.right, r.bottom)))
+                out.append((window_title(u, h), cls.value, (r.left, r.top, r.right, r.bottom), h))
                 break
         return True
     u.EnumWindows(enum_proc(cb), 0)
     return out
 
 
+PARK_XY = (1920 - 10, 80)     # 把挡路的通知挪到右上角 (交易页这块是行情区, 读屏和下单都不用)
+
+
+def park_windows(over, log=print):
+    """把挡在读数区域上的别家置顶窗口挪到右上角: 只改位置, 不关、不点、不抢焦点 (10-30 钉钉 DING 提醒不会自己收起)。"""
+    import ctypes
+    u = ctypes.windll.user32
+    for title, cls, (left, _top, right, _bottom), h in over:
+        w = right - left
+        u.SetWindowPos(h, 0, PARK_XY[0] - w, PARK_XY[1], 0, 0, 0x0001 | 0x0004 | 0x0010)   # NOSIZE|NOZORDER|NOACTIVATE
+        log(f"把挡路的窗口「{title or cls}」挪到右上角")
+
+
 def wait_clear(regions, main=None, wait_s=30, log=print):
     """等别的程序盖在读数区域上的置顶窗口消失 (通知一般几秒就自己收起); 返回仍挡着的窗口列表 (空 = 可以读)。"""
-    t0 = time.time()
+    t0, parked = time.time(), False
     while True:
         over = foreign_overlaps(regions, main)
         if not over or time.time() - t0 >= wait_s:
             if over:
-                log(f"等了 {wait_s} 秒仍被挡: {over}")
-            return over
+                log(f"等了 {wait_s} 秒仍被挡: {[o[:3] for o in over]}")
+            return [o[:3] for o in over]
+        if not parked and time.time() - t0 >= 6:              # 等 6 秒还在 (多半是不会自己收起的提醒), 挪开它
+            park_windows(over, log)
+            parked = True
+            time.sleep(0.5)
+            continue
         log(f"读数区域被别的窗口挡住, 等它收起: {[o[0] or o[1] for o in over]}")
         time.sleep(3)
 
