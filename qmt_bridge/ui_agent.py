@@ -432,6 +432,56 @@ def qmt_popups(u, main):
     return out
 
 
+def foreign_overlaps(regions, main=None):
+    """别的程序的置顶窗口 (如钉钉通知「DING | 应用内」) 盖在这些屏幕区域上的: [(标题, 类名, 矩形)]。
+    10-30 早上钉钉通知盖住资金表右半边, 可用金额/冻结金额读不到。任务栏、桌面不算。"""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    qpid = wintypes.DWORD()
+    if main:
+        u.GetWindowThreadProcessId(main, ctypes.byref(qpid))
+    me = ctypes.windll.kernel32.GetCurrentProcessId()
+    out = []
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(h, _):
+        if not u.IsWindowVisible(h) or not (u.GetWindowLongW(h, -20) & 0x8):      # GWL_EXSTYLE / WS_EX_TOPMOST
+            return True
+        p = wintypes.DWORD()
+        u.GetWindowThreadProcessId(h, ctypes.byref(p))
+        if p.value in (qpid.value, me):
+            return True
+        cls = ctypes.create_unicode_buffer(128)
+        u.GetClassNameW(h, cls, 128)
+        if cls.value in ("Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW"):
+            return True
+        r = wintypes.RECT()
+        u.GetWindowRect(h, ctypes.byref(r))
+        if r.right - r.left < 8 or r.bottom - r.top < 8:
+            return True
+        for x0, y0, x1, y1 in regions:
+            if r.left < x1 and r.right > x0 and r.top < y1 and r.bottom > y0:
+                out.append((window_title(u, h), cls.value, (r.left, r.top, r.right, r.bottom)))
+                break
+        return True
+    u.EnumWindows(enum_proc(cb), 0)
+    return out
+
+
+def wait_clear(regions, main=None, wait_s=30, log=print):
+    """等别的程序盖在读数区域上的置顶窗口消失 (通知一般几秒就自己收起); 返回仍挡着的窗口列表 (空 = 可以读)。"""
+    t0 = time.time()
+    while True:
+        over = foreign_overlaps(regions, main)
+        if not over or time.time() - t0 >= wait_s:
+            if over:
+                log(f"等了 {wait_s} 秒仍被挡: {over}")
+            return over
+        log(f"读数区域被别的窗口挡住, 等它收起: {[o[0] or o[1] for o in over]}")
+        time.sleep(3)
+
+
 def close_info_notices(u, main, log=print):
     """关掉白名单里的 QMT 信息通知 (发 WM_CLOSE, 等于点右上角 ×); 返回 (关掉的, 没敢关的) 标题。"""
     closed, others = [], []

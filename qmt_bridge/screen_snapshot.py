@@ -25,6 +25,8 @@ STATUS_CODE = {"未报": 48, "待报": 49, "已报": 50, "已报待撤": 51, "�
                "已成": 56, "废单": 57}
 # 10-26 截图量出 (QMT 最大化 1920x1080, 交易页): 底部页签与表格区域。点击前仍做独立复核。
 TABS = {"positions": (840, 474, "持仓"), "trades": (905, 474, "成交"), "orders": (1000, 474, "委托")}
+TAB_STRIP = (780, 460, 1300, 488)     # 底部表格区的页签栏; 页签按 OCR 找到的文字位置点 (10-30: 选中的「持仓」偏了 29px)
+HEADER_KEY = {"positions": "当前拥股", "trades": "成交时间", "orders": "委托剩余量"}   # 切页签后表头里必须有它
 TABLE_BOX = (780, 482, 1920, 738)
 TOP_TAB_STOCK = (110, 51, "股票交易")      # 10-27 量出: 顶部页签栏最左边; 那天早上停在「沪港通」, 三张表和资金表全空
 EXPECTED_ACCOUNT_LAST4 = os.environ.get("QMT_ACCOUNT_LAST4", "6735")
@@ -282,6 +284,35 @@ def build_snapshot(kind, funds, positions, trades, orders, account_last4, proble
     return snap
 
 
+def click_tab(label, fallback_xy, step, click_xy_verified):
+    """先用 OCR 在页签栏里找这个字, 找到唯一一处就点它的中心 (确定、不联网); 找不到才退回固定坐标 + 复核。"""
+    from . import ocr_read
+    from .ui_agent import click_windows, screenshot_windows
+    from .ui_channel import CLICK_SETTLE
+    if ocr_read.available():
+        try:
+            xy = ocr_read.locate_text(screenshot_windows(), label, TAB_STRIP, 2)
+        except Exception:  # noqa: BLE001
+            xy = None
+        if xy:
+            click_windows(*xy)
+            time.sleep(CLICK_SETTLE)
+            return {"ok": True, "xy": xy, "verify": {"by": "ocr-locate"}}
+    return click_xy_verified(*fallback_xy, f"底部表格区的「{label}」页签", label, step)
+
+
+def header_ok(png, kind):
+    """切页签后核对表头 (只在有 OCR 时做; 没 OCR 时由模型读数时自行判断)。"""
+    from . import ocr_read
+    if not ocr_read.available():
+        return True
+    try:
+        boxes = ocr_read.ocr_boxes(png, (TABLE_BOX[0], TABLE_BOX[1], TABLE_BOX[2], TABLE_BOX[1] + 60), 2)
+    except Exception:  # noqa: BLE001
+        return True
+    return any(HEADER_KEY[kind] == b[0].strip() for b in boxes)
+
+
 def take(kind, log=print):
     from .ui_agent import ensure_qmt_foreground, login_normal_mode
     from .ui_channel import click_xy_checked, click_xy_verified, read, snap
@@ -312,15 +343,24 @@ def take(kind, log=print):
         return build_snapshot(kind, {}, [], [], [], None, [f"切到「{label}」页签失败 (复核: {top.get('verify')})"], {})
     time.sleep(1.5)
     meta, problems, tables = {"tabs": {}}, [], {}
+    from .ui_agent import wait_clear
+    over = wait_clear([TABLE_BOX, FUNDS_BOX, TAB_STRIP], log=log)
+    if over:
+        return build_snapshot(kind, {}, [], [], [], None,
+                              [f"QMT 窗口被别的程序挡住: {[o[0] or o[1] for o in over]}"], {"state": st})
     for kind_t in ("positions", "trades", "orders"):
         x, y, label = TABS[kind_t]
-        c = click_xy_verified(x, y, f"底部表格区的「{label}」页签", label, f"snap_tab_{kind_t}")
+        c = click_tab(label, (x, y), f"snap_tab_{kind_t}", click_xy_verified)
         if not c["ok"]:
             problems.append(f"切换「{label}」页签失败 (复核: {c.get('verify')})")
             tables[kind_t] = []
             continue
         time.sleep(1.2)
         png, path = snap(f"snap_{kind_t}")
+        if not header_ok(png, kind_t):
+            problems.append(f"切到「{label}」后表头里没有「{HEADER_KEY[kind_t]}」 (页签没切过去或布局变了)")
+            tables[kind_t] = []
+            continue
         val, m, _ = read_agreed(png, TABLE_BOX, TABLE_PROMPTS[kind_t], lambda r, k=kind_t: canon_rows(k, r.get("rows")),
                                 ocr_kind=kind_t)
         meta["tabs"][kind_t] = {**m, "shot": str(path)}

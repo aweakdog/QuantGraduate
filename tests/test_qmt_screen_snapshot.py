@@ -226,3 +226,28 @@ def test_position_value_ignores_truncated_market_value_column():
     f2 = {"total_asset": 120000.0, "available": 100050.0, "frozen": 0.0, "market_value": 19950.0}
     assert ss.checks(f2, stock, [], []) == [] and ss.position_value(stock[0]) == 19950.0
     assert ss.checks(f2, [{**stock[0], "last": None}], [], [])      # 没读到最新价: 只能用 (截断的) 市值, 对不上就拦
+
+
+def test_click_tab_uses_ocr_position_then_falls_back(monkeypatch):
+    import qmt_bridge.ocr_read as ocr
+    import qmt_bridge.ui_agent as ua
+    import qmt_bridge.ui_channel as uc
+    clicks, fallback = [], []
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ua, "screenshot_windows", lambda: b"png")
+    monkeypatch.setattr(ua, "click_windows", lambda x, y: clicks.append((x, y)))
+    monkeypatch.setattr(uc.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ss.time, "sleep", lambda s: None)
+    monkeypatch.setattr(ocr, "locate_text", lambda png, text, box, scale: (811, 474))     # 10-30: 选中的「持仓」偏了 29px
+    out = ss.click_tab("持仓", (840, 474), "t", lambda *a: fallback.append(a) or {"ok": False})
+    assert out["ok"] and clicks == [(811, 474)] and fallback == []
+    monkeypatch.setattr(ocr, "locate_text", lambda png, text, box, scale: None)           # OCR 找不到: 退回坐标+复核
+    out = ss.click_tab("持仓", (840, 474), "t", lambda *a: fallback.append(a) or {"ok": False})
+    assert out["ok"] is False and len(fallback) == 1 and len(clicks) == 1
+
+
+def test_header_ok(monkeypatch):
+    import qmt_bridge.ocr_read as ocr
+    monkeypatch.setattr(ocr, "available", lambda: True)
+    monkeypatch.setattr(ocr, "ocr_boxes", lambda png, box, scale: [("资金账号", 1, (870, 521)), ("当前拥股", 1, (1091, 522))])
+    assert ss.header_ok(b"", "positions") and not ss.header_ok(b"", "orders")
