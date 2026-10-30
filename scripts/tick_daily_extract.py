@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""逐笔特征日更链 (跑在 eez040, 逐笔仓库所在机): 同步 -> 挂链 -> 抽取 -> 推送
+r"""逐笔特征日更链 (跑在 eez040, 逐笔仓库所在机): 同步 -> 挂链 -> 抽取 -> 推送
 
 为什么存在
 ──────────
@@ -42,6 +42,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +104,19 @@ def missing_days(out_dir):
     return days
 
 
+T1A_RETRY_DAYS = 30
+
+
+def plan_days(need_tm, need_t1a, today):
+    """抽取顺序与范围 (10-30): 最新的日子先抽 —— tk_* 是日更的硬依赖, 原来按日期升序, 每班都先在两个老缺口
+    (T1A 20241127 跑十几分钟、20250827 空结果) 上耗着, 本月重试了 90 次。T1A 只补近 30 天的缺口, 更早的
+    不再每班重试 (T1A 目前列建而不用)。返回 (要处理的日期 新→旧, 跳过的 T1A 旧缺口)。"""
+    cut = (today - timedelta(days=T1A_RETRY_DAYS)).strftime("%Y%m%d")
+    stale = sorted(d for d in need_t1a - need_tm if d < cut)
+    days = sorted((need_tm | need_t1a) - set(stale), reverse=True)
+    return days, stale
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-sync", action="store_true", help="跳过 123 云盘同步")
@@ -131,7 +145,10 @@ def main():
     link_123_into_tree()
     need_tm = set(missing_days(OUT))
     need_t1a = set(missing_days(OUT_T1A))
-    days = sorted(need_tm | need_t1a)
+    days, stale = plan_days(need_tm, need_t1a, date.today())
+    if stale:
+        log(f"T1A 旧缺口 {len(stale)} 天本班不重试 (不影响日更): {', '.join(stale[:5])}")
+        need_t1a -= set(stale)
     if not days:
         log("无待抽取日期")
     for d in days:
