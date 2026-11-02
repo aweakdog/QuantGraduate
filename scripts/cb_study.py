@@ -17,12 +17,20 @@ COST = 0.0002 + 0.001
 MAX_PRICE, MIN_AGE = 150.0, 5
 
 
+MIN_PRICE, BAD_RET = 30.0, 0.5
+
+
 def prepare(panel):
+    """数据清洗 (11-02 首跑发现, 不是调参): 只留沪深交易所转债 (11xxxx/12xxxx), 404xxx 是退市后到两网板块的
+    转债, 价格在 0 和几十之间乱跳 (单日 +15594%); 价格 < 30 视为坏数据不可选; 单日涨跌超过 50% 视为数据错误记 0
+    (交易所转债 2022-08 起涨跌幅限制 20%, 此前极少超过 50%)。"""
+    panel = panel[panel["code"].astype(str).str.match(r"^1[12]\d{4}$")]
     close = panel.pivot_table(index="date", columns="code", values="close").sort_index()
     prem = panel.pivot_table(index="date", columns="code", values="premium").reindex_like(close)
     ret = close.pct_change(fill_method=None)
+    ret = ret.where(ret.abs() <= BAD_RET)
     age = close.notna().cumsum()
-    elig = close.notna() & prem.notna() & (close <= MAX_PRICE) & (age >= MIN_AGE)
+    elig = close.notna() & prem.notna() & (close <= MAX_PRICE) & (close >= MIN_PRICE) & (age >= MIN_AGE)
     return ret, (close + prem).where(elig), elig
 
 
