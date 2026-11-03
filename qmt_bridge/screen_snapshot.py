@@ -301,6 +301,31 @@ def click_tab(label, fallback_xy, step, click_xy_verified):
     return click_xy_verified(*fallback_xy, f"底部表格区的「{label}」页签", label, step)
 
 
+LEFT_MENU = (60, 70, 160, 95)          # 交易页左侧功能树最上面的「买入」
+
+
+def restore_trade_layout(log=print):
+    """页签栏里找不到「持仓」时 (11-03: 交易页内容区变成了个股 K 线 + 新闻研报, 下单面板和表格都没了),
+    先按 Esc 关掉可能的弹框, 再点左侧功能树的「买入」把交易布局切回来。纯界面导航, 不会下单。返回是否动过。"""
+    from . import ocr_read
+    from .ui_agent import click_windows, screenshot_windows
+    if not ocr_read.available():
+        return False
+    if ocr_read.locate_text(screenshot_windows(), "持仓", TAB_STRIP, 2):
+        return False
+    import ctypes
+    u = ctypes.windll.user32
+    u.keybd_event(0x1B, 0, 0, 0)
+    u.keybd_event(0x1B, 0, 2, 0)
+    time.sleep(0.8)
+    buy = ocr_read.locate_text(screenshot_windows(), "买入", LEFT_MENU, 2)
+    if buy:
+        click_windows(*buy)
+        time.sleep(2.0)
+    log(f"交易布局不对, 已按 Esc 并点左侧「买入」恢复 (买入位置 {buy})")
+    return True
+
+
 def header_ok(png, kind):
     """切页签后核对表头 (只在有 OCR 时做; 没 OCR 时由模型读数时自行判断)。"""
     from . import ocr_read
@@ -348,6 +373,7 @@ def take(kind, log=print):
     if over:
         return build_snapshot(kind, {}, [], [], [], None,
                               [f"QMT 窗口被别的程序挡住: {[o[0] or o[1] for o in over]}"], {"state": st})
+    restore_trade_layout(log)
     for kind_t in ("positions", "trades", "orders"):
         x, y, label = TABS[kind_t]
         c = click_tab(label, (x, y), f"snap_tab_{kind_t}", click_xy_verified)
