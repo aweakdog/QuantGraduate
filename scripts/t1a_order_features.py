@@ -56,6 +56,9 @@ try:      # 只有真抽取才需要; 缺包时仍可导入本模块跑算法测
 except ImportError:
     py7zr = None
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tick_pack  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 TICK = Path(os.environ.get(
     "TICK_DIR", "/home/yliog/tickdata/----逐笔委托成交行情-明细---"))
@@ -114,25 +117,27 @@ def run_day(day: str, codes):
     rows = []
     try:
         with py7zr.SevenZipFile(zf) as z:
-            names = set(z.getnames())
-        targets = []
-        for c in codes:
-            for p in (f"{day}/{c}/{F_TRD}", f"{c}/{F_TRD}"):
-                if p in names:
-                    targets.append(p)
-                    break
+            names = z.getnames()
+        # v1: <日>/<代码>/逐笔成交.csv 或 <代码>/逐笔成交.csv; v3 (2026-11-03 起) 见 tick_pack
+        lay, mem = tick_pack.members(names, day, kinds=("trd",))
+        pairs = [(c, mem[c]["trd"]) for c in codes if c in mem]
+        targets = [rel for _, rel in pairs]
+        # v3 整包只有 4 个固实块, 分批解压每批都要从块头重解 -> 一次解完 (成交文件 ~1GB)
+        step = max(len(targets), 1) if lay == "v3" else CHUNK
         tmp = tempfile.mkdtemp(prefix=f"t1a{day}_", dir="/tmp")
         try:
             # 分批解压: 一次 targets 全给 py7zr 会把整包摊进内存
-            for i in range(0, len(targets), CHUNK):
+            for i in range(0, len(targets), step):
                 with py7zr.SevenZipFile(zf) as z:
-                    z.extract(path=tmp, targets=targets[i:i + CHUNK])
-            for rel in targets:
-                code = rel.split("/")[-2]
+                    z.extract(path=tmp, targets=targets[i:i + step])
+            for code, rel in pairs:
                 try:
-                    d = pd.read_csv(Path(tmp) / rel, encoding="gbk", engine="c",
-                                    usecols=lambda c: c.strip() in U_TRD)
-                    d.columns = [c.strip() for c in d.columns]
+                    if rel.endswith(".parquet"):
+                        d = tick_pack.read(Path(tmp) / rel, "trd", U_TRD, code.endswith(".SH"))
+                    else:
+                        d = pd.read_csv(Path(tmp) / rel, encoding="gbk", engine="c",
+                                        usecols=lambda c: c.strip() in U_TRD)
+                        d.columns = [c.strip() for c in d.columns]
                     r = ratios_for_code(d, code.endswith(".SZ"))
                     if r is not None:
                         rows.append({"date": day, "code": code[:6], **r})

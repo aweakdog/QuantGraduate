@@ -42,7 +42,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tick_micro_features import F_ORD, _rd, resolve  # noqa: E402
+import tick_pack  # noqa: E402
+from tick_micro_features import resolve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 QC = ROOT / "data/processed/tick_qc_early.parquet"
@@ -67,27 +68,24 @@ def sample_codes():
     return [f"{c}.{'SH' if c[0] == '6' else 'SZ'}" for c in c6[::step]]
 
 
-def measure_pack(pack: Path, codes):
-    """返回逐股 (share_pre10, n_rows) 列表。只解压采样股的委托文件。"""
+def measure_pack(pack: Path, codes, day=None):
+    """返回 (逐股 (share_pre10, n_rows) 列表, 包格式)。只解压采样股的委托文件。
+    v3 的 SZ 委托文件多了撤单重复行, tick_pack 统一成 v1 口径后再数, 基线才可比。"""
     import py7zr
     with py7zr.SevenZipFile(pack, mode="r") as z:
-        names = set(z.getnames())
-    dirs = {}
-    tail = "/" + F_ORD
-    for n in names:
-        if n.endswith(tail):
-            dirs[n.split("/")[-2]] = n[:-len(tail)]
-    have = [c for c in codes if c in dirs]
+        names = z.getnames()
+    lay, mem = tick_pack.members(names, day or pack.stem, kinds=("ord",))
+    have = [c for c in codes if c in mem]
     if not have:
-        return []
+        return [], lay
     out = []
     tmp = tempfile.mkdtemp(prefix="qc_", dir="/tmp")
     try:
-        tgt = [f"{dirs[c]}/{F_ORD}" for c in have]
+        tgt = [mem[c]["ord"] for c in have]
         with py7zr.SevenZipFile(pack, mode="r") as z:
             z.extract(path=tmp, targets=tgt)
         for c in have:
-            df = _rd(Path(tmp) / dirs[c] / F_ORD, {"时间"})
+            df = tick_pack.read(Path(tmp) / mem[c]["ord"], "ord", {"时间"}, c.endswith(".SH"))
             if df is None or "时间" not in df.columns or not len(df):
                 continue
             t = pd.to_numeric(df["时间"], errors="coerce").dropna()
@@ -96,13 +94,15 @@ def measure_pack(pack: Path, codes):
             out.append((float((t < T10).mean()), int(len(t))))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    return out
+    return out, lay
 
 
 def qc_one(day: str, pack: Path):
-    per = measure_pack(pack, sample_codes())
+    per, lay = measure_pack(pack, sample_codes(), day)
     if len(per) < N_SAMPLE // 3:
-        print(f"{day}: 采样股票只解出 {len(per)} 只, 包不可用")
+        why = {"v2": " (.dat 加密格式, 读不了, 需供应商重发)",
+               "?": " (不认识的包格式)"}.get(lay, "")
+        print(f"{day}: 采样股票只解出 {len(per)} 只, 包不可用, 包格式 {lay}{why}")
         return None
     sh = np.array([p[0] for p in per])
     rows = np.array([p[1] for p in per])

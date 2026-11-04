@@ -41,10 +41,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-try:
+try:      # 只有真抽取才需要; 缺包时仍可导入本模块跑算法测试
     import py7zr
 except ImportError:
-    sys.exit("需要 py7zr: pip install py7zr")
+    py7zr = None
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tick_pack  # noqa: E402
+from tick_pack import read_csv as _rd  # noqa: E402,F401  (tick_qc_early 从这里导入)
 
 warnings.filterwarnings("ignore")
 
@@ -82,31 +86,6 @@ def _sec(t):
     return (t // 10000000) * 3600 + (t // 100000 % 100) * 60 + (t // 1000 % 100)
 
 
-def _rd(fp: Path, use):
-    """编码不统一: 多数天是 GBK, 但实测 20241127/20250827 是 UTF-8 带 BOM。
-    编码猜错时列名解不出来, usecols 匹配为空, 会静默丢掉一整天, 所以必须逐个试。
-    2018-07~2019-05 供应商批次的列头逗号后带空格 (" 成交价格"), 精确匹配会静默
-    丢整天 (2026-08-19 回填 2017 时 136 天全军覆没查出来的), 所以匹配前先 strip。"""
-    if not fp.exists():
-        return None
-    try:
-        with open(fp, "rb") as fh:
-            bom = fh.read(3)
-    except Exception:
-        return None
-    encs = ("utf-8-sig",) if bom == b"\xef\xbb\xbf" else ("gbk", "utf-8")
-    for e in encs:
-        try:
-            df = pd.read_csv(fp, encoding=e,
-                             usecols=lambda c: c.strip() in use,
-                             on_bad_lines="skip")
-        except Exception:
-            continue
-        if len(df.columns):
-            return df.rename(columns=lambda c: c.strip())
-    return None
-
-
 def _bucket_net(amt, is_buy):
     """按单笔金额分档, 返回各档 (买额-卖额)"""
     out = {}
@@ -117,9 +96,10 @@ def _bucket_net(amt, is_buy):
     return out
 
 
-def one_stock(base: Path, code: str, day: str):
+def one_stock(files: dict, code: str, day: str):
+    """files = {ord/trd/quo: 解压后的路径}; 新旧包格式由 tick_pack 统一成 v1 口径"""
     is_sh = code.endswith(".SH")
-    trd = _rd(base / F_TRD, U_TRD)
+    trd = tick_pack.read(files.get("trd"), "trd", U_TRD, is_sh)
     if trd is None or trd.empty or "成交价格" not in trd.columns:
         return None
 
@@ -190,7 +170,7 @@ def one_stock(base: Path, code: str, day: str):
         r["rv_5m"] = r["kyle_lambda"] = np.nan
 
     # ---------- 撤单 ----------
-    ordf = _rd(base / F_ORD, U_ORD)
+    ordf = tick_pack.read(files.get("ord"), "ord", U_ORD, is_sh)
     if ordf is not None and not ordf.empty and "委托数量" in ordf.columns:
         o_q = pd.to_numeric(ordf["委托数量"], errors="coerce").fillna(0)
         o_p = pd.to_numeric(ordf["委托价格"], errors="coerce").fillna(0) / PDIV
@@ -235,7 +215,7 @@ def one_stock(base: Path, code: str, day: str):
             r[f"ord_net_{nm}"] = np.nan
 
     # ---------- 盘口 ----------
-    quo = _rd(base / F_QUO, U_QUO)
+    quo = tick_pack.read(files.get("quo"), "quo", U_QUO, is_sh)
     if quo is not None and not quo.empty and "申卖价1" in quo.columns:
         qt = pd.to_numeric(quo["时间"], errors="coerce").fillna(0).astype("int64")
         m = (qt >= T_OPEN) & (qt <= T_END)
@@ -280,34 +260,32 @@ def run_day(day: str, codes, chunk: int):
     if pack is None:
         return f"{day} 无包"
     with py7zr.SevenZipFile(pack, mode="r") as z:
-        names = set(z.getnames())
-    # 包内有两种结构: <日期>/<代码>/<文件> 与 <代码>/<文件>(无日期前缀)。
+        names = z.getnames()
+    # v1 包内有两种结构: <日期>/<代码>/<文件> 与 <代码>/<文件>(无日期前缀)。
     # 写死日期前缀会整段漏掉后一种(实测 91 天, 集中在 2026 年), 所以扫一遍条目自动推断。
-    dirs = {}
-    tail = "/" + F_TRD
-    for n in names:
-        if n.endswith(tail):
-            dirs[n.split("/")[-2]] = n[:-len(tail)]
-    have = [c for c in codes if c in dirs]
+    # 2026-11-03 起是 v3 (按数据类型分目录的 parquet), 见 tick_pack。
+    lay, mem = tick_pack.members(names, day)
+    have = [c for c in codes if "trd" in mem.get(c, {})]
     if not have:
-        return f"{day} 无匹配"
+        return f"{day} 无匹配 (包格式 {lay})"
+    if lay == "v3":   # 整包只有 4 个固实块 (v1 有 3000+), 分批解压每批都得从块头重解 -> 一次解完 (~3GB)
+        chunk = len(have)
 
     rows = []
     # 分批解压即用即删: 600 只全解开约 14GB, 多天并发会把磁盘和内存打满
     for i in range(0, len(have), chunk):
         part = have[i:i + chunk]
-        tgt = [f"{dirs[c]}/{f}" for c in part for f in (F_ORD, F_TRD, F_QUO)
-               if f"{dirs[c]}/{f}" in names]
+        tgt = [p for c in part for p in mem[c].values()]
         tmp = tempfile.mkdtemp(prefix=f"tm{day}_", dir="/tmp")
         try:
             with py7zr.SevenZipFile(pack, mode="r") as z:
                 z.extract(path=tmp, targets=tgt)
             for c in part:
-                base = Path(tmp) / dirs[c]
-                if not base.exists():
+                files = {k: Path(tmp) / p for k, p in mem[c].items()}
+                if not files["trd"].exists():
                     continue
                 try:
-                    rec = one_stock(base, c, day)
+                    rec = one_stock(files, c, day)
                 except Exception:
                     rec = None
                 if rec:
@@ -325,6 +303,8 @@ def run_day(day: str, codes, chunk: int):
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__.split("用法")[1])
+    if py7zr is None:
+        sys.exit("需要 py7zr: pip install py7zr")
     start, end = sys.argv[1], sys.argv[2]
 
     # 取所有 universe 的并集: 线上池 519 只与实验池 630 只并不互相包含,

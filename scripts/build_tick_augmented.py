@@ -39,6 +39,29 @@ DROP = {"code", "date", "close", "vwap", "prev_close", "day_amt"}
 WIN = 3.0        # 横截面 z 的截尾
 MA = 5           # 平滑窗口, 与 feature_engine 的 min_periods=window 惯例一致
 EDGE_MAX = 3     # 每股最多补几个"基矩阵有、逐笔面板还没有"的尾部交易日
+KLINE = ROOT / "data" / "raw" / "kline"
+V3_FROM = pd.Timestamp("2026-11-03")   # 逐笔包换成 v3 格式的首日 (见 scripts/tick_pack.py)
+
+
+def fill_amihud_v3(df, kline_dir=KLINE):
+    """v3 包的快照没有 前收盘, 抽取端 amihud 为空。用前复权日线收益补:
+    |close_qfq(d) / close_qfq(d-1) - 1| 与 v1 的 |收盘 / 前收盘 - 1| 同口径 (除权日也对)。
+    只补 V3_FROM 起的空值 —— 历史行为逐字节不变; 日线还没有这天的仍为空。"""
+    if not {"amihud", "day_amt"} <= set(df.columns):
+        return df
+    m = (df["date"] >= V3_FROM) & df["amihud"].isna() & (df["day_amt"] > 0)
+    parts = []
+    for c6 in df.loc[m, "c6"].unique():
+        f = Path(kline_dir) / f"{c6}.parquet"
+        if f.exists():
+            k = pd.read_parquet(f, columns=["date", "close"])
+            k["date"] = pd.to_datetime(k["date"])
+            k = k.drop_duplicates("date", keep="last").sort_values("date")
+            parts.append(pd.DataFrame({"c6": c6, "date": k["date"], "kret": k["close"].pct_change()}))
+    if parts:
+        r = df.loc[m, ["c6", "date", "day_amt"]].merge(pd.concat(parts), on=["c6", "date"], how="left")
+        df.loc[m, "amihud"] = (r["kret"].abs() / (r["day_amt"] / 1e8)).to_numpy()
+    return df
 
 
 def load_micro():
@@ -49,7 +72,7 @@ def load_micro():
     df["c6"] = df["code"].astype(str).str.zfill(6)
     df["date"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d")
     df = df.sort_values(["c6", "date"]).drop_duplicates(["c6", "date"], keep="last")
-    return df, len(fs)
+    return fill_amihud_v3(df), len(fs)
 
 
 def main():
