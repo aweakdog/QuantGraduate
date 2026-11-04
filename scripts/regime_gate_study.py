@@ -36,20 +36,20 @@ def command(root, var, seed):
             "--label-alignment", "purge6", "--tag", f"RG_{var}", "--load-preds", ro.n6_caches(seed)[1]]
 
 
-def run(root, workers):
-    jobs = [(v, s) for v in VARIANTS for s in ro.N6_SEEDS if not out_path(root, f"RG_{v}", s).exists()]
+def run(root, workers, variants=VARIANTS, prefix="RG", cmd=command):
+    jobs = [(v, s) for v in variants for s in ro.N6_SEEDS if not out_path(root, f"{prefix}_{v}", s).exists()]
     print(f"{len(jobs)} 个回放待跑", flush=True)
 
     def one(job):
         v, s = job
-        log = Path(root) / "logs" / f"rg_{v}_s{s}.log"
+        log = Path(root) / "logs" / f"{prefix.lower()}_{v}_s{s}.log"
         log.parent.mkdir(exist_ok=True)
         with log.open("w") as f:
-            rc = subprocess.run(["nice", "-n", "10", *command(root, v, s)], cwd=root, stdout=f, stderr=subprocess.STDOUT).returncode
+            rc = subprocess.run(["nice", "-n", "10", *cmd(root, v, s)], cwd=root, stdout=f, stderr=subprocess.STDOUT).returncode
         return v, s, rc
     with ThreadPoolExecutor(workers) as ex:
         for v, s, rc in ex.map(one, jobs):
-            print(f"  RG_{v} s{s}: rc={rc}", flush=True)
+            print(f"  {prefix}_{v} s{s}: rc={rc}", flush=True)
 
 
 def daily(path):

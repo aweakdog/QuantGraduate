@@ -103,6 +103,11 @@ parser.add_argument("--regime-confirm", type=int, default=2,
 parser.add_argument("--regime-reenter", type=float, default=0.0,
                     help="滞回回场阈值: 空仓后需广度连续确认 ≥ 此值才回场; 离场仍用 "
                          "--regime-breadth。中间是死区(状态保持)。0=关闭。仅 breadth 过滤")
+parser.add_argument("--regime-confirm-on", type=int, default=0,
+                    help="回场确认天数, 0=同 --regime-confirm。离场确认不变")
+parser.add_argument("--regime-thrust", type=float, default=0.0,
+                    help="广度推力快速回场: 空仓中广度单日上升 ≥ 此值且当天已达回场条件, "
+                         "当天即回场 (不等确认)。0=关闭。仅 breadth 过滤")
 parser.add_argument("--regime-soft-low", type=float, default=0.0,
                     help="半仓档下限: 广度在 [此值, regime-breadth) 时不清仓, 新买槽位压到 "
                          "--regime-soft-n; 低于此值才全清。0=关闭。仅 breadth 过滤")
@@ -417,13 +422,18 @@ def build_regime_state(regime_src):
       breadth < L → 全清仓; [L, regime_breadth) → 不清仓但新买槽位压到
       --regime-soft-n; >= regime_breadth → 满配。只管买入侧, 已持仓按普通
       到期/续持规则处理。仅支持 breadth; 与 --regime-reenter 互斥(单变量归因)。
+    --regime-confirm-on N: 回场只需连续 N 天达回场条件 (离场仍 regime_confirm 天)。
+    --regime-thrust D: 空仓中广度单日上升 ≥ D 且当天已达回场条件 -> 当天回场, 其余照常确认。
     """
     if args.regime_filter == "off":
         return None, None
-    if (args.regime_reenter > 0 or args.regime_soft_low > 0) and args.regime_filter != "breadth":
-        raise SystemExit("--regime-reenter / --regime-soft-low 仅支持 --regime-filter breadth")
+    if ((args.regime_reenter > 0 or args.regime_soft_low > 0 or args.regime_thrust > 0)
+            and args.regime_filter != "breadth"):
+        raise SystemExit("--regime-reenter / --regime-soft-low / --regime-thrust 仅支持 --regime-filter breadth")
     if args.regime_reenter > 0 and args.regime_soft_low > 0:
         raise SystemExit("--regime-reenter 与 --regime-soft-low 不可同用 (单变量归因)")
+    if args.regime_soft_low > 0 and (args.regime_confirm_on > 0 or args.regime_thrust > 0):
+        raise SystemExit("--regime-soft-low 不支持 --regime-confirm-on / --regime-thrust")
     r = regime_src.set_index("date").sort_index()
     k = max(1, args.regime_confirm)
     if args.regime_soft_low > 0:
@@ -450,7 +460,10 @@ def build_regime_state(regime_src):
     if args.regime_reenter > 0:
         good = (r["breadth_above_ma"] >= args.regime_reenter).fillna(False)
     turn_off = raw.rolling(k).min().fillna(0) == 1        # 连续k天弱 -> 空仓
-    turn_on = good.rolling(k).min().fillna(0) == 1        # 连续k天达回场条件 -> 回场
+    k_on = max(1, args.regime_confirm_on or k)
+    turn_on = good.rolling(k_on).min().fillna(0) == 1     # 连续k_on天达回场条件 -> 回场
+    if args.regime_thrust > 0:                            # 广度推力: 单日暴涨且已达回场条件 -> 不等确认
+        turn_on |= ((r["breadth_above_ma"].diff() >= args.regime_thrust) & good).fillna(False)
     state, out = False, {}
     for d in r.index:
         if not state and bool(turn_off.loc[d]):
@@ -899,6 +912,9 @@ if regime_state is not None:
           f"确认{args.regime_confirm}天) | 回测期内弱势日占比 {_rs.mean()*100:.1f}%")
     if args.regime_reenter > 0:
         print(f"  滞回: 回场需广度≥{args.regime_reenter:.0%} (离场<{args.regime_breadth:.0%}, 中间死区保持)")
+    if args.regime_confirm_on > 0 or args.regime_thrust > 0:
+        print(f"  快速回场: 回场确认 {args.regime_confirm_on or args.regime_confirm} 天"
+              + (f", 广度单日涨 ≥{args.regime_thrust:.0%} 当天回场" if args.regime_thrust > 0 else ""))
     if regime_soft_state is not None:
         _ss = regime_soft_state.loc[(regime_soft_state.index >= pd.Timestamp(TEST_START))]
         print(f"  半仓档: 广度∈[{args.regime_soft_low:.0%},{args.regime_breadth:.0%}) 槽位{args.regime_soft_n} "
@@ -1650,6 +1666,7 @@ json.dump({
     "regime_filter": args.regime_filter, "regime_ma": args.regime_ma,
     "regime_breadth": args.regime_breadth, "regime_confirm": args.regime_confirm,
     "regime_reenter": args.regime_reenter,
+    "regime_confirm_on": args.regime_confirm_on, "regime_thrust": args.regime_thrust,
     "regime_soft_low": args.regime_soft_low, "regime_soft_n": args.regime_soft_n,
     "reversal_guard": args.reversal_guard,
     "lot_flex": LOT_FLEX,
