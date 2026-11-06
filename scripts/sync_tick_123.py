@@ -15,6 +15,11 @@
   - web JWT 缓存复用, 失效才密码重登, 避免每天一次密码登录画像
   - 下载先写 .part 再原子改名, 半截文件不会被当成完成
   - 本地存在性同时查 123 树和百度树 (0803~0807 由百度渠道先到)
+  - 11-04 起供应商把大包切成分卷 (20261104.7z.001/.002, 分享里留了个目录叫
+    "带001，002 全下，解压 001 即可"): 分卷照常转存下载, 齐了按序拼回 <日>.7z
+    (7-Zip 分卷就是整包按字节切开), 下游只认 <日>.7z。只认 .7z 时这些天被静默漏掉
+  - 供应商同名重发 (20261102.7z 11-04 换成新格式, 5.56GB -> 4.04GB): 分享与账号同名但大小
+    不同 -> 账号旧版移入回收站后重新转存、下载
 
 凭证文件 (全部 600, 不进仓库):
   ~/.config/123open/credentials.json      {"client_id","client_secret"}
@@ -35,6 +40,8 @@ import argparse
 import fcntl
 import json
 import os
+import re
+import shutil
 import sys
 import time
 import urllib.error
@@ -60,6 +67,21 @@ BAIDU_TREE = "/home/yliog/tickdata/----逐笔委托成交行情-明细---"  # �
 
 PAUSE = 1.2          # open 平台 QPS 很低, 每次调用间隔
 LOCK_FILE = "/tmp/sync_tick_123.lock"
+PACK_RE = re.compile(r"^(\d{8})\.7z(?:\.(\d{3}))?$")  # 整包 20261103.7z 或分卷 20261104.7z.001
+
+
+def is_pack(name):
+    return bool(PACK_RE.match(name))
+
+
+def volumes(files):
+    """{名字: 大小} -> {日期: {分卷名: 大小}}, 只收 .7z.NNN 分卷"""
+    out = {}
+    for n, size in files.items():
+        m = PACK_RE.match(n)
+        if m and m.group(2):
+            out.setdefault(m.group(1), {})[n] = size
+    return out
 
 
 def log(*a):
@@ -234,9 +256,35 @@ def local_ok(month, name, size):
     # 百度树是另一渠道打的包, 压缩参数不同导致大小天然不等 (34/86 天不一致,
     # 见 findings 2026-08-16 §3)。按精确大小判会把这些天误判为缺失, 每次
     # 同步重复拉 ~100GB。百度版是完整口径, 存在且非空即视为已有。
-    if os.path.exists(pbd) and os.path.getsize(pbd) > 0:
+    # 但符号链接是 tick_daily_extract 从 123 树挂过去的, 不是独立副本 —— 不算,
+    # 否则供应商同名重发后永远不会重新下载。
+    if os.path.exists(pbd) and not os.path.islink(pbd) and os.path.getsize(pbd) > 0:
         return pbd
     return None
+
+
+def assemble(month, day, vols):
+    """分卷齐了 (编号 001..N 连续、本地大小都对) 就按序拼成 <日>.7z; 拼过且分卷没变则跳过。
+    分卷保留不删: 供应商若还在补传后续分卷, 下次能直接重拼。拼残的包打不开, 下游质检会挡。"""
+    nums = sorted(int(PACK_RE.match(n).group(2)) for n in vols)
+    paths = [os.path.join(DEST, month, n) for n in sorted(vols)]
+    final, meta = os.path.join(DEST, month, day + ".7z"), os.path.join(DEST, month, day + ".7z.vols.json")
+    if nums != list(range(1, len(nums) + 1)) or not all(
+            os.path.exists(p) and os.path.getsize(p) == vols[os.path.basename(p)] for p in paths):
+        return None
+    if os.path.exists(final) and os.path.exists(meta):
+        with open(meta) as f:
+            if json.load(f) == vols:
+                return None
+    with open(final + ".part", "wb") as out:
+        for p in paths:
+            with open(p, "rb") as f:
+                shutil.copyfileobj(f, out, 1 << 24)
+    os.replace(final + ".part", final)
+    with open(meta, "w") as f:
+        json.dump(vols, f)
+    log(f"分卷合并: {day}.7z <- {' + '.join(sorted(vols))} ({os.path.getsize(final) / 1e9:.2f} GB)")
+    return final
 
 
 def download(file_id, month, name, size):
@@ -302,9 +350,9 @@ def main():
             continue
         mon = m["FileName"]
         share_files[mon] = {f["FileName"]: f for f in share_ls(m["FileId"])
-                            if f.get("Type") != 1 and f["FileName"].endswith(".7z")}
+                            if f.get("Type") != 1 and is_pack(f["FileName"])}
     n_share = sum(len(v) for v in share_files.values())
-    log("分享共 %d 个月目录, %d 个 .7z, 最新: %s"
+    log("分享共 %d 个月目录, %d 个包文件 (含分卷), 最新: %s"
         % (len(share_files), n_share,
            max((n for v in share_files.values() for n in v), default="(无)")))
 
@@ -321,18 +369,20 @@ def main():
             mine_month_ids[m["filename"]] = m["fileId"]
             mine_files[m["filename"]] = {
                 f["filename"]: f for f in open_list(m["fileId"])
-                if f.get("type") != 1 and f["filename"].endswith(".7z")}
+                if f.get("type") != 1 and is_pack(f["filename"])}
     n_mine = sum(len(v) for v in mine_files.values())
-    log("账号共 %d 个月目录, %d 个 .7z" % (len(mine_files), n_mine))
+    log("账号共 %d 个月目录, %d 个包文件" % (len(mine_files), n_mine))
 
-    # 3. 差异
-    to_copy = {}           # month -> [share entry]
+    # 3. 差异 (账号里同名但大小不同 = 供应商重发, 旧版先进回收站再转存)
+    to_copy, to_replace = {}, []      # month -> [share entry]; [(month, 账号旧文件)]
     for mon, files in share_files.items():
-        missing = [e for n, e in sorted(files.items())
-                   if n not in mine_files.get(mon, {})
-                   and n.startswith(args.only)]
-        if missing:
-            to_copy[mon] = missing
+        for n, e in sorted(files.items()):
+            old = mine_files.get(mon, {}).get(n)
+            if not n.startswith(args.only) or (old and old.get("size") == e.get("Size")):
+                continue
+            to_copy.setdefault(mon, []).append(e)
+            if old:
+                to_replace.append((mon, old))
     to_download = []       # (fileId, month, name, size)
     for mon, files in mine_files.items():
         for n, f in sorted(files.items()):
@@ -342,6 +392,10 @@ def main():
     log("待转存 %d 个: %s"
         % (sum(len(v) for v in to_copy.values()),
            ", ".join(e["FileName"] for v in to_copy.values() for e in v) or "(无)"))
+    if to_replace:
+        log(f"其中供应商同名重发 {len(to_replace)} 个: " + ", ".join(
+            f"{f['filename']} (账号 {f.get('size', 0) / 1e9:.2f}GB -> "
+            f"分享 {share_files[m][f['filename']].get('Size', 0) / 1e9:.2f}GB)" for m, f in to_replace))
     log("待下载 %d 个: %s"
         % (len(to_download), ", ".join(n for _, _, n, _ in to_download) or "(无)"))
     if args.check:
@@ -350,6 +404,13 @@ def main():
     # 4. 转存 + 确认 + 下载
     if to_copy and not args.no_copy:
         log("== 3/4 转存 ==")
+        if to_replace:     # open 平台操作放在 web 登录之前 (web 登录会作废 open token)
+            j = open_api("/api/v1/file/trash", payload={"fileIDs": [f["fileId"] for _, f in to_replace]})
+            if j.get("code") != 0:
+                raise RuntimeError(f"旧版移入回收站失败: {json.dumps(j, ensure_ascii=False)[:200]}")
+            log("账号旧版已移入回收站:", ", ".join(f["filename"] for _, f in to_replace))
+            gone = {(m, f["filename"]) for m, f in to_replace}
+            to_download = [x for x in to_download if (x[1], x[2]) not in gone]
         c = web_client()
         for mon, entries in sorted(to_copy.items()):
             if mon not in mine_month_ids:
@@ -379,7 +440,7 @@ def main():
         for mon in to_copy:
             for f in open_list(mine_month_ids[mon]):
                 n = f.get("filename", "")
-                if n.endswith(".7z") and not local_ok(mon, n, f.get("size", -1)) \
+                if is_pack(n) and not local_ok(mon, n, f.get("size", -1)) \
                         and all(x[2] != n for x in to_download):
                     to_download.append((f["fileId"], mon, n, f["size"]))
 
@@ -388,6 +449,10 @@ def main():
         for fid, mon, name, size in sorted(to_download, key=lambda x: x[2],
                                            reverse=True):
             download(fid, mon, name, size)
+    for mon, files in share_files.items():
+        for day, vols in volumes({n: e.get("Size") for n, e in files.items()}).items():
+            if day.startswith(args.only):
+                assemble(mon, day, vols)
     log("同步完成: 转存 %d, 下载 %d"
         % (sum(len(v) for v in to_copy.values()) if not args.no_copy else 0,
            len(to_download)))
