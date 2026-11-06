@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------- 常量
 OPEN_BASE = "https://open-api.123pan.com"
@@ -68,6 +70,7 @@ BAIDU_TREE = "/home/yliog/tickdata/----逐笔委托成交行情-明细---"  # �
 PAUSE = 1.2          # open 平台 QPS 很低, 每次调用间隔
 LOCK_FILE = "/tmp/sync_tick_123.lock"
 PACK_RE = re.compile(r"^(\d{8})\.7z(?:\.(\d{3}))?$")  # 整包 20261103.7z 或分卷 20261104.7z.001
+DL_CONN = 8          # 并行分段下载连接数
 
 
 def is_pack(name):
@@ -287,8 +290,24 @@ def assemble(month, day, vols):
     return final
 
 
-def download(file_id, month, name, size):
-    """open 平台下载, .part 原子改名, 进度每 10s 一行"""
+def _fetch_range(url, part, start, end, got):
+    """下载 [start, end] 写进 part 的对应位置; got[start] 记已写字节 (给进度用)"""
+    req = urllib.request.Request(url, headers={"User-Agent": "quant-strategy-feed/1.0",
+                                               "Range": f"bytes={start}-{end}"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(part, "r+b") as f:
+        if r.status != 206:
+            raise RuntimeError(f"服务端不支持分段下载 (HTTP {r.status})")
+        f.seek(start)
+        while chunk := r.read(1 << 20):
+            f.write(chunk)
+            got[start] += len(chunk)
+    if got[start] != end - start + 1:
+        raise RuntimeError(f"分段 {start}-{end} 不完整: {got[start]} 字节")
+
+
+def download(file_id, month, name, size, etag=""):
+    """open 平台下载: DL_CONN 段并行写 .part, 校验大小和 MD5 (123 的 etag 就是 MD5) 后原子改名。
+    跨境链路白天单连接常只有 0.5~1 MB/s (11-06 15:40 实测), 8 段并行约 3 倍。"""
     j = open_api("/api/v1/file/download_info", {"fileId": file_id})
     if j.get("code") != 0:
         raise RuntimeError("download_info 失败 %s: %s"
@@ -300,22 +319,32 @@ def download(file_id, month, name, size):
     os.makedirs(dirp, exist_ok=True)
     part = os.path.join(dirp, name + ".part")
     final = os.path.join(dirp, name)
-    req = urllib.request.Request(url, headers={"User-Agent": "quant-strategy-feed/1.0"})
-    t0, last_t, total = time.time(), time.time(), 0
-    with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
-            total += len(chunk)
-            if time.time() - last_t >= 10:
-                log("  %s %.2f/%.2f GB  平均 %.1f MB/s"
-                    % (name, total / 1e9, size / 1e9, total / (time.time() - t0) / 1e6))
-                last_t = time.time()
+    with open(part, "wb") as f:
+        f.truncate(size)
+    step = -(-size // DL_CONN)
+    ranges = [(a, min(a + step, size) - 1) for a in range(0, size, step)]
+    got = dict.fromkeys((a for a, _ in ranges), 0)
+    t0 = time.time()
+    with ThreadPoolExecutor(len(ranges)) as ex:
+        futs = [ex.submit(_fetch_range, url, part, a, b, got) for a, b in ranges]
+        while not all(f.done() for f in futs):
+            time.sleep(10)
+            total = sum(got.values())
+            log("  %s %.2f/%.2f GB  平均 %.1f MB/s"
+                % (name, total / 1e9, size / 1e9, total / (time.time() - t0) / 1e6))
+        for f in futs:
+            f.result()       # 任一段出错就抛, 保留 .part 以便排查
+    total = sum(got.values())
     if total != size:
         raise RuntimeError("大小不符 %s: 得到 %d 期望 %d (保留 .part 以便排查)"
                            % (name, total, size))
+    if re.fullmatch(r"[0-9a-f]{32}", etag or ""):
+        h = hashlib.md5()
+        with open(part, "rb") as f:
+            while chunk := f.read(1 << 24):
+                h.update(chunk)
+        if h.hexdigest() != etag:
+            raise RuntimeError(f"MD5 不符 {name}: {h.hexdigest()} != {etag} (保留 .part 以便排查)")
     os.replace(part, final)
     log("  %s 完成: %.2f GB, %.0fs, 平均 %.1f MB/s"
         % (name, total / 1e9, time.time() - t0, total / (time.time() - t0) / 1e6))
@@ -383,11 +412,11 @@ def main():
             to_copy.setdefault(mon, []).append(e)
             if old:
                 to_replace.append((mon, old))
-    to_download = []       # (fileId, month, name, size)
+    to_download = []       # (fileId, month, name, size, etag)
     for mon, files in mine_files.items():
         for n, f in sorted(files.items()):
             if n.startswith(args.only) and not local_ok(mon, n, f.get("size", -1)):
-                to_download.append((f["fileId"], mon, n, f["size"]))
+                to_download.append((f["fileId"], mon, n, f["size"], f.get("etag", "")))
 
     log("待转存 %d 个: %s"
         % (sum(len(v) for v in to_copy.values()),
@@ -397,7 +426,7 @@ def main():
             f"{f['filename']} (账号 {f.get('size', 0) / 1e9:.2f}GB -> "
             f"分享 {share_files[m][f['filename']].get('Size', 0) / 1e9:.2f}GB)" for m, f in to_replace))
     log("待下载 %d 个: %s"
-        % (len(to_download), ", ".join(n for _, _, n, _ in to_download) or "(无)"))
+        % (len(to_download), ", ".join(x[2] for x in to_download) or "(无)"))
     if args.check:
         return 0
 
@@ -442,13 +471,12 @@ def main():
                 n = f.get("filename", "")
                 if is_pack(n) and not local_ok(mon, n, f.get("size", -1)) \
                         and all(x[2] != n for x in to_download):
-                    to_download.append((f["fileId"], mon, n, f["size"]))
+                    to_download.append((f["fileId"], mon, n, f["size"], f.get("etag", "")))
 
     if to_download:
         log("== 4/4 下载 %d 个 (最新优先) ==" % len(to_download))
-        for fid, mon, name, size in sorted(to_download, key=lambda x: x[2],
-                                           reverse=True):
-            download(fid, mon, name, size)
+        for fid, mon, name, size, etag in sorted(to_download, key=lambda x: x[2], reverse=True):
+            download(fid, mon, name, size, etag)
     for mon, files in share_files.items():
         for day, vols in volumes({n: e.get("Size") for n, e in files.items()}).items():
             if day.startswith(args.only):

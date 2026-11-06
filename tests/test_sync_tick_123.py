@@ -1,6 +1,10 @@
-"""123 云盘同步: 分卷包 (11-04 起) 要认、齐了要拼回整包; 自己挂的符号链接不能挡住重发后的重新下载。"""
+"""123 云盘同步: 分卷包 (11-04 起) 要认、齐了要拼回整包; 自己挂的符号链接不能挡住重发后的重新下载;
+分段并行下载拼出来的文件必须逐字节一致, MD5 对不上不许落盘。"""
+import hashlib
+import http.server
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -42,6 +46,39 @@ def test_assemble_waits_for_all_volumes(dest):
     assert s.assemble("202611", "20261105", {"20261105.7z.001": 3, "20261105.7z.002": 4}) is None   # 第 2 卷没下完
     assert s.assemble("202611", "20261105", {"20261105.7z.001": 3, "20261105.7z.003": 4}) is None   # 编号不连续
     assert not (dest / "20261105.7z").exists()
+
+
+@pytest.fixture
+def range_server():
+    payload = os.urandom(1_000_003)
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            a, b = (int(x) for x in self.headers["Range"].split("=")[1].split("-"))
+            self.send_response(206)
+            self.send_header("Content-Length", str(b - a + 1))
+            self.end_headers()
+            self.wfile.write(payload[a:b + 1])
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield payload, f"http://127.0.0.1:{srv.server_address[1]}/f"
+    srv.shutdown()
+
+
+def test_parallel_download_bytes_and_md5(dest, range_server, monkeypatch):
+    payload, url = range_server
+    monkeypatch.setattr(s, "open_api", lambda *a, **k: {"code": 0, "data": {"downloadUrl": url}})
+    monkeypatch.setattr(s.time, "sleep", lambda _: None)
+    md5 = hashlib.md5(payload).hexdigest()
+    s.download("id", "202611", "20261106.7z.001", len(payload), md5)
+    assert (dest / "20261106.7z.001").read_bytes() == payload
+    with pytest.raises(RuntimeError, match="MD5"):
+        s.download("id", "202611", "20261106.7z.002", len(payload), "0" * 32)
+    assert not (dest / "20261106.7z.002").exists()
 
 
 def test_own_symlink_in_baidu_tree_does_not_count(dest, tmp_path):
