@@ -378,8 +378,12 @@ def main():
         if m.get("Type") != 1:
             continue
         mon = m["FileName"]
-        share_files[mon] = {f["FileName"]: f for f in share_ls(m["FileId"])
+        items = share_ls(m["FileId"])
+        share_files[mon] = {f["FileName"]: f for f in items
                             if f.get("Type") != 1 and is_pack(f["FileName"])}
+        other = [f["FileName"] for f in items if f["FileName"] not in share_files[mon]]
+        if other:       # 供应商换打包方式时先在这里露头 (11-04 的分卷就是这么漏掉的)
+            log(f"  {mon} 里不认识、不下载的条目: {', '.join(other)}")
     n_share = sum(len(v) for v in share_files.values())
     log("分享共 %d 个月目录, %d 个包文件 (含分卷), 最新: %s"
         % (len(share_files), n_share,
