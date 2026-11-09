@@ -132,7 +132,7 @@ def run_day(day: str, codes):
                     z.extract(path=tmp, targets=targets[i:i + step])
             for code, rel in pairs:
                 try:
-                    if rel.endswith(".parquet"):
+                    if rel.endswith(".parquet") or tick_pack.is_v4(Path(rel)):
                         d = tick_pack.read(Path(tmp) / rel, "trd", U_TRD, code.endswith(".SH"))
                     else:
                         d = pd.read_csv(Path(tmp) / rel, encoding="gbk", engine="c",

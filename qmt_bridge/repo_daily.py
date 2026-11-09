@@ -109,10 +109,17 @@ def run(dry_run, log=print, test_amount=None):
     if not snap0.get("account_online"):
         return {"ok": False, "status": "snapshot_offline", "error": snap0.get("error")}
     cash = snap0["asset"]["cash"]
-    st, resp = signed_post(f"{BASE_URL}/api/qmt/ticket", {"profile": "qmt10w", "today": today}, key)
+    for i in range(3):                          # 网络偶发失败不该白白丢掉上午这一次
+        st, resp = signed_post(f"{BASE_URL}/api/qmt/ticket", {"profile": "qmt10w", "today": today}, key)
+        if st == 200:
+            break
+        log(f"取单据失败 (第 {i + 1} 次): {st} {str(resp.get('error'))[:120]}")
+        time.sleep(10)
     ticket = resp.get("ticket") if st == 200 else None
-    if morning and not morning_ok(ticket):
-        return {"ok": True, "status": "defer_to_afternoon", "why": "今天不是确认空仓日 (或取不到计划), 留到 14:40 再判断"}
+    if morning and not morning_ok(ticket):     # 记下取单据的结果: 11-09 上午空仓日也被推迟, 当时分不清是网络还是计划
+        return {"ok": True, "status": "defer_to_afternoon", "why": "今天不是确认空仓日 (或取不到计划), 留到 14:40 再判断",
+                "ticket_http": st, "ticket_error": None if st == 200 else str(resp.get("error"))[:200],
+                "ticket_trades": None if ticket is None else len(ticket.get("buy") or []) + len(ticket.get("sell") or [])}
     amount, reserve, why = plan_amount(cash, ticket)
     if dry_run and test_amount:                     # 只用于演练: 钱已借出时也能把填单流程走一遍
         amount, reserve, why, cash = float(test_amount), 0.0, f"演练金额 {test_amount}", max(cash, float(test_amount))
