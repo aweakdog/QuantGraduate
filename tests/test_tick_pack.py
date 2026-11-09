@@ -129,6 +129,20 @@ def _write_v3(root: Path, code, is_sh, ev):
     return paths
 
 
+def _write_v4(root: Path, code, is_sh, ev):
+    """v4 = v3 的内容换成每股一个目录的中文列头 CSV (列名照供应商说明)"""
+    v3 = _write_v3(root / "src", code, is_sh, ev)
+    base = root / DAY / code[:6]
+    base.mkdir(parents=True)
+    out = {}
+    for k, cols in tick_pack.V4_COLS.items():
+        d = pd.read_parquet(v3[k]).rename(columns={v: c for c, v in cols.items()})
+        d.insert(0, "交易所代码", code[:6])
+        out[k] = base / tick_pack.V4[k]
+        d[["交易所代码", *cols]].to_csv(out[k], index=False, encoding="utf-8")
+    return out
+
+
 def _same(a, b, skip=()):
     assert a.keys() == b.keys()
     for k in a:
@@ -150,6 +164,20 @@ def test_v3_features_equal_v1(tmp_path, code):
     assert r1 is not None and np.isfinite(r1["cxl_rate_b"]) and np.isfinite(r1["amihud"])
     _same(r1, r3, skip=("prev_close", "amihud"))
     assert np.isnan(r3["prev_close"]) and np.isnan(r3["amihud"])
+
+
+@pytest.mark.parametrize("code", ["000001.SZ", "600000.SH"])
+def test_v4_csv_features_equal_v3_and_v1(tmp_path, code):
+    is_sh = code.endswith(".SH")
+    ev = _events(is_sh, seed=11)
+    r1 = tmf.one_stock(_write_v1(tmp_path / "v1" / code, code, is_sh, ev), code, DAY)
+    f4 = _write_v4(tmp_path / "v4", code, is_sh, ev)
+    r3, r4 = tmf.one_stock(_write_v3(tmp_path / "v3", code, is_sh, ev), code, DAY), tmf.one_stock(f4, code, DAY)
+    _same(r3, r4)
+    _same(r1, r4, skip=("prev_close", "amihud"))
+    d = tick_pack.read(f4["trd"], "trd", t1a.U_TRD, is_sh)
+    assert t1a.ratios_for_code(d, not is_sh) == t1a.ratios_for_code(
+        tick_pack.read(_write_v3(tmp_path / "v3b", code, is_sh, ev)["trd"], "trd", t1a.U_TRD, is_sh), not is_sh)
 
 
 @pytest.mark.parametrize("code", ["000001.SZ", "600000.SH"])
@@ -207,3 +235,7 @@ def test_members_and_layout():
         "600000.SH": {"ord": f"{DAY}/逐笔委托原始{DAY}/600000.parquet",
                       "quo": f"{DAY}/行情快照{DAY}/600000.parquet"}}
     assert tick_pack.layout(["20261102/000001.SZ/逐笔成交.dat"]) == "v2"
+    v4 = [f"{DAY}/000001/逐笔成交.csv", f"{DAY}/000001/逐笔委托.csv", f"{DAY}/000001/逐笔委托原始.csv",
+          f"{DAY}/000001/行情快照.csv"]
+    lay, m = tick_pack.members(v4, DAY)
+    assert lay == "v4" and m == {"000001.SZ": {"trd": v4[0], "ord": v4[2], "quo": v4[3]}}

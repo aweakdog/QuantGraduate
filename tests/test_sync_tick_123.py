@@ -51,6 +51,7 @@ def test_assemble_waits_for_all_volumes(dest):
 @pytest.fixture
 def range_server():
     payload = os.urandom(1_000_003)
+    drops = {"left": 3}                 # 前 3 个请求只发一半就断流, 逼下载端续传
 
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
@@ -58,6 +59,11 @@ def range_server():
             self.send_response(206)
             self.send_header("Content-Length", str(b - a + 1))
             self.end_headers()
+            if drops["left"] > 0:
+                drops["left"] -= 1
+                self.wfile.write(payload[a:a + (b - a + 1) // 2])
+                self.close_connection = True
+                return
             self.wfile.write(payload[a:b + 1])
 
         def log_message(self, *a):

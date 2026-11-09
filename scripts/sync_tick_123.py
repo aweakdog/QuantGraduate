@@ -71,6 +71,7 @@ PAUSE = 1.2          # open 平台 QPS 很低, 每次调用间隔
 LOCK_FILE = "/tmp/sync_tick_123.lock"
 PACK_RE = re.compile(r"^(\d{8})\.7z(?:\.(\d{3}))?$")  # 整包 20261103.7z 或分卷 20261104.7z.001
 DL_CONN = 8          # 并行分段下载连接数
+DL_TRIES = 30        # 每段最多续传次数
 
 
 def is_pack(name):
@@ -290,18 +291,31 @@ def assemble(month, day, vols):
     return final
 
 
-def _fetch_range(url, part, start, end, got):
-    """下载 [start, end] 写进 part 的对应位置; got[start] 记已写字节 (给进度用)"""
-    req = urllib.request.Request(url, headers={"User-Agent": "quant-strategy-feed/1.0",
-                                               "Range": f"bytes={start}-{end}"})
-    with urllib.request.urlopen(req, timeout=120) as r, open(part, "r+b") as f:
-        if r.status != 206:
-            raise RuntimeError(f"服务端不支持分段下载 (HTTP {r.status})")
-        f.seek(start)
-        while chunk := r.read(1 << 20):
-            f.write(chunk)
-            got[start] += len(chunk)
-    if got[start] != end - start + 1:
+def _fetch_range(url, part, start, end, got, tries=DL_TRIES):
+    """下载 [start, end] 写进 part 的对应位置; got[start] 记已写字节 (给进度用)。
+    读超时/断流就从已写到的位置续传 (11-07~09 每班都因单段超时整班作废、从头再来)。"""
+    for i in range(tries):
+        pos = start + got[start]
+        if pos > end:
+            return
+        req = urllib.request.Request(url, headers={"User-Agent": "quant-strategy-feed/1.0",
+                                                   "Range": f"bytes={pos}-{end}"})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r, open(part, "r+b") as f:
+                if r.status != 206:
+                    raise RuntimeError(f"服务端不支持分段下载 (HTTP {r.status})")
+                f.seek(pos)
+                while chunk := r.read(1 << 20):
+                    f.write(chunk)
+                    got[start] += len(chunk)
+        except RuntimeError:
+            raise
+        except Exception as e:        # 超时、断流、IncompleteRead: 续传
+            if i == tries - 1:
+                raise
+            log(f"  分段 {start}-{end} 第 {i + 1} 次中断 ({type(e).__name__}), 从 {got[start]} 字节处续传")
+            time.sleep(min(60, 5 * (i + 1)))
+    if start + got[start] != end + 1:
         raise RuntimeError(f"分段 {start}-{end} 不完整: {got[start]} 字节")
 
 
@@ -477,17 +491,28 @@ def main():
                         and all(x[2] != n for x in to_download):
                     to_download.append((f["fileId"], mon, n, f["size"], f.get("etag", "")))
 
+    def assemble_all():
+        for mon, files in share_files.items():
+            for day, vols in volumes({n: e.get("Size") for n, e in files.items()}).items():
+                if day.startswith(args.only):
+                    assemble(mon, day, vols)
+
+    assemble_all()                     # 上一班已下齐、但没来得及拼的先拼 (11-05 就卡在这)
+    failed = []
     if to_download:
         log("== 4/4 下载 %d 个 (最新优先) ==" % len(to_download))
         for fid, mon, name, size, etag in sorted(to_download, key=lambda x: x[2], reverse=True):
-            download(fid, mon, name, size, etag)
-    for mon, files in share_files.items():
-        for day, vols in volumes({n: e.get("Size") for n, e in files.items()}).items():
-            if day.startswith(args.only):
-                assemble(mon, day, vols)
+            try:                       # 一个文件失败不拖累其余文件, 也不挡住拼包
+                download(fid, mon, name, size, etag)
+                assemble_all()
+            except Exception as e:
+                failed.append(name)
+                log(f"  ✗ {name} 下载失败 ({type(e).__name__}: {e}), 下一班重试")
     log("同步完成: 转存 %d, 下载 %d"
         % (sum(len(v) for v in to_copy.values()) if not args.no_copy else 0,
-           len(to_download)))
+           len(to_download) - len(failed)))
+    if failed:
+        raise RuntimeError(f"{len(failed)} 个文件没下成: {', '.join(failed)}")
     return 0
 
 

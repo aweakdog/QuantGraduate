@@ -5,7 +5,12 @@
 ────
 v1  <=20261030  <日>/<代码>.<所>/{逐笔委托,逐笔成交,行情}.csv   GBK, 价格 1/10000 元
 v2  20261102    目录同 v1, 文件是 .dat, 头 b"WDPK" + 加密/私有压缩 —— 读不了, 当缺包
-v3  >=20261103  <日>/{逐笔委托,逐笔成交,行情快照}<日>/<6位>.parquet   价格 1/100 元
+                (供应商 11-04 已用 v3 格式重发同名包)
+v3  20261103    <日>/{逐笔委托,逐笔成交,行情快照}<日>/<6位>.parquet   价格 1/100 元
+v4  >=20261104  <日>/<6位>/{逐笔委托原始,逐笔委托,逐笔成交,行情快照}.csv   UTF-8, 中文列头 =
+                供应商说明里的中文列名, 取值与 v3 逐列相同 (11-05 实测: 方向 0 = 主动买 100%、
+                委托类型编码相同、价格单位分、成交合计 = 快照成交总量)。⚠ 成交价格/申卖价1 等列名
+                与 v1 相同但单位差 100 倍, 只能按目录 (6 位代码、无交易所后缀) 认 v4, 不能按列名
 
 v3 -> v1 (20261103 实测。供应商的字段说明有三处与数据不符, 以数据为准):
   成交 Side 0=主动买 B, 1=主动卖 S —— 说明写反了。两条独立证据: 主动方 = 序号大的一方
@@ -33,7 +38,16 @@ import pandas as pd
 
 V1 = {"ord": "逐笔委托.csv", "trd": "逐笔成交.csv", "quo": "行情.csv"}
 V3 = {"ord": "逐笔委托原始", "trd": "逐笔成交", "quo": "行情快照"}
-PX = 100                     # v3 价格(分) -> v1 口径(1/10000 元)
+V4 = {k: v + ".csv" for k, v in V3.items()}
+V4_COLS = {   # v4 中文列 -> v3 列名, 之后与 v3 走同一套换算
+    "trd": {"时间": "DealTime", "成交编号": "DealID", "叫买序号": "BuyID", "叫卖序号": "SellID",
+            "成交价格": "Price", "成交数量": "Volume", "方向": "Side"},
+    "ord": {"订单时间": "OrderTime", "交易所委托号": "OrderID", "委托类型": "OrderType",
+            "委托价格": "Price", "委托数量": "Volume"},
+    "quo": {"时间": "TickTime", "成交价": "Price", "成交总量": "TotalVolume", "成交总金额": "TotalTurnover",
+            "申卖价1": "AskPrice1", "申买价1": "BidPrice1", "申卖量1": "AskVolume1", "申买量1": "BidVolume1",
+            "未成交委卖总量": "TotalAskVolume", "未成交委买总量": "TotalBidVolume"}}
+PX = 100                     # v3/v4 价格(分) -> v1 口径(1/10000 元)
 SZ_TYPE = {1: "1", 2: "0", 3: "U"}
 
 
@@ -43,6 +57,8 @@ def code_of(c6: str) -> str:
 
 def layout(names) -> str:
     names = list(names)
+    if any(n.endswith("/" + V4["ord"]) for n in names):      # 先于 v1: 两者都有 /逐笔成交.csv
+        return "v4"
     if any(n.endswith("/" + V1["trd"]) for n in names):
         return "v1"
     if any(n.endswith(".parquet") and f"/{V3['trd']}" in n for n in names):
@@ -65,7 +81,13 @@ def members(names, day: str, kinds=("ord", "trd", "quo")):
                 out.setdefault(parts[-2], {})[k] = n
             elif lay == "v3" and parts[-2] == V3[k] + day and parts[-1].endswith(".parquet"):
                 out.setdefault(code_of(parts[-1][:-len(".parquet")]), {})[k] = n
+            elif lay == "v4" and parts[-1] == V4[k] and parts[-2].isdigit():
+                out.setdefault(code_of(parts[-2]), {})[k] = n
     return lay, out
+
+
+def is_v4(fp: Path) -> bool:
+    return fp.suffix == ".csv" and fp.parent.name.isdigit()
 
 
 def read_csv(fp: Path, use):
@@ -131,8 +153,11 @@ def read(fp, kind: str, use, is_sh: bool):
     if fp is None or not Path(fp).exists():
         return None
     fp = Path(fp)
-    if fp.suffix != ".parquet":
+    if is_v4(fp):
+        d = pd.read_csv(fp, encoding="utf-8", usecols=list(V4_COLS[kind])).rename(columns=V4_COLS[kind])
+    elif fp.suffix != ".parquet":
         return read_csv(fp, use)
-    d = pd.read_parquet(fp)
+    else:
+        d = pd.read_parquet(fp)
     d = _trd(d, is_sh) if kind == "trd" else _ord(d, is_sh) if kind == "ord" else _quo(d)
     return d[[c for c in d.columns if c in use]]
