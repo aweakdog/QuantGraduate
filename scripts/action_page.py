@@ -455,6 +455,46 @@ def _macro_events(plan, win):
     return evs
 
 
+def _regime_status(live: Path, cfg, plan, days=None):
+    """空仓开关的进度 (只管 breadth 过滤): 站上均线的股票占比、门槛、连续达标几天、还差几天、最早哪天回场。
+    口径同 live_signal.build_regime_series: 广度 < 阈值连续 k 天清仓, ≥ 阈值连续 k 天回场。
+    历史取 live_signal 写的大盘缓存 (截到计划信号日); 缓存对不上信号日就只用计划里那一天, 不拼凑。"""
+    if cfg.get("regime_filter") != "breadth" or not plan or plan.get("breadth") is None:
+        return None
+    thr, k, sig = float(cfg.get("regime_breadth") or 0), max(1, int(cfg.get("regime_confirm") or 1)), plan["signal_date"]
+    hist = []
+    caches = sorted(live.glob(f"cache_market_ma{cfg.get('regime_ma') or 20}_*.parquet"), key=lambda p: p.stat().st_mtime)
+    if caches:
+        try:
+            m = pd.read_parquet(caches[-1], columns=["date", "breadth_above_ma"]).dropna()
+            m["date"] = pd.to_datetime(m["date"]).dt.strftime("%Y-%m-%d")
+            hist = [(d, float(b)) for d, b in zip(m["date"], m["breadth_above_ma"], strict=True) if d <= sig]
+        except Exception:
+            hist = []
+    if not hist or hist[-1][0] != sig:
+        hist = [(sig, float(plan["breadth"]))]
+    in_cash = bool(plan.get("in_cash"))
+    streak = 0                         # 空仓时数连续达标 (≥ 阈值) 的天数; 持仓时数连续不达标的天数
+    for _, b in reversed(hist):
+        if (b >= thr) != in_cash:
+            break
+        streak += 1
+    need = max(0, k - streak)
+    if days is None:
+        days, _ = trading_calendar.load()
+    flip, d = None, sig                # 假设接下来每天都满足条件, 第 need 个交易日收盘后切换
+    for _ in range(need):
+        d = trading_calendar.next_trading_day(d, days) if d else None
+    flip = str(d) if d else None
+    act = trading_calendar.next_trading_day(flip, days) if flip else None
+    latest = hist[-1][1]
+    return {"threshold": thr, "confirm": k, "in_cash": in_cash, "date": sig, "breadth": latest,
+            "chg_1d_pp": round((latest - hist[-2][1]) * 100, 1) if len(hist) > 1 else None,
+            "gap_pp": round(max(0.0, thr - latest) * 100, 1) if in_cash else round(max(0.0, latest - thr) * 100, 1),
+            "streak": streak, "need_days": need, "flip_signal_date": flip, "act_date": str(act) if act else None,
+            "recent": [{"date": dd, "breadth": round(b, 4)} for dd, b in hist[-10:]]}
+
+
 def build_today(root: Path, pid=None, allowed=None):
     """把 state + plan + pipeline_status 归一化成"明天该做什么"。"""
     pid = _resolve_pid(pid, allowed)
@@ -771,6 +811,7 @@ def build_today(root: Path, pid=None, allowed=None):
             "mkt_close": (plan or {}).get("mkt_close"),
             "mkt_ma": (plan or {}).get("mkt_ma"),
         },
+        "regime": _regime_status(live, cfg, plan),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "plan_generated_at": (plan or {}).get("generated_at"),
     }
@@ -1244,6 +1285,36 @@ function epochNote(d){
     ${ch ? `（最近一次：${esc(ch)}）` : ''}。<br>
     上面的<b>累计盈亏与收益率横跨多段不同配置</b>，不代表任何单一策略的表现，
     比较业绩请按配置分段看。</div>`;
+}
+
+// 空仓开关进度卡: 站上 20 日线的股票占比离回场门槛还差多少、已连续达标几天、最快哪天回场 + 近 10 日柱状
+function regimeCard(r){
+  const pct = x => (x * 100).toFixed(1) + '%', md = s => s ? s.slice(5) : '--', thr = Math.round(r.threshold * 100);
+  const chg = r.chg_1d_pp == null ? '' : ` <span style="font-size:13px;font-weight:400;color:${
+    r.chg_1d_pp >= 0 ? '#86efac' : '#fca5a5'}">${r.chg_1d_pp >= 0 ? '+' : ''}${r.chg_1d_pp}</span>`;
+  const tip = r.need_days === 0 ? '条件已满足，下次更新后回场。'
+    : `要连续 <b>${r.confirm} 个交易日</b>收盘时 ≥ ${thr}% 才回场。` + (r.flip_signal_date
+      ? `最快：接下来 ${r.need_days} 个交易日都达标 → <b>${md(r.flip_signal_date)}</b> 晚上出回场信号，<b>${md(r.act_date)}</b> 尾盘买入。`
+      : '');
+  const H = 64, yThr = Math.round(r.threshold * H / 0.8), bars = (r.recent || []).map(x => {
+    const ok = x.breadth >= r.threshold, h = Math.min(H, Math.max(2, Math.round(x.breadth * H / 0.8)));
+    return `<div style="flex:1;text-align:center;min-width:0">
+      <div style="font-size:10px;color:${ok ? '#86efac' : '#8a93a6'}">${Math.round(x.breadth * 100)}</div>
+      <div style="position:relative;height:${H}px;display:flex;align-items:flex-end;justify-content:center">
+        <div style="position:absolute;left:0;right:0;bottom:${yThr}px;border-top:1px dashed #fcd34d;opacity:.6"></div>
+        <div style="width:70%;height:${h}px;background:${ok ? '#16a34a' : '#3b4252'};border-radius:3px 3px 0 0"></div></div>
+      <div style="font-size:10px;color:#6f7889;margin-top:2px">${md(x.date)}</div></div>`;
+  }).join('');
+  return `<div class="card"><h2>空仓开关 · 离回场还差多少</h2><div class="grid">
+      <div class="kv"><div class="k">站上 20 日线的股票 · ${md(r.date)}</div><div class="v">${pct(r.breadth)}${chg}</div></div>
+      <div class="kv"><div class="k">回场门槛</div><div class="v">≥ ${thr}%</div></div>
+      <div class="kv"><div class="k">还差</div><div class="v">${r.gap_pp > 0 ? r.gap_pp + ' 个点' : '已达标'}</div></div>
+      <div class="kv"><div class="k">已连续达标</div><div class="v">${r.streak} / ${r.confirm} 天</div></div>
+    </div>
+    <div class="tipbox" style="margin:12px 0 10px">${tip}</div>
+    <div style="display:flex;gap:2px;padding-top:2px">${bars}</div>
+    <div style="font-size:12px;color:#6f7889;line-height:1.7;margin-top:8px">全市场收盘价高于自己 20 日均线的股票占比（虚线 = ${thr}%）。
+      低于 ${thr}% 连续 ${r.confirm} 天清仓，≥ ${thr}% 连续 ${r.confirm} 天回场。只是告诉你开关的进度，不是预测。</div></div>`;
 }
 
 function holdRow(r){
@@ -2055,6 +2126,8 @@ async function loadAct(){
   // 横幅已经把原因说完了(stale / await 两种), 不再重复一遍
   if (d.freshness && d.freshness.stale && d.action !== 'stale' && d.action !== 'await')
     h += `<div class="warn">${d.freshness.note}</div>`;
+
+  if (d.in_cash && d.regime && d.regime.in_cash) h += regimeCard(d.regime);
 
   // 信号盲区警示: 落在 信号日..执行日 的宏观事件, 这份计划生成时看不见。
   // 只在真有盲区事件时才出现 —— 平时不给页面加噪音。
