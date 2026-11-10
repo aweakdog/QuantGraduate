@@ -217,10 +217,12 @@ def test_fill_amihud_v3_from_qfq_kline(tmp_path):
                        "amihud": [np.nan, 0.7, np.nan, np.nan],
                        "day_amt": [1e8, 1e8, 2e8, 1e8]})
     out = bta.fill_amihud_v3(df.copy(), kline_dir=tmp_path)
-    assert np.isnan(out["amihud"].iloc[0])                  # v3 之前的空值不动 (历史不变)
+    assert np.isnan(out["amihud"].iloc[0])                  # v1 时期的空值不动 (历史不变)
     assert out["amihud"].iloc[1] == 0.7                     # 已有值不动
     assert np.isclose(out["amihud"].iloc[2], 0.02 / 2)      # |10.29/10.5-1| / (2e8/1e8)
     assert np.isnan(out["amihud"].iloc[3])                  # 没日线 -> 仍为空
+    d2 = pd.DataFrame({"c6": ["000001"], "date": d(["2026-11-02"]), "amihud": [np.nan], "day_amt": [1e8]})
+    assert np.isclose(bta.fill_amihud_v3(d2, kline_dir=tmp_path)["amihud"].iloc[0], 0.05)   # 11-02 重发包是 v3, 也要补
 
 
 def test_members_and_layout():

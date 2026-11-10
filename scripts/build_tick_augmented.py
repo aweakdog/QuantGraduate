@@ -40,7 +40,9 @@ WIN = 3.0        # 横截面 z 的截尾
 MA = 5           # 平滑窗口, 与 feature_engine 的 min_periods=window 惯例一致
 EDGE_MAX = 3     # 每股最多补几个"基矩阵有、逐笔面板还没有"的尾部交易日
 KLINE = ROOT / "data" / "raw" / "kline"
-V3_FROM = pd.Timestamp("2026-11-03")   # 逐笔包换成 v3 格式的首日 (见 scripts/tick_pack.py)
+# 首个没有 前收盘 的逐笔日 (见 scripts/tick_pack.py)。原写 11-03: 11-02 那包当时读不了, 供应商 11-04 用 v3
+# 重发后 11-09 补抽进面板, amihud 为空没补, 5 日均值整段变空, 当晚在用列校验拦下、没出信号。
+V3_FROM = pd.Timestamp("2026-11-02")
 
 
 def fill_amihud_v3(df, kline_dir=KLINE):
