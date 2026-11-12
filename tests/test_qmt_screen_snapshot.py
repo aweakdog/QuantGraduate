@@ -65,16 +65,18 @@ def test_codes_and_sides():
 def _patch_ui(monkeypatch, fg_results, login_ok=True):
     import qmt_bridge.ui_agent as ua
     import qmt_bridge.ui_channel as uc
-    calls = {"login": 0, "fg": 0}
+    calls = {"login": 0, "fg": 0, "force": []}
     seq = iter(fg_results)
+    oks = iter(login_ok if isinstance(login_ok, list) else [login_ok] * 3)
 
     def fg(log=print):
         calls["fg"] += 1
         return next(seq)
 
-    def login(log=print):
+    def login(log=print, force_cleanup=False):
         calls["login"] += 1
-        return login_ok
+        calls["force"].append(force_cleanup)
+        return next(oks)
     monkeypatch.setattr(ua, "ensure_qmt_foreground", fg)
     monkeypatch.setattr(ua, "login_normal_mode", login)
     monkeypatch.setattr(uc, "read", lambda kind, step=None: ({"logged_in": False, "trade_online": False}, {}))
@@ -92,6 +94,23 @@ def test_missing_window_triggers_login_once(monkeypatch):
     calls = _patch_ui(monkeypatch, [["找不到 QMT 主窗口 (未登录或已退出)"], ["QMT 主窗口没能切到最前"]])
     snap = ss.take("close", log=lambda m: None)
     assert calls["login"] == 1 and snap["account_online"] is False and "切到最前" in snap["error"]
+
+
+def test_failed_login_force_quits_others_and_retries_once(monkeypatch):
+    calls = _patch_ui(monkeypatch, [["找不到 QMT 主窗口 (未登录或已退出)"], []], login_ok=[False, True])
+    ss.take("close", log=lambda m: None)
+    assert calls["login"] == 2 and calls["force"] == [False, True]          # 先正常退其他软件登, 失败再强杀重登
+    calls = _patch_ui(monkeypatch, [["找不到 QMT 主窗口 (未登录或已退出)"]], login_ok=[False, False])
+    snap = ss.take("close", log=lambda m: None)
+    assert calls["login"] == 2 and "重试也失败" in snap["error"]
+
+
+def test_cleanup_targets_keep_qmt_system_and_remote_tools():
+    from qmt_bridge.desktop_cleanup import pick_targets
+    t = pick_targets(["QQ.exe", "WeGame.exe", "quark.exe", "XtItClient.exe", "explorer.exe", "SunloginClient.exe",
+                      "pythonw.exe", "LogiOptionsPlus.exe", "Notepad.exe", "AweSunRemote.exe"],
+                     ["KOOK.exe", "DingTalk.exe", "tailscale-ipn.exe", "svchost.exe", "RandomService.exe"])
+    assert t == ["dingtalk.exe", "kook.exe", "notepad.exe", "qq.exe", "quark.exe", "wegame.exe"]
 
 
 def test_wrong_resolution_goes_offline_without_clicking(monkeypatch):

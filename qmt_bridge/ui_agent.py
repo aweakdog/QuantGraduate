@@ -580,9 +580,15 @@ def login_state(log=print):
     return state
 
 
-def login_normal_mode(log=print):
-    """重启 QMT, 在自动登录倒计时期间取消「自动登录」「独立交易」, 再用普通模式点「登录」。不涉及任何交易。"""
+def login_normal_mode(log=print, force_cleanup=False):
+    """重启 QMT, 在自动登录倒计时期间取消「自动登录」「独立交易」, 再用普通模式点「登录」。不涉及任何交易。
+    登录前先退掉别的软件 (11-12 QQ/WeGame 的登录框叠在上面, 找到两个「登录」没敢点); force_cleanup = 强杀。"""
+    from .desktop_cleanup import quit_other_apps
     from .ensure_qmt import kill_qmt, launch_qmt
+    try:
+        quit_other_apps(force=force_cleanup, log=log)
+    except Exception as e:  # noqa: BLE001  清理失败不挡登录, 登录本身还有「容易点错就不点」的保护
+        log(f"退出其他软件时出错 (继续登录): {e!r}")
     kill_qmt()
     time.sleep(3)
     t0 = time.time()

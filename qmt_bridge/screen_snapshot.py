@@ -347,7 +347,9 @@ def take(kind, log=print):
     if any("找不到 QMT 主窗口" in x for x in win_probs):
         log("没有 QMT 主窗口, 自动普通方式登录")
         if not login_normal_mode(log=log):
-            return build_snapshot(kind, {}, [], [], [], None, ["QMT 普通方式登录失败"], {})
+            log("登录失败: 强杀其他所有没用的软件后再登一次")
+            if not login_normal_mode(log=log, force_cleanup=True):
+                return build_snapshot(kind, {}, [], [], [], None, ["QMT 普通方式登录失败 (强杀其他软件后重试也失败)"], {})
         time.sleep(5)
         win_probs = ensure_qmt_foreground(log)
     if win_probs:
