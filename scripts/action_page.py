@@ -689,6 +689,13 @@ def build_today(root: Path, pid=None, allowed=None):
         # 不能写死"明天" —— 第二天打开页面时那个"明天"已经是今天了
         headline = f"{win['day_text']}不用操作"
         subline = f"继续持有 {len(hold)} 只, 到期自动提示卖出" if hold else "当前空仓, 等待下个换仓日"
+        # --min-pred 断链: 不空仓、有空位, 但模型最看好的也不到买入门槛 —— 原来照样写"等待下个换仓日",
+        # 和同一天别的线在买对不上 (11-11 qmt10w/steady5w 最高 0.18% < 0.2%), 而开了每日补仓的线根本不用等换仓日
+        mp = float((plan or {}).get("min_pred") or 0)
+        top = max(((r.get("pred") or -9.0) for r in ((plan or {}).get("recommend") or [])), default=None)
+        if mp > 0 and top is not None and top < mp and len(hold) < int(cfg.get("tranche_n") or 0):
+            subline = (f"模型最看好的股票预测 5 天涨 {top * 100:.2f}%, 不到买入门槛 {mp * 100:.1f}%, 今天不买、空位留现金"
+                       + ("; 每天都会再看, 哪天达标就补买" if prof.get("fill-daily") else "; 等下个换仓日再看"))
 
     nxt_date, nxt_left = _next_rebal(state, plan)
     # 现金必须取 state 而不是 plan —— plan 是出信号那一刻的快照, 之后的
