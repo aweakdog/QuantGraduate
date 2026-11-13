@@ -77,8 +77,21 @@ def ensure_code(o, tries=2):
     return panel_code() == o["code"]
 
 
-def fill_one(o, log=print):
-    """填一笔并读回; 不提交。返回记录。"""
+def clear_qty(lab_q, code):
+    """把总量框清成 0 (面板上不留填好的单)。lab_q = OCR 找到的「总量」标签中心。"""
+    from .ui_channel import click_xy_verified
+    from .ui_order import backspace, select_all, type_digits
+    r = click_xy_verified(lab_q[0] + QTY_DX, lab_q[1], "下单面板里「总量」右边的数字输入框", "", f"rh_clear_{code}",
+                          anchor=(lab_q[0], lab_q[1], "总"))
+    if r["ok"]:
+        select_all()
+        backspace()
+        type_digits("0")
+    return r["ok"]
+
+
+def fill_one(o, log=print, keep=False):
+    """填一笔并读回; 不提交。返回记录。keep=True 时不清空 (界面下单执行器接着提交), 记下总量框位置供出错时清空。"""
     from .ocr_read import locate_text
     from .ui_agent import screenshot_windows
     from .ui_channel import click_xy_verified, read_form_checked, side_by_button, tab_side
@@ -137,12 +150,11 @@ def fill_one(o, log=print):
     rec["backers"] = len(reads) - 1
     if not (form and same(form, o)):
         rec["problems"].append(f"读回不一致 OCR={rec['ocr']} 模型={reads[1:]}")
-    r = click_xy_verified(lab_q[0] + QTY_DX, lab_q[1], "下单面板里「总量」右边的数字输入框", "", f"rh_clear_{o['code']}",
-                          anchor=(lab_q[0], lab_q[1], "总"))
-    if r["ok"]:                                               # 清空数量, 面板上不留填好的单
-        select_all()
-        backspace()
-        type_digits("0")
+    rec["qty_label"] = lab_q
+    if keep:
+        rec["seconds"] = round(time.time() - t0, 1)
+        return rec
+    clear_qty(lab_q, o["code"])                               # 清空数量, 面板上不留填好的单
     lap("clear")
     rec["seconds"] = round(time.time() - t0, 1)
     log(f"  {o['side']} {o['code']} {o['name']} {o['price']}×{o['shares']}: OCR {'✓' if rec['ocr_ok'] else '✗'} "

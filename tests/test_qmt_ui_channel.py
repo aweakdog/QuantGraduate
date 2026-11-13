@@ -38,9 +38,9 @@ def test_matches_field_by_field():
 
 def test_submit_refuses_outside_session_or_bad_guard(monkeypatch):
     exp = ch.parse_expect("600000:BUY:8.58:100")
-    monkeypatch.setattr(ch, "in_session", lambda now=None: False)
+    monkeypatch.setattr(ch, "in_session", lambda now=None, until=None: False)
     assert ch.submit_buy(exp, 8.58)["ok"] is False
-    monkeypatch.setattr(ch, "in_session", lambda now=None: True)
+    monkeypatch.setattr(ch, "in_session", lambda now=None, until=None: True)
     clicked = []
     monkeypatch.setattr(ch, "click", lambda *a, **k: clicked.append(a) or {"ok": True})
     assert ch.submit_buy(ch.parse_expect("600000:BUY:9.55:100"), 8.58)["ok"] is False   # 市价附近: 拒
@@ -52,7 +52,7 @@ def test_submit_refuses_outside_session_or_bad_guard(monkeypatch):
 
 def test_confirm_requires_exactly_one_matching_dialog(monkeypatch):
     exp = ch.parse_expect("600000:BUY:8.58:100")
-    monkeypatch.setattr(ch, "in_session", lambda now=None: True)
+    monkeypatch.setattr(ch, "in_session", lambda now=None, until=None: True)
     clicked = []
     monkeypatch.setattr(ch, "click", lambda *a, **k: clicked.append(a) or {"ok": True})
     dlg = {"title": "委托确认", "code": "600000", "side": "买入", "price": 8.58, "volume": 100, "buttons": ["确定", "取消"]}
@@ -97,7 +97,7 @@ def test_repo_guard_only_gc001_10_lots_at_or_below_bid():
 def test_submit_sell_repo_refuses_before_clicking(monkeypatch):
     clicked = []
     monkeypatch.setattr(ch, "side_by_button", lambda: ("买入", {}))
-    monkeypatch.setattr(ch, "in_session", lambda now=None: True)
+    monkeypatch.setattr(ch, "in_session", lambda now=None, until=None: True)
     assert ch.submit_sell_repo(ch.parse_expect("204001:SELL:1.105:10"), 1.105)["ok"] is False   # 按钮是橙色 (买入)
     monkeypatch.setattr(ch, "side_by_button", lambda: ("卖出", {}))
     monkeypatch.setattr(ch, "click_xy_verified", lambda *a, **k: clicked.append(a) or {"ok": True})

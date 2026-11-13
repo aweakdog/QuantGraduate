@@ -47,9 +47,11 @@ NAV = {"side_trade": ("最左侧竖排导航栏里的「交易」图标或文字
        "menu_buy": ("左侧功能菜单最上面的「买入」", "买入")}
 
 
-def in_session(now=None):
+def in_session(now=None, until=None):
+    """连续竞价时段内; until 可把下午的截止时间放宽到 14:57 前 (界面下单执行器用, 收盘集合竞价期间不下)。"""
     t = (now or datetime.now()).strftime("%H:%M:%S")
-    return any(a <= t <= b for a, b in SESSIONS)
+    sessions = SESSIONS if not until else (SESSIONS[0], (SESSIONS[1][0], until))
+    return any(a <= t <= b for a, b in sessions)
 
 
 def parse_expect(s):
@@ -372,8 +374,8 @@ def submit_sell_repo(exp, bid_rate):
     return res
 
 
-def confirm(exp, kind="order"):
-    if not in_session():
+def confirm(exp, kind="order", until=None):
+    if not in_session(until=until):
         return {"ok": False, "why": "不在连续竞价时段"}
     d, meta = read("dialog", f"confirm_{kind}_check")
     # 10-26 实测: 同一弹窗的标题两次读出不同的字 (系统预留信息 -> 系统预警信息, 下单确认 -> 下达任务),
