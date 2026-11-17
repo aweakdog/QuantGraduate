@@ -60,6 +60,9 @@ def test_codes_and_sides():
     assert ss.xt_code("300750") == "300750.SZ" and ss.xt_code("511880") == "511880.SH"
     assert ss.xt_code("204001") == "204001.SH" and ss.xt_code("131810") == "131810.SZ"     # 沪/深逆回购
     assert ss.side_type("证券买入") == 23 and ss.side_type("卖出") == 24 and ss.side_type("撤单") is None
+    assert ss.side_type(24) == 24 and ss.side_type(23) == 23 and ss.side_type(1) is None
+    row = {"amount": 9530.0, "code": "002625", "price": 19.06, "side": 24, "time": "09:31", "volume": 500.0}
+    assert not [p for p in ss.checks({}, [], [row], []) if "成交" in p]          # 11-17 早上的真实成交行
 
 
 def _patch_ui(monkeypatch, fg_results, login_ok=True):

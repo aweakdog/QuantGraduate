@@ -58,6 +58,8 @@ def xt_code(code6):
 
 
 def side_type(side):
+    if side in (23, 24, "23", "24"):   # 已经换算过的方向码 (11-16 第一次有股票成交时, 读数里是 24, 被当成「成交行不全」)
+        return int(side)
     s = str(side or "")
     if "逆回购" in s:
         return 24          # 逆回购 = 卖出 (借出资金); 成交表里写的是「通用回购逆回购」
