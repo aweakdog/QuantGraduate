@@ -91,6 +91,9 @@ def canon_rows(kind, rows):
                  "orders": ("code", "volume", "traded_volume", "status")}[kind]
     out = []
     for r in rows or []:
+        # 当天清仓的股票仍以「0股」留在持仓表 (成本价、持仓盈亏是怪数, 各家读法不一), 不比也不算持仓 (11-17 因此离线)
+        if kind == "positions" and _num(r.get("volume")) == 0:
+            continue
         c = {}
         for k in (repo_keys if is_repo_row(r) else keys):
             v = r.get(k)

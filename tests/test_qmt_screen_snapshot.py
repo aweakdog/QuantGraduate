@@ -273,3 +273,11 @@ def test_header_ok(monkeypatch):
     monkeypatch.setattr(ocr, "available", lambda: True)
     monkeypatch.setattr(ocr, "ocr_boxes", lambda png, box, scale: [("资金账号", 1, (870, 521)), ("当前拥股", 1, (1091, 522))])
     assert ss.header_ok(b"", "positions") and not ss.header_ok(b"", "orders")
+
+
+def test_sold_out_zero_rows_ignored_in_position_compare():
+    a = [{"code": "002625", "volume": 0, "can_use": 0, "cost": 0.0, "last": 18.2},
+         {"code": "888880", "volume": 0}, {"code": "600673", "volume": 0, "cost": 0, "last": 20.54}]
+    b = [{"code": "600673", "volume": "0", "cost": -754.54, "last": 20.54}]
+    assert ss.canon_rows("positions", a) == ss.canon_rows("positions", b) == ss.canon_rows("positions", [])
+    assert ss.canon_rows("positions", [{"code": "600000", "volume": 100, "can_use": 100, "cost": 8, "last": 9}])
