@@ -265,7 +265,7 @@ def list_profiles(allowed=None):
              # 开户日 = 这条线上站的日期(代码静态字段, 重置不变)
              "opened": v.get("opened"),
              "desc": v["desc"], "auto": is_auto(k), "locked": is_locked(k)}
-            for k, v in PROFILES.items() if allowed is None or k in allowed]
+            for k, v in PROFILES.items() if (allowed is None or k in allowed) and not v.get("hidden")]
 
 
 def _resolve_pid(pid, allowed):
@@ -273,11 +273,14 @@ def _resolve_pid(pid, allowed):
 
     账户口令越权/缺省时不报错而是落到其名下第一条线 —— 登录后的
     首次请求带不带 profile 都能直接看到自己的东西。"""
+    if pid in PROFILES and PROFILES[pid].get("hidden"):
+        pid = None                                   # 隐藏的线按不存在处理
     if allowed is None:
         return pid if pid in PROFILES else DEFAULT_PROFILE
     if pid in allowed:
         return pid
-    return DEFAULT_PROFILE if DEFAULT_PROFILE in allowed else next(iter(allowed))
+    vis = [p for p in allowed if not PROFILES.get(p, {}).get("hidden")]
+    return DEFAULT_PROFILE if DEFAULT_PROFILE in vis else next(iter(vis or allowed))
 
 
 def _quote_map(plan):

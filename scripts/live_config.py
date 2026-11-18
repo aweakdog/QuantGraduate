@@ -370,6 +370,8 @@ PROFILES = {
                 "以 QMT 真实成交记账。",
     },
     "aggr5w": {
+        # 11-18 用户要求: 网站上隐藏 (llx 改用 qmt10w 后停用, 11-13 被手动记过 3 笔买入); 想恢复删掉这行即可
+        "hidden": True,
         "name": "激进 5万",
         "capital": 50000.0,
         "tranche-n": 3,
@@ -579,7 +581,7 @@ ACCESS_CODES = {
     "611611": {"role": "admin"},
     "px":  {"role": "acct", "pids": ("steady5w", "aggr2w_px2")},  # Px 本尊 + PX2
     # 10-08: llx 改用华泰 QMT 专用线 qmt10w(排第一 = 默认线); 旧线 aggr5w 暂停使用但保留可见
-    "llx": {"role": "acct", "pids": ("qmt10w", "aggr5w")},
+    "llx": {"role": "acct", "pids": ("qmt10w", "aggr5w")},  # aggr5w 已隐藏 (见 PROFILES)
     "phy": {"role": "acct", "pids": ("aggr2w",)},
     "xjb": {"role": "acct", "pids": ("aggr10w",)},
     "fyf": {"role": "acct", "pids": ("fyf100w",)},
@@ -836,3 +838,8 @@ if __name__ == "__main__":
                   f"每只预算 {cap/p['tranche-n']:,.0f}")
             print(f"           记账 {'自动(按行情)' if is_auto(pid) else '手动(等确认成交)'}")
             print(f"           状态 {state_file(pid)}")
+
+
+def is_hidden(pid):
+    """网站上隐藏的线: 不出现在任何人的列表里, 也不能直接按 id 打开; 日更照跑, 数据保留"""
+    return bool(PROFILES.get(pid, {}).get("hidden"))

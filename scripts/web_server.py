@@ -540,7 +540,7 @@ def _check_profile(pid, write=True):
     基准线的意义就是"没人动过", 所以拦在后端而不是只靠前端隐藏按钮 ——
     前端藏起来的按钮, 用 curl 一样能打到接口。
     """
-    if pid not in PROFILES:
+    if pid not in PROFILES or PROFILES[pid].get("hidden"):
         return JSONResponse({"error": f"未知条线 {pid}"}, status_code=400)
     if write and is_locked(pid):
         return JSONResponse(

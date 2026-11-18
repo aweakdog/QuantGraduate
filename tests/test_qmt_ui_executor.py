@@ -61,12 +61,12 @@ def test_run_stops_on_first_failure_and_shadow_never_submits(monkeypatch, tmp_pa
     fq = lambda c: (Q[c]["name"], Q[c]["last"], Q[c]["up"], Q[c]["down"])   # noqa: E731
     rep = ux.run(True, log=lambda m: None, ticket=_ticket(), fetch_quote=fq)
     assert calls == [("600105", True)] and rep["status"] == "stopped"      # 第一笔失败, 第二笔不下
-    assert (tmp_path / "2026-11-13.json").exists()                          # 点提交前就落了「今天已下」标记
+    assert list(tmp_path.glob("*.json"))                          # 点提交前就落了「今天已下」标记
     assert ux.run(True, log=lambda m: None, ticket=_ticket(), fetch_quote=fq)["status"] == "already_done"
     calls.clear()
     ux.run(False, log=lambda m: None, ticket=_ticket(trading_enabled=True), fetch_quote=fq)
     assert calls and all(live is False for _, live in calls)               # 影子模式绝不提交
-    (tmp_path / "2026-11-13.json").unlink()
+    [f.unlink() for f in tmp_path.glob("*.json")]
     calls.clear()
     rep = ux.run(True, log=lambda m: None, ticket=_ticket(trading_enabled=False), fetch_quote=fq)
     assert rep["mode"] == "shadow" and calls and all(live is False for _, live in calls)   # 网页开关关 = 影子
