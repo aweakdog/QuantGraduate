@@ -527,3 +527,101 @@ def build_fallback_confirm(later_snap, state, exec_date):
         return [], [f"没有 {exec_date} 收盘快照, 且 {later_snap.get('probe_at')} 的持仓与线账本不一致 "
                     f"(代码: QMT 股数, 线账本股数) {diff}, 推不出执行日成交"], []
     return [], [], [f"{exec_date} 没有收盘快照 (QMT 离线); {later_snap.get('probe_at')} 的持仓与线账本一致, 执行日无成交"]
+
+
+# ── 补账 (11-20): QMT 线是全自动的, 账本跟着券商走, 当晚没确认成也不停下等人 ─────────────
+def latest_online_snapshot_after(live_dir, date):
+    """执行日之后最新一份账户在线的快照, 任何 kind; 没有返回 None。"""
+    day = str(date).replace("-", "")
+    for p in sorted((Path(live_dir) / "qmt").glob("snap_*.json"), reverse=True):
+        stamp = p.name[5:13]
+        if not stamp.isdigit() or stamp <= day:
+            continue
+        try:
+            s = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if s.get("account_online"):
+            return s
+    return None
+
+
+def total_confirmed_later(live_dir, exec_date, snap):
+    """执行日收盘快照的总资产是否被之后第一份在线快照证实 (相差在一天的正常波动内)。
+    是 = 当天总资产的大幅变化是真的 (银证转账), 不是读错位数 —— 自动确认不必再为它停下。"""
+    later = first_online_snapshot_after(live_dir, exec_date)
+    a, b = ((snap or {}).get("asset") or {}).get("total_asset"), ((later or {}).get("asset") or {}).get("total_asset")
+    if a is None or b is None:
+        return False
+    mv = float(((snap or {}).get("asset") or {}).get("market_value") or 0)
+    return abs(float(a) - float(b)) <= 0.12 * mv + 0.003 * float(a) + 200
+
+
+def kline_close(code, date, kline_dir=None):
+    """某天的日线收盘价 (前复权; 近几天没有除权就等于真实价); 没有返回 None。只用于补账时估价。"""
+    kp = Path(kline_dir or Path(__file__).resolve().parents[1] / "data" / "raw" / "kline") / f"{code6(code)}.parquet"
+    if not kp.exists():
+        return None
+    import pandas as pd
+    k = pd.read_parquet(kp, columns=["date", "close"])
+    hit = k[pd.to_datetime(k["date"]).dt.date.astype(str) == str(date)]
+    return None if hit.empty else float(hit.iloc[-1]["close"])
+
+
+CATCHUP_FEE, CATCHUP_MIN_FEE = 0.001, 5.0     # 只用来预估线内现金够不够 (比 live_signal 的费率略高, 偏保守)
+
+
+def build_catchup_confirm(snap, state, plan, exec_date, kline_dir=None, exec_snap=None):
+    """执行日已过、当晚没能确认时的补账。返回 (fills, problems, notes)。
+
+    起因 (11-16~11-20): 收盘读屏离线 + 账户里有人工买卖, 之后第一份在线快照的持仓与账本对不上, 自动确认停了一周:
+    出不了新计划、逆回购每天少借 10 万。全自动线不该等人, 所以: 以执行日之后**最新**一份在线快照的持仓为准,
+    把线账本补到与券商逐只一致 ——
+      一致           -> 按无成交补账 (期间即使有过买卖也已自行平掉, 不计入策略线)
+      券商少了/多了   -> 记卖出/买入; 计划外买入的也并入策略线 (这个账户的股票都归这条线, 之后按到期规则处理)
+    成交价: 执行日收盘快照 (exec_snap, 有的话) 或该快照的成交表里有 -> 真实成交价; 新建仓 -> 券商持仓的成本价;
+    都没有 -> 执行日收盘价估算 (备注写明)。
+    补不了的仍停下报警: 多出的不是整百 (多半送转股)、估不出价、线内现金不够。
+    """
+    if not snap:
+        return [], [f"{exec_date} 之后还没有在线的 QMT 快照"], []
+    q, ln, at = qmt_positions(snap), line_positions(state), snap.get("probe_at")
+    if q == ln:
+        return [], [], [f"{exec_date} 当晚没能确认; {at} 券商持仓与线账本一致, 按无成交补账 (期间如有买卖已自行平掉, 不计入策略线)"]
+    agg = {}
+    for sn in (exec_snap, snap):
+        for f in aggregate_trades((sn or {}).get("trades"))[0]:
+            v, a = agg.get((f["code"], f["action"]), (0, 0.0))
+            agg[(f["code"], f["action"])] = (v + f["shares"], a + f["shares"] * f["price"])
+    real = {k: a / v for k, (v, a) in agg.items()}
+    cost = {code6(p["stock_code"]): p.get("avg_price") for p in snap.get("positions") or [] if int(p.get("volume") or 0) > 0}
+    planned = {code6(x["code"]) for k in ("buy", "alternates") for x in (plan or {}).get(k) or []}
+    fills, probs, notes = [], [], [f"{exec_date} 当晚没能确认, 以 {at} 的券商持仓为准补账"]
+    for c in sorted(set(q) | set(ln)):
+        d = q.get(c, 0) - ln.get(c, 0)
+        if d == 0:
+            continue
+        act, cn = ("buy", "买入") if d > 0 else ("sell", "卖出")
+        if d > 0 and d % 100:
+            probs.append(f"{c} 多出 {d} 股不是整百 (多半是送转股), 需要人工处理")
+            continue
+        px, src = real.get((c, act)), "真实成交价"
+        if not px and d > 0 and c not in ln and cost.get(c):
+            px, src = cost[c], "券商成本价"
+        if not px:
+            px, src = kline_close(c, exec_date, kline_dir), f"{exec_date} 收盘价估算"
+        if not px or float(px) <= 0:
+            probs.append(f"{c} {cn} {abs(d)} 股估不出成交价")
+            continue
+        fills.append({"code": c, "action": act, "shares": abs(d), "price": round(float(px), 4)})
+        notes.append(f"{cn} {c} {abs(d)} 股 @ {round(float(px), 3)} ({src}"
+                     + ("; 计划外, 并入策略线" if d > 0 and c not in planned else "") + ")")
+    fills.sort(key=lambda f: (f["action"] != "sell", f["code"]))
+    cash = float((state or {}).get("cash") or 0)
+    for f in fills:
+        gross = f["shares"] * f["price"]
+        fee = max(gross * CATCHUP_FEE, CATCHUP_MIN_FEE)
+        cash += (gross - fee) if f["action"] == "sell" else -(gross + fee)
+    if not probs and cash < 0:
+        probs.append(f"按券商持仓补账后线内现金会变成 {cash:,.0f} (负数): 账户里的持仓超过了这条线的本金, 需要人工处理")
+    return ([] if probs else fills), probs, notes

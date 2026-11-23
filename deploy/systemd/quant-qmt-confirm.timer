@@ -3,6 +3,8 @@
 Description=Quant QMT auto-confirm timer
 
 [Timer]
+# 09:50: 前一晚没确认成的 (收盘读屏离线等), 用当天开盘读屏的券商持仓补账, 当天照常出计划 (11-20)
+OnCalendar=Mon..Fri 09:50
 OnCalendar=Mon..Fri 18:50
 OnCalendar=Mon..Fri 20:50
 Persistent=false

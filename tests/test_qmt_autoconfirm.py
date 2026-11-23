@@ -121,3 +121,69 @@ def test_dry_run_writes_nothing(tmp_path):
     _setup(tmp_path)
     rec = qa.run_one(PID, live=tmp_path, dry_run=True, runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError))
     assert rec["status"] == "dry_run" and not list(tmp_path.glob("confirm_*"))
+
+
+# ── 补账 (11-20): 全自动线不停下等人 ──────────────────────────────
+def _stuck_week(tmp_path, latest_positions=(), lots=(), avg_price=None, trades=()):
+    """11-16~11-20 的原型: 执行日收盘读屏离线, 次日读屏看到人工买的股票, 之后某天的最新读屏是 latest_positions。"""
+    _offline_exec_day(tmp_path, lots=lots, next_positions=[("600673.SH", 800)])
+    store_snapshot({"probe_at": "2026-10-14T09:37:00", "kind": "morning", "account_online": True,
+                    "asset": {"cash": 457000.0, "total_asset": 457000.0}, "orders": [],
+                    "trades": [{"stock_code": c, "order_type": ot, "traded_volume": v, "traded_price": p} for c, ot, v, p in trades],
+                    "positions": [{"stock_code": c, "volume": v, "avg_price": avg_price} for c, v in latest_positions]}, tmp_path)
+
+
+def test_same_night_still_waits_but_next_day_catches_up_to_broker(tmp_path):
+    _stuck_week(tmp_path)                                    # 人工买了又卖了, 最新读屏是空仓 = 账本
+    calls, sent = [], []
+    run = _runner_that_settles(tmp_path, calls)
+    rec = qa.run_one(PID, live=tmp_path, runner=run, send=lambda t: sent.append(t) or True, today=EXEC)
+    assert rec["status"] == "blocked" and calls == [] and "自动补账" in sent[0]          # 当晚: 不凭单次读屏改账
+    rec = qa.run_one(PID, live=tmp_path, runner=run, send=lambda t: sent.append(t) or True, today="2026-10-14")
+    assert rec["status"] == "confirmed" and rec["mode"] == "catchup" and rec["fills"] == []
+    assert rec["snapshot_at"] == "2026-10-14T09:37:00" and "按无成交补账" in rec["notes"][0] and "已补账" in sent[-1]
+    assert json.loads((tmp_path / rec["confirm_file"]).read_text()) == []
+
+
+def test_catchup_adopts_and_sells_to_match_broker(tmp_path):
+    _stuck_week(tmp_path, lots=[("000001", 200)], latest_positions=[("600673.SH", 800)], avg_price=21.33,
+                trades=[("000001.SZ", 24, 200, 12.5)])
+    calls = []
+    rec = qa.run_one(PID, live=tmp_path, runner=_runner_that_settles(tmp_path, calls), send=lambda t: True, today="2026-10-14")
+    assert rec["status"] == "confirmed" and rec["fills"] == [
+        {"code": "000001", "action": "sell", "shares": 200, "price": 12.5},              # 最新读屏当天的真实成交价
+        {"code": "600673", "action": "buy", "shares": 800, "price": 21.33}]              # 新建仓: 券商成本价
+    assert any("计划外, 并入策略线" in n for n in rec["notes"])
+
+
+def test_catchup_refuses_what_it_cannot_explain(tmp_path):
+    from qmt_sync import build_catchup_confirm
+    snap = {"probe_at": "2026-10-14T09:37:00", "trades": [],
+            "positions": [{"stock_code": "600673.SH", "volume": 850, "avg_price": 21.33}]}
+    st = {"cash": 100000.0, "lots": []}
+    assert "不是整百" in build_catchup_confirm(snap, st, {}, EXEC)[1][0]
+    snap["positions"][0]["volume"] = 8000                                               # 17 万 > 线内 10 万
+    assert "负数" in build_catchup_confirm(snap, st, {}, EXEC)[1][0]
+    snap["positions"][0].update(volume=800, avg_price=None)                             # 没成本价、没成交、没 K 线
+    assert "估不出成交价" in build_catchup_confirm(snap, st, {}, EXEC, kline_dir="/nonexistent")[1][0]
+    assert build_catchup_confirm(None, st, {}, EXEC)[1]
+
+
+def test_bank_transfer_block_is_lifted_once_a_later_snapshot_confirms_total(tmp_path, monkeypatch):
+    import qmt_sync
+    _setup(tmp_path, trades=[("600000.SH", 23, 400, 10.3)], positions=[("600000.SH", 400)], plan_buys=["600000"])
+    real = qmt_sync.build_autoconfirm
+    monkeypatch.setattr(qmt_sync, "build_autoconfirm", lambda *a: (lambda f, p, n: (
+        f, p + ["总资产 503,000.00 → 457,000.00 变化超出合理范围 ±1,700 (可能读错位数, 或当天有银证转账)"], n))(*real(*a)))
+    snap = json.loads(next((tmp_path / "qmt").glob("snap_*_close.json")).read_text())
+    snap["asset"].update(total_asset=457000.0, market_value=4120.0)
+    store_snapshot(snap, tmp_path)
+    calls = []
+    run = _runner_that_settles(tmp_path, calls)
+    assert qa.run_one(PID, live=tmp_path, runner=run, send=lambda t: True, today="2026-10-12")["status"] == "blocked"   # 还没有后续读屏
+    store_snapshot({"probe_at": "2026-10-12T09:37:00", "kind": "morning", "account_online": True, "orders": [], "trades": [],
+                    "asset": {"cash": 452900.0, "total_asset": 457050.0},
+                    "positions": [{"stock_code": "600000.SH", "volume": 400}]}, tmp_path)
+    rec = qa.run_one(PID, live=tmp_path, runner=run, send=lambda t: True, today="2026-10-12")
+    assert rec["status"] == "confirmed" and rec["mode"] == "close" and rec["fills"][0]["price"] == 10.3
+    assert "银证转账" in rec["notes"][-1]

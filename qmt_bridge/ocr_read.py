@@ -3,6 +3,7 @@
 用法: 在固定区域裁图后识别, 返回 [(文字, 置信度, (屏幕x, 屏幕y))]。数字读数以 OCR 为主, 模型只做交叉核对。
 """
 import io
+import re
 from functools import lru_cache
 
 
@@ -94,7 +95,8 @@ ROW_TOL = 7          # 同一行的文字框中心 y 相差不超过 7 像素
 
 def _number(text):
     """「50 2000.00」(QMT 用空格分千位)、「5020张」「￥0」「1,234.5」都转成数; 转不了返回 None。"""
-    t = text.replace(" ", "").replace(",", "").replace("￥", "").replace("¥", "").rstrip("股张元")
+    t = text.replace(" ", "").replace(",", "").replace("￥", "").replace("¥", "")
+    t = re.sub(r"[^\d.]+$", "", t)      # 去掉末尾的单位: 股/张/元, 以及 OCR 认错的 (11-16「0股」读成「0吸」, 持仓表因此对不上)
     try:
         return float(t)
     except ValueError:

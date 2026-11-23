@@ -83,3 +83,9 @@ def test_empty_table_and_unknown_page():
     head_only = [b for b in ORDERS if b[2][1] <= 522]
     assert parse_table(head_only, "orders") == {"rows": []}
     assert parse_table([box(100, 50, "沪港通"), box(200, 50, "深港通")], "orders") is None      # 认不出表头 = 不在这一页
+
+
+def test_number_strips_misread_unit_suffix():
+    from qmt_bridge.ocr_read import _number
+    assert _number("0吸") == 0.0 and _number("800股") == 800.0 and _number("4020张") == 4020.0      # 11-16「0股」被认成「0吸」
+    assert _number("50 2000.00") == 502000.0 and _number("-754.54") == -754.54 and _number("-") is None
