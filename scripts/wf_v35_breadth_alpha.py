@@ -226,6 +226,23 @@ parser.add_argument("--label-alignment", choices=["legacy", "purge6", "purge7", 
                     help="研究标签: legacy原口径; purge6/7/8旧标签只多截断1/2/3天; common5旧标签只用共同样本(5日截断); "
                          "common旧标签+共同样本/6日截断(=purge6+common5); t1close次日收盘起5日收益+相同截断")
 parser.add_argument("--label-panel", default="label_alignment_panel.parquet")
+parser.add_argument("--skip-top", type=int, default=0,
+                    help="组合层去极值: 新买入时跳过当日排名前 K 只(0=关闭, 不影响续持)")
+parser.add_argument("--weight-mode", choices=["equal", "inv_vol"], default="equal",
+                    help="买入预算分配方式: equal=等权(默认), inv_vol=近vol-window日波动率倒数加权(0.5x~2.0x)")
+parser.add_argument("--vol-window", type=int, default=20,
+                    help="inv_vol 波动率回看交易日数 (严格 PIT, 只用 <= signal_date 收盘价)")
+parser.add_argument("--lgb-loss", choices=["l2", "huber", "fair"], default="l2",
+                    help="LGBMRegressor 损失函数 (仅 --objective l2 生效; l2=默认逐位不变)")
+parser.add_argument("--huber-alpha", type=float, default=0.0,
+                    help="huber/fair 损失的截断阈值 alpha (LGB 默认 1.0 对 5d 收益率不触发; 0=不传)")
+parser.add_argument("--label-winsor", type=float, default=0.0,
+                    help="训练标签每日截面 [q, 1-q] 缩尾后再 demean (0=关闭)")
+parser.add_argument("--boosting-type", choices=["dart", "gbdt"], default="dart")
+parser.add_argument("--n-estimators", type=int, default=151)
+parser.add_argument("--learning-rate", type=float, default=0.03)
+parser.add_argument("--reg-lambda", type=float, default=0.0)
+parser.add_argument("--min-child-samples", type=int, default=50)
 parser.add_argument("--tag", type=str, default=None)
 args = parser.parse_args()
 if not 0 <= args.corr_cap <= 1:
@@ -270,6 +287,23 @@ LOCKED_PARAMS = dict(
     boosting_type="dart",
 )
 LOCKED_PARAMS["random_state"] = args.lgb_seed   # 仅多种子集成用, 见 --lgb-seed 说明
+if args.boosting_type != "dart":
+    LOCKED_PARAMS["boosting_type"] = args.boosting_type
+if args.n_estimators != 151:
+    LOCKED_PARAMS["n_estimators"] = args.n_estimators
+if args.learning_rate != 0.03:
+    LOCKED_PARAMS["learning_rate"] = args.learning_rate
+if args.reg_lambda > 0:
+    LOCKED_PARAMS["reg_lambda"] = args.reg_lambda
+if args.min_child_samples != 50:
+    LOCKED_PARAMS["min_child_samples"] = args.min_child_samples
+if args.objective == "l2" and args.lgb_loss != "l2":
+    LOCKED_PARAMS["objective"] = args.lgb_loss
+if args.huber_alpha > 0:
+    LOCKED_PARAMS["alpha"] = args.huber_alpha
+SKIP_TOP = args.skip_top
+WEIGHT_MODE = args.weight_mode
+VOL_WINDOW = args.vol_window
 
 TRADE_COST = args.trade_cost
 MIN_FEE = args.min_fee
@@ -798,7 +832,12 @@ df = df.merge(ovn_df[["date", "code"] + ovn_features], on=["date", "code"], how=
 
 # ── 改动 A: 只按日期 demean (保序, 与 raw 收益 corr=1.00) ──
 # 共同样本口径(common5/common/t1close)只让共同有效行进训练与 demean; legacy/purge6 用全部行。
-if not uses_panel(args.label_alignment):
+if args.label_winsor > 0:
+    from research_port_opt import winsorize_demean
+    _vm = df.lab1_common if uses_panel(args.label_alignment) else None
+    df[LABEL] = winsorize_demean(df, LABEL_RAW, args.label_winsor, valid_mask=_vm)
+    print(f"  训练标签截面缩尾 [{args.label_winsor:.2%}, {1 - args.label_winsor:.2%}] + demean")
+elif not uses_panel(args.label_alignment):
     df[LABEL] = df.groupby("date")[LABEL_RAW].transform(lambda x: x - x.mean())
 else:
     _target = df[LABEL_RAW].where(df.lab1_common)
@@ -1058,7 +1097,14 @@ if args.save_preds:
             "n_features": args.n_features,
             "exclude_feats": args.exclude_feats or "",
             "n_selected": len(features),
-            "feat_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}"}
+            "feat_cutoff": f"{pd.Timestamp(FIRST_PRED):%Y-%m-%d}",
+            **({"lgb_loss": args.lgb_loss} if args.lgb_loss != "l2" else {}),
+            **({"label_winsor": args.label_winsor} if args.label_winsor > 0 else {}),
+            **({"boosting_type": args.boosting_type} if args.boosting_type != "dart" else {}),
+            **({"reg_lambda": args.reg_lambda} if args.reg_lambda > 0 else {}),
+            **({"n_estimators": args.n_estimators} if args.n_estimators != 151 else {}),
+            **({"learning_rate": args.learning_rate} if args.learning_rate != 0.03 else {}),
+            **({"min_child_samples": args.min_child_samples} if args.min_child_samples != 50 else {})}
     # v2 格式: 多存 pred_vals (与 ranked 对齐的预测值)。没有它就无法做
     # "信号强度门槛/离散度择时"一类实验 —— 旧 v1 缓存只存了排名。
     slim = [{"date": dp["date"], "ranked": dp["ranked"], "ic": dp["ic"],
@@ -1086,6 +1132,12 @@ if _kl_last is None or _kl_last < pd.Timestamp(TEST_END) - pd.Timedelta(days=4):
     print(f"ERROR: K线末日 {_kl_last} 落后 test_end {TEST_END} 超过 4 天, 末段会被冻结; "
           f"先同步 {KLINE_DIR} 再跑 (或显式 --test-end 到 K线末日)")
     sys.exit(2)
+
+vol_lookup = None
+if WEIGHT_MODE == "inv_vol":
+    from research_port_opt import TrailingVolLookup, inv_vol_weights
+    vol_lookup = TrailingVolLookup(klines, window=VOL_WINDOW, min_periods=min(10, VOL_WINDOW))
+    print(f"  买入预算权重: inv_vol (window={VOL_WINDOW}, PIT <= signal_date)")
 
 # ── MN1 (--mom-neutral k): 排序前压低追涨暴露, 所有下游层(门槛/续持/补买)统一用调整后的预测 ──
 MOM_NEUTRAL = None
@@ -1406,107 +1458,212 @@ for i, (dp, exec_date) in enumerate(sched):
                 _il = ind_of(_l["code"], dp["date"])
                 if _il is not None:
                     _ind_cnt[_il] = _ind_cnt.get(_il, 0) + 1
-        for code in dp["ranked"]:
-            if bought >= day_cap:
-                break
-            # 信号强度门槛: ranked 按 pred 降序, 第一个不达标的之后全都不达标。
-            # 留空的槽位不沿排名退而求其次 —— 那正是要避免的"买弱信号"。
-            if _pred_of is not None and _pred_of.get(code, -1.0) < MIN_PRED:
-                n_below_thresh += TRANCHE_N - bought
-                break
-            if code in held:            # 已持有则跳到下一名, 保证广度
-                continue
-            if code in blocked:         # 刚急涨过的不追
-                continue
-            if SKIP_BOARDS and str(code).startswith(SKIP_BOARDS):
-                n_board_skip += 1
-                if SKIP_CASH:
-                    # 留现金模式: 槽位被"消耗"但不买, 预算也预留不给后面的槽位。
-                    # (否则就变成变相递补: 钱流给下一名, 只是换个名字)
-                    alloc = remaining / (TRANCHE_N - bought)
-                    remaining -= alloc
-                    bought += 1
-                continue                # 递补模式: 直接看下一名
-            _il_buy = None
-            if IND_CAP > 0:
-                # 行业满额 -> 递补下一名(不同行业)。递补而非留现金:
-                # 目标就是把钱分散到别的行业, 而不是减仓。
-                _il_buy = ind_of(code, dp["date"])
-                if _il_buy is not None and _ind_cnt.get(_il_buy, 0) >= IND_CAP:
-                    n_ind_skip += 1
+        if WEIGHT_MODE == "inv_vol":
+            _iv_cands = []
+            _iv_slots = bought
+            _iv_ind = dict(_ind_cnt)
+            _iv_held = set(held)
+            for _rk_idx, code in enumerate(dp["ranked"]):
+                if _iv_slots >= day_cap:
+                    break
+                if SKIP_TOP and _rk_idx < SKIP_TOP:
                     continue
-            if corr_guard is not None and corr_guard.blocks(code, held, dp["date"], args.corr_cap):
-                n_corr_skip += 1
-                continue
-            px = get_px(klines, code, d, EXEC_FIELD)
-            if px is None:                          # 停牌/无行情
-                rejected_buy += 1
-                rej["buy_halt"] += 1
-                continue
-            limit_up, _ = _limit_state(klines, code, d, EXEC_FIELD)
-            if limit_up:
-                rejected_buy += 1
-                rej["buy_limit_up"] += 1
-                continue
-            # 追高上限: 模拟"限价挂在信号日收盘价附近, 涨太多就买不到"的真实成交。
-            # 回测原本假设 100% 按执行日收盘价成交, 但实盘是挂限价单 ——
-            # 跳空高开的票根本打不到你的价位, 那个槽位就空着(不递补, 现金留下)。
-            # 实测这类漏掉的票买进去反而更差(平均 -0.15% vs 能买到的 +0.80%),
-            # 所以这未必是损失; 但空置的现金也有代价, 净效果需要实测。
-            if MAX_CHASE > 0:
-                # 此处 px 还是执行日的原始收盘价(滑点在下一行才加), 正好用来
-                # 和信号日收盘价比 —— 与"页面上的参考价"同一口径
-                _sig_px = get_px(klines, code, dp["date"], "close")
-                if _sig_px and (px / _sig_px - 1) > MAX_CHASE:
-                    n_chase_skip += 1
-                    alloc = remaining / (TRANCHE_N - bought)
-                    remaining -= alloc      # 预算留住, 不流给后面的槽位
-                    bought += 1             # 槽位算被占用: 不递补
+                if _pred_of is not None and _pred_of.get(code, -1.0) < MIN_PRED:
+                    n_below_thresh += TRANCHE_N - _iv_slots
+                    break
+                if code in _iv_held or code in blocked:
                     continue
-            # 下跌跳空弃买(--gap-skip): 与 --max-chase 同构反向。信号生成于
-            # 隔夜/周末利空落地之前, 执行时已大幅低开的票, 便宜未必是机会。
-            # 同样留现金不递补 —— 递补等于把钱流给排名更弱的信号。
-            if GAP_SKIP > 0:
-                _sig_px_g = get_px(klines, code, dp["date"], "close")
-                if _sig_px_g and (px / _sig_px_g - 1) < -GAP_SKIP:
-                    n_gap_skip += 1
-                    alloc = remaining / (TRANCHE_N - bought)
-                    remaining -= alloc
-                    bought += 1
+                if SKIP_BOARDS and str(code).startswith(SKIP_BOARDS):
+                    n_board_skip += 1
+                    if SKIP_CASH:
+                        remaining -= remaining / (TRANCHE_N - _iv_slots)
+                        _iv_slots += 1
                     continue
-            px = fill_px(px, "buy")
-            alloc = remaining / (TRANCHE_N - bought)
-            shares = int(alloc / (px * 100)) * 100
-            if shares <= 0:                         # 预算不足一手(100股)
-                # 整手粒度救济: 一手成本在预算容忍带内就买, 保住排名靠前的信号。
-                # 超出的部分由 remaining 自然扣减, 后面的槽位预算相应变小。
-                if LOT_FLEX > 0 and px * 100 <= alloc * (1 + LOT_FLEX):
-                    shares = 100
-                    n_lot_flex += 1
-                else:
+                _il_buy = None
+                if IND_CAP > 0:
+                    _il_buy = ind_of(code, dp["date"])
+                    if _il_buy is not None and _iv_ind.get(_il_buy, 0) >= IND_CAP:
+                        n_ind_skip += 1
+                        continue
+                if corr_guard is not None and corr_guard.blocks(code, _iv_held, dp["date"], args.corr_cap):
+                    n_corr_skip += 1
+                    continue
+                px = get_px(klines, code, d, EXEC_FIELD)
+                if px is None:
+                    rejected_buy += 1
+                    rej["buy_halt"] += 1
+                    continue
+                limit_up, _ = _limit_state(klines, code, d, EXEC_FIELD)
+                if limit_up:
+                    rejected_buy += 1
+                    rej["buy_limit_up"] += 1
+                    continue
+                if MAX_CHASE > 0:
+                    _sig_px = get_px(klines, code, dp["date"], "close")
+                    if _sig_px and (px / _sig_px - 1) > MAX_CHASE:
+                        n_chase_skip += 1
+                        remaining -= remaining / (TRANCHE_N - _iv_slots)
+                        _iv_slots += 1
+                        continue
+                if GAP_SKIP > 0:
+                    _sig_px_g = get_px(klines, code, dp["date"], "close")
+                    if _sig_px_g and (px / _sig_px_g - 1) < -GAP_SKIP:
+                        n_gap_skip += 1
+                        remaining -= remaining / (TRANCHE_N - _iv_slots)
+                        _iv_slots += 1
+                        continue
+                bpx = fill_px(px, "buy")
+                # 预检单手门槛 (按等权槽位预算估算), 与 equal 分支一致: 买不起一手则顺位递补下一名
+                _est_alloc = remaining / max(TRANCHE_N - _iv_slots, 1)
+                if bpx * 100 > _est_alloc * (1 + LOT_FLEX):
                     rejected_buy += 1
                     rej["buy_lot_too_big"] += 1
                     continue
-            gross = shares * px
-            fee = max(gross * TRADE_COST, MIN_FEE)
-            if gross + fee > cash:
-                rejected_buy += 1
-                rej["buy_no_cash"] += 1
-                continue
-            cash -= gross + fee
-            remaining -= gross + fee
-            buy_fee += fee
-            lots.append({"code": code, "shares": shares, "buy_price": px, "open_idx": i})
-            held.add(code)
-            bought += 1
-            if IND_CAP > 0 and _il_buy is not None:
-                _ind_cnt[_il_buy] = _ind_cnt.get(_il_buy, 0) + 1
-            if not is_rebal:
-                n_daily_fill += 1
-            trade_log.append({"date": dstr, "signal_date": sig_str, "code": code,
-                              "action": "buy", "shares": shares, "price": px,
-                              "gross": gross, "fee": fee, "net": -(gross + fee),
-                              "reason": "new_tranche" if is_rebal else "daily_fill"})
+                _iv_cands.append((code, bpx, _il_buy))
+                _iv_held.add(code)
+                if IND_CAP > 0 and _il_buy is not None:
+                    _iv_ind[_il_buy] = _iv_ind.get(_il_buy, 0) + 1
+                _iv_slots += 1
+            if _iv_cands:
+                _ws = inv_vol_weights([x[0] for x in _iv_cands], dp["date"], vol_lookup)
+                _pool_rem = remaining
+                _w_left = sum(_ws)
+                for (code, px, _il_buy), _w in zip(_iv_cands, _ws):
+                    alloc = _pool_rem * (_w / _w_left) if _w_left > 0 else 0.0
+                    _w_left -= _w
+                    shares = int(alloc / (px * 100)) * 100
+                    if shares <= 0:
+                        if LOT_FLEX > 0 and px * 100 <= alloc * (1 + LOT_FLEX):
+                            shares = 100
+                            n_lot_flex += 1
+                        else:
+                            rejected_buy += 1
+                            rej["buy_lot_too_big"] += 1
+                            continue
+                    gross = shares * px
+                    fee = max(gross * TRADE_COST, MIN_FEE)
+                    if gross + fee > cash:
+                        rejected_buy += 1
+                        rej["buy_no_cash"] += 1
+                        continue
+                    cash -= gross + fee
+                    _pool_rem -= gross + fee
+                    buy_fee += fee
+                    lots.append({"code": code, "shares": shares, "buy_price": px, "open_idx": i})
+                    held.add(code)
+                    bought += 1
+                    if IND_CAP > 0 and _il_buy is not None:
+                        _ind_cnt[_il_buy] = _ind_cnt.get(_il_buy, 0) + 1
+                    if not is_rebal:
+                        n_daily_fill += 1
+                    trade_log.append({"date": dstr, "signal_date": sig_str, "code": code,
+                                      "action": "buy", "shares": shares, "price": px,
+                                      "gross": gross, "fee": fee, "net": -(gross + fee),
+                                      "reason": "new_tranche" if is_rebal else "daily_fill"})
+        else:
+            for _rk_idx, code in enumerate(dp["ranked"]):
+                if bought >= day_cap:
+                    break
+                if SKIP_TOP and _rk_idx < SKIP_TOP:
+                    continue
+                # 信号强度门槛: ranked 按 pred 降序, 第一个不达标的之后全都不达标。
+                # 留空的槽位不沿排名退而求其次 —— 那正是要避免的"买弱信号"。
+                if _pred_of is not None and _pred_of.get(code, -1.0) < MIN_PRED:
+                    n_below_thresh += TRANCHE_N - bought
+                    break
+                if code in held:            # 已持有则跳到下一名, 保证广度
+                    continue
+                if code in blocked:         # 刚急涨过的不追
+                    continue
+                if SKIP_BOARDS and str(code).startswith(SKIP_BOARDS):
+                    n_board_skip += 1
+                    if SKIP_CASH:
+                        # 留现金模式: 槽位被"消耗"但不买, 预算也预留不给后面的槽位。
+                        # (否则就变成变相递补: 钱流给下一名, 只是换个名字)
+                        alloc = remaining / (TRANCHE_N - bought)
+                        remaining -= alloc
+                        bought += 1
+                    continue                # 递补模式: 直接看下一名
+                _il_buy = None
+                if IND_CAP > 0:
+                    # 行业满额 -> 递补下一名(不同行业)。递补而非留现金:
+                    # 目标就是把钱分散到别的行业, 而不是减仓。
+                    _il_buy = ind_of(code, dp["date"])
+                    if _il_buy is not None and _ind_cnt.get(_il_buy, 0) >= IND_CAP:
+                        n_ind_skip += 1
+                        continue
+                if corr_guard is not None and corr_guard.blocks(code, held, dp["date"], args.corr_cap):
+                    n_corr_skip += 1
+                    continue
+                px = get_px(klines, code, d, EXEC_FIELD)
+                if px is None:                          # 停牌/无行情
+                    rejected_buy += 1
+                    rej["buy_halt"] += 1
+                    continue
+                limit_up, _ = _limit_state(klines, code, d, EXEC_FIELD)
+                if limit_up:
+                    rejected_buy += 1
+                    rej["buy_limit_up"] += 1
+                    continue
+                # 追高上限: 模拟"限价挂在信号日收盘价附近, 涨太多就买不到"的真实成交。
+                # 回测原本假设 100% 按执行日收盘价成交, 但实盘是挂限价单 ——
+                # 跳空高开的票根本打不到你的价位, 那个槽位就空着(不递补, 现金留下)。
+                # 实测这类漏掉的票买进去反而更差(平均 -0.15% vs 能买到的 +0.80%),
+                # 所以这未必是损失; 但空置的现金也有代价, 净效果需要实测。
+                if MAX_CHASE > 0:
+                    # 此处 px 还是执行日的原始收盘价(滑点在下一行才加), 正好用来
+                    # 和信号日收盘价比 —— 与"页面上的参考价"同一口径
+                    _sig_px = get_px(klines, code, dp["date"], "close")
+                    if _sig_px and (px / _sig_px - 1) > MAX_CHASE:
+                        n_chase_skip += 1
+                        alloc = remaining / (TRANCHE_N - bought)
+                        remaining -= alloc      # 预算留住, 不流给后面的槽位
+                        bought += 1             # 槽位算被占用: 不递补
+                        continue
+                # 下跌跳空弃买(--gap-skip): 与 --max-chase 同构反向。信号生成于
+                # 隔夜/周末利空落地之前, 执行时已大幅低开的票, 便宜未必是机会。
+                # 同样留现金不递补 —— 递补等于把钱流给排名更弱的信号。
+                if GAP_SKIP > 0:
+                    _sig_px_g = get_px(klines, code, dp["date"], "close")
+                    if _sig_px_g and (px / _sig_px_g - 1) < -GAP_SKIP:
+                        n_gap_skip += 1
+                        alloc = remaining / (TRANCHE_N - bought)
+                        remaining -= alloc
+                        bought += 1
+                        continue
+                px = fill_px(px, "buy")
+                alloc = remaining / (TRANCHE_N - bought)
+                shares = int(alloc / (px * 100)) * 100
+                if shares <= 0:                         # 预算不足一手(100股)
+                    # 整手粒度救济: 一手成本在预算容忍带内就买, 保住排名靠前的信号。
+                    # 超出的部分由 remaining 自然扣减, 后面的槽位预算相应变小。
+                    if LOT_FLEX > 0 and px * 100 <= alloc * (1 + LOT_FLEX):
+                        shares = 100
+                        n_lot_flex += 1
+                    else:
+                        rejected_buy += 1
+                        rej["buy_lot_too_big"] += 1
+                        continue
+                gross = shares * px
+                fee = max(gross * TRADE_COST, MIN_FEE)
+                if gross + fee > cash:
+                    rejected_buy += 1
+                    rej["buy_no_cash"] += 1
+                    continue
+                cash -= gross + fee
+                remaining -= gross + fee
+                buy_fee += fee
+                lots.append({"code": code, "shares": shares, "buy_price": px, "open_idx": i})
+                held.add(code)
+                bought += 1
+                if IND_CAP > 0 and _il_buy is not None:
+                    _ind_cnt[_il_buy] = _ind_cnt.get(_il_buy, 0) + 1
+                if not is_rebal:
+                    n_daily_fill += 1
+                trade_log.append({"date": dstr, "signal_date": sig_str, "code": code,
+                                  "action": "buy", "shares": shares, "price": px,
+                                  "gross": gross, "fee": fee, "net": -(gross + fee),
+                                  "reason": "new_tranche" if is_rebal else "daily_fill"})
 
     buy_fee_sum += buy_fee
     sell_fee_sum += sell_fee
@@ -1675,6 +1832,11 @@ json.dump({
     "gap_skip": GAP_SKIP, "holiday_flat": HOLIDAY_FLAT,
     "corr_cap": args.corr_cap, "corr_window": args.corr_window,
     "corr_min_periods": args.corr_min_periods,
+    "skip_top": SKIP_TOP, "weight_mode": WEIGHT_MODE, "vol_window": VOL_WINDOW,
+    "lgb_loss": args.lgb_loss, "label_winsor": args.label_winsor,
+    "boosting_type": args.boosting_type, "reg_lambda": args.reg_lambda,
+    "n_estimators": args.n_estimators, "learning_rate": args.learning_rate,
+    "min_child_samples": args.min_child_samples,
     "exclude_feats": sorted(_extra_excl),
     "skip_boards": list(SKIP_BOARDS), "skip_boards_mode": args.skip_boards_mode,
     "features": len(features), "selected_features": features,

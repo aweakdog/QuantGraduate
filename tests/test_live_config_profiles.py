@@ -82,7 +82,8 @@ def test_px2_is_twin_of_aggr2w():
     from live_config import PROFILES
     a, b = PROFILES["aggr2w"], PROFILES["aggr2w_px2"]
     for k in ("capital", "tranche-n", "lot-flex", "skip-boards",
-              "fill-daily", "roll-rank"):
+              "fill-daily", "roll-rank", "features-from", "train-purge",
+              "ridge-blend", "ridge-alpha-ratio"):
         assert a.get(k) == b.get(k), f"aggr2w 与 aggr2w_px2 的 {k} 不一致"
 
 
@@ -129,31 +130,22 @@ def test_hold_days_pinned_to_five():
     assert BASE_PARAMS["hold-days"] == 5
 
 
-# ── T1A/T1B 分点分配 (2026-09-01) ─────────────────────────
-# 证据: LSW 逐线扫描(看板 08-31) + T1AL/T1AV lag1 生产口径复核(看板 09-01)。
-# 分配是逐点判决不是全线一刀切, 改任何一条前先读 factor_family_ledger「T1A/T1B」。
+# ── 2026-11-25 全主板统一最优模型 (T1B + PG1 + 20% 异质线性 Ridge α=0.05N) ─────────
+# 证据: E7 (40种子 Q5/S5W/FYF) + 自适应 α=0.05N (40种子 +33.2pp, 35/40) + E8 ALR 全站 4 族 PK:
+#   全部 8 条主板线统一用 T1B+PG1+Ridge(0.20, 0.05N) 全面碾压旧配置 (+12~+76pp, 夏普 +0.13~+0.57);
+#   全市场 4 条线(含 20cm 创/科板)实测 Ridge IC 仅主板一半且负增量 (-14.2pp 3/20), 坚决不开 Ridge。
 
-T1A_LINES = ("aggr5w", "aggr10w", "base5w_aggr")
-T1B_LINES = ("steady5w", "fyf100w", "base5w_steady", "qmt10w")
-NO_T1_LINES = ("steady2w", "aggr2w", "aggr2w_px2", "bench10m", "bench10m_fm")
+T1B_LINES = MAIN_BOARD_ONLY + ("base5w_steady", "base5w_aggr")
+NO_T1_LINES = ("steady2w", "bench10m_fm")
 
 
 def test_t1_allocation_matches_ledger_verdict():
-    """分点分配钉死: T1A=订单结构(逐笔lag1), T1B=K线情绪分解。
-
-    steady2w 明确【不上】T1A: lag0 下 +19.4pp 但 lag1(生产可得口径)塌成
-    +3.45pp/11-20 = wash —— 六个点里唯一一个 alpha 大头是当日信息的点。
-    aggr2w 是 LSW 原判 wash。谁改这里谁先出 20 种子配对证据。
-    """
+    """全部 8 条主板线 + 两条 5 万镜像基准线统一用 T1B; 全市场基线线保持 80 特征。"""
     from live_config import PROFILES
-    for pid in T1A_LINES:
-        assert PROFILES[pid].get("features-from") == "features_V24PUT_T1A.json", pid
     for pid in T1B_LINES:
         assert PROFILES[pid].get("features-from") == "features_V24PUT_T1B.json", pid
     for pid in NO_T1_LINES:
-        assert "features-from" not in PROFILES[pid], \
-            f"{pid} 不该有分线特征集 (steady2w=lag1 wash, aggr2w=LSW wash, " \
-            f"bench* 无该点位证据)"
+        assert "features-from" not in PROFILES[pid], pid
 
 
 def test_locked_baselines_mirror_latest_strategy_features():
@@ -167,13 +159,13 @@ def test_locked_baselines_mirror_latest_strategy_features():
 
 def test_per_line_features_from_beats_global():
     """分线特征表必须顶掉全局表, 且只发一次 ——
-    发两次的话 argparse 后者覆盖前者, 全局表会静默把分线表顶掉(T1 白上)。"""
+    发两次的话 argparse 后者覆盖前者, 全局表会静默把分线表顶掉。"""
     from live_config import signal_args, FEATURES_FROM
     args = signal_args("aggr5w")
     assert args.count("--features-from") == 1
-    assert args[args.index("--features-from") + 1] == "features_V24PUT_T1A.json"
-    # 未分配的线仍用全局表
-    args2 = signal_args("aggr2w")
+    assert args[args.index("--features-from") + 1] == "features_V24PUT_T1B.json"
+    # 未分配分线特征表的全市场基线线仍用全局表
+    args2 = signal_args("steady2w")
     assert args2.count("--features-from") == 1
     assert args2[args2.index("--features-from") + 1] == FEATURES_FROM
 
@@ -185,46 +177,47 @@ def test_no_features_flag_when_disabled():
 
 
 def test_feature_set_lines_use_isolated_preds_cache():
-    """缓存文件是单条目的(键不同即整体覆盖): 特征集不同的线共用文件会在
-    夜链里循环互踩, 每条线都 cache miss 白训。同模型的线则必须继续共享。"""
+    """不同模型族的缓存文件必须互相隔离; 同模型的线则共享缓存不重复训练。"""
     from live_config import signal_args
 
     def cache_of(pid):
         a = signal_args(pid)
         return a[a.index("--preds-cache") + 1]
 
-    assert cache_of("aggr5w") == cache_of("aggr10w")       # 同主板+T1A: 共享
-    assert cache_of("steady5w") != cache_of("fyf100w")     # 同主板+T1B 但 steady5w 开 PG1: 分开
-    assert cache_of("aggr2w") == cache_of("bench10m")      # 同主板+基线: 共享
-    assert cache_of("steady2w") == cache_of("bench10m_fm")  # 同全市场+基线: 共享
-    distinct = {cache_of(p) for p in
-                ("aggr5w", "steady5w", "aggr2w", "steady2w",
-                 "base5w_aggr", "base5w_steady")}
-    assert len(distinct) == 6, f"六类模型的缓存文件必须两两不同: {distinct}"
+    # 全部 8 条主板线同为 T1B+PG1+Ridge(0.20, 0.05N), 共享唯一主板缓存
+    mb_caches = {cache_of(p) for p in MAIN_BOARD_ONLY}
+    assert len(mb_caches) == 1, f"主板线应共享同一预测缓存: {mb_caches}"
+    assert next(iter(mb_caches)).endswith("_mb_v24put_t1b_p1_rb20_r50.json")
+    # 全市场镜像基准线共享一份 T1B+PG1 全市场缓存 (无 Ridge)
+    assert cache_of("base5w_steady") == cache_of("base5w_aggr")
+    assert cache_of("base5w_steady").endswith("_v24put_t1b_p1.json")
+    # 全市场基线 80 线共享一份基础缓存
+    assert cache_of("steady2w") == cache_of("bench10m_fm")
+    distinct = {cache_of("steady5w"), cache_of("base5w_steady"), cache_of("steady2w")}
+    assert len(distinct) == 3, f"三类模型的缓存文件必须两两不同: {distinct}"
 
 
-def test_train_purge_only_on_tested_point_and_its_mirror():
-    """PG1 (2026-09-29): 收益证据只在 5万/n5/T1B/主板(steady5w); 基准线按 08-22 口径跟随镜像。
-    3 只线(T1A)同改动 20 种子归零、fyf100w(n8/100万)未测 —— 都不得顺手打开。"""
+def test_train_purge_and_ridge_blend_allocation():
+    """主板 8 线统一开 PG1 + Ridge(0.20, 0.05N); 全市场线坚决不开 Ridge。"""
     from live_config import PROFILES, signal_args
 
-    def cache_of(pid):
+    for pid in MAIN_BOARD_ONLY:
+        p = PROFILES[pid]
+        assert p.get("train-purge") == 1, pid
+        assert p.get("ridge-blend") == 0.20, pid
+        assert p.get("ridge-alpha-ratio") == 0.05, pid
         a = signal_args(pid)
-        return a[a.index("--preds-cache") + 1]
-
-    on = {pid for pid, p in PROFILES.items() if p.get("train-purge")}
-    # qmt10w (10-08 用户定开): 与 steady5w 同点位(n5/T1B/主板), 只是本金 10 万
-    assert on == {"steady5w", "base5w_steady", "qmt10w"}, on
-    assert cache_of("qmt10w") == cache_of("steady5w")          # 同模型共用缓存
-    a = signal_args("steady5w")
-    assert a.count("--train-purge") == 1 and a[a.index("--train-purge") + 1] == "1"
-    assert cache_of("steady5w").endswith("_mb_v24put_t1b_p1.json")
-    assert cache_of("base5w_steady").endswith("_v24put_t1b_p1.json") and "_mb_" not in cache_of("base5w_steady")
-    for pid in PROFILES:
-        if pid not in on:
-            assert "--train-purge" not in signal_args(pid), pid
-            assert "_p1" not in cache_of(pid), pid
-    assert PROFILES["base5w_steady"]["train-purge"] == PROFILES["steady5w"]["train-purge"]
+        assert a[a.index("--train-purge") + 1] == "1"
+        assert a[a.index("--ridge-blend") + 1] == "0.2"
+        assert a[a.index("--ridge-alpha-ratio") + 1] == "0.05"
+    for pid in FULL_MARKET:
+        p = PROFILES[pid]
+        assert not p.get("ridge-blend"), f"全市场线 {pid} 实测 Ridge 有害, 不得开启"
+        assert "--ridge-blend" not in signal_args(pid)
+    assert PROFILES["base5w_steady"].get("train-purge") == 1
+    assert PROFILES["base5w_aggr"].get("train-purge") == 1
+    for pid in NO_T1_LINES:
+        assert not PROFILES[pid].get("train-purge"), pid
 
 
 def test_qmt_line_is_steady5w_strategy_with_its_own_capital():
@@ -232,7 +225,7 @@ def test_qmt_line_is_steady5w_strategy_with_its_own_capital():
     from live_config import ACCESS_CODES, PROFILES, signal_args
     a, b = PROFILES["steady5w"], PROFILES["qmt10w"]
     for k in ("tranche-n", "skip-boards", "fill-daily", "roll-rank", "features-from", "train-purge",
-              "ind-cap", "lot-flex", "gate-ma60"):
+              "ridge-blend", "ridge-alpha-ratio", "ind-cap", "lot-flex", "gate-ma60"):
         assert a.get(k) == b.get(k), f"steady5w 与 qmt10w 的 {k} 不一致"
     assert b["capital"] == 100000.0 and not b.get("locked")
     sa, sb = signal_args("steady5w"), signal_args("qmt10w")
@@ -262,6 +255,6 @@ def test_train_years_plumbing(monkeypatch):
     monkeypatch.setitem(live_config.BASE_PARAMS, "train-years", 3)
     on = signal_args("aggr5w")
     assert on[on.index("--train-years") + 1] == "3"
-    assert cache_of("aggr5w").endswith("_ty3.json")
-    assert cache_of("aggr5w") == cache_of("aggr10w")
-    assert cache_of("aggr5w") != cache_of("steady5w")
+    assert "_ty3" in cache_of("aggr5w")
+    assert cache_of("aggr5w") == cache_of("aggr10w") == cache_of("steady5w")
+    assert cache_of("aggr5w") != cache_of("steady2w")

@@ -187,6 +187,14 @@ ap.add_argument("--min-pred", type=float, default=0.0,
                      "留空槽位持现金(第二层择时: 模型没信心的日子宁可不买)。只管新买入, "
                      "不影响续持。与回测 wf_v35 --min-pred 同义(MP1c 采纳, 2026-08-22)。"
                      "纯执行层不进指纹, 开关切换不需要 --init")
+ap.add_argument("--ridge-blend", type=float, default=0.0,
+                help="异质线性 Ridge 融合权重 w (0=关闭; 如 0.20 = 80%% DART + 20%% Ridge, "
+                     "每日截面仿射对齐到 DART 均值/标准差再加权, 保持 min-pred 尺度)。"
+                     "与回测共用 scripts/ridge_blend.py, 不进指纹, 删行即回滚")
+ap.add_argument("--ridge-alpha", type=float, default=10000.0,
+                help="配合 --ridge-blend: 固定 L2 惩罚强度 alpha (当 --ridge-alpha-ratio=0 时生效)")
+ap.add_argument("--ridge-alpha-ratio", type=float, default=0.0,
+                help="配合 --ridge-blend: 按训练样本数自适应正则 alpha = ratio * N_train (0=用固定 --ridge-alpha)")
 ap.add_argument("--status", action="store_true",
                 help="只打印当前持仓/现金/待执行计划, 不跑模型 (秒级)")
 ap.add_argument("--sync", default=None,
@@ -1610,6 +1618,8 @@ if args.preds_cache:
         "rows": int(len(train_df)),
         # 只在开启时入键: 未开的线缓存键逐位不变, 部署当晚不会白白重训
         **({"train_purge": args.train_purge} if args.train_purge else {}),
+        **({"ridge_blend": args.ridge_blend, "ridge_alpha": args.ridge_alpha,
+            "ridge_alpha_ratio": args.ridge_alpha_ratio} if args.ridge_blend > 0 else {}),
     }, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 # tm 在缓存命中时也要用(下面算 blocked 靠它), 所以放在分支外
@@ -1647,6 +1657,15 @@ if ranked is None:
         _p = _m.predict(Xt)
         preds = _p if preds is None else preds + _p
     preds = preds / len(ENSEMBLE_SEEDS)
+    if args.ridge_blend > 0:
+        import ridge_blend as _rb
+        _rp = _rb.ridge_predict_day(
+            train_df, df.loc[tm], features_used, LABEL_RAW,
+            alpha=args.ridge_alpha, alpha_ratio=args.ridge_alpha_ratio, winsor=0.02,
+        )
+        preds = _rb.blend_affine(preds, _rp, args.ridge_blend)
+        _rdesc = f"ratio={args.ridge_alpha_ratio:g}" if args.ridge_alpha_ratio > 0 else f"alpha={args.ridge_alpha:g}"
+        print(f"  [异质融合] 叠 Ridge w={args.ridge_blend:.2f} ({_rdesc}, 截面仿射对齐)")
     ranked = (pd.DataFrame({"code": df.loc[tm, "code"].astype(str).str[:6].values, "pred": preds})
               .sort_values("pred", ascending=False).reset_index(drop=True))
     if _cache_key and not args.dry_run:
